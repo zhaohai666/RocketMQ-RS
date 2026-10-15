@@ -1,0 +1,8 @@
+RocketMQ-RS
+Rust server implementation derived from Apache RocketMQ protocol and behavior.
+
+Apache RocketMQ
+Copyright 2016-2026 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (http://www.apache.org/).
