@@ -33,6 +33,11 @@ const MAX_VALUE: usize = 64 * 1024;
 const MAX_TOPICS: usize = 16_384;
 const MAX_FILTERS: usize = 1024;
 const ORDER_NAMESPACE: &str = "ORDER_TOPIC_CONFIG";
+// PermName.PERM_WRITE / PERM_READ (Java common.constant.PermName).
+const PERM_WRITE: i32 = 2;
+const PERM_READ: i32 = 4;
+// TopicValidator.SYNC_BROKER_MEMBER_GROUP_PREFIX: acting-master pickup skips these topics.
+const SYNC_BROKER_MEMBER_GROUP_PREFIX: &str = "rmq_sys_SYNC_BROKER_MEMBER_";
 
 type KvTable = BTreeMap<String, BTreeMap<String, String>>;
 
@@ -47,6 +52,10 @@ pub struct Namesrv {
 struct State {
     brokers: BTreeMap<String, BrokerGroup>,
     kv: KvTable,
+    // Static topic mappings: topic -> broker name -> raw TopicQueueMappingInfo JSON
+    // (Java RouteInfoManager.topicQueueMappingInfoTable). Accumulates like Java and is
+    // never cleaned on unregistration/expiry; memory-only like the broker state above.
+    topic_mappings: BTreeMap<String, BTreeMap<String, Value>>,
     // Fence KV until reopen because failed fsync/rename may leave memory and disk divergent.
     kv_failed: bool,
 }
@@ -55,6 +64,7 @@ struct BrokerGroup {
     cluster: String,
     instances: BTreeMap<i64, BrokerInstance>,
     topics: BTreeMap<String, TopicConfig>,
+    enable_acting_master: bool,
 }
 
 struct BrokerInstance {
@@ -106,7 +116,9 @@ struct TopicWrapper {
     topic_config_table: BTreeMap<String, WireTopic>,
     #[serde(default)]
     topic_queue_mapping_info_map: Option<BTreeMap<String, Value>>,
+    /// Wire format field: accepted (and validated by serde) but never read back.
     #[serde(default)]
+    #[allow(dead_code)]
     topic_queue_mapping_detail_map: Option<BTreeMap<String, Value>>,
     #[serde(default)]
     mapping_data_version: Option<DataVersion>,
@@ -173,6 +185,9 @@ struct Registration {
     ha_addr: String,
     topics: BTreeMap<String, TopicConfig>,
     filters: Vec<String>,
+    enable_acting_master: bool,
+    // topic -> broker name -> raw TopicQueueMappingInfo as registered on the wire.
+    mappings: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 impl Namesrv {
@@ -249,13 +264,25 @@ impl Namesrv {
 
     fn expire_at(&self, now: Instant) {
         if let Ok(mut state) = self.state.lock() {
-            state.brokers.retain(|_, broker| {
-                broker.instances.retain(|_, instance| {
+            for group in state.brokers.values_mut() {
+                let had_master = group.instances.contains_key(&0);
+                group.instances.retain(|_, instance| {
                     now.saturating_duration_since(instance.last_seen) < self.broker_timeout
                 });
-                // Retain topics during master outages while a slave still advertises the group.
-                !broker.instances.is_empty()
-            });
+                // Java routes expiry through the unregister path, so an acting-master
+                // group whose master expired also loses its write permission here.
+                if had_master
+                    && group.enable_acting_master
+                    && !group.instances.is_empty()
+                    && !group.instances.contains_key(&0)
+                {
+                    for config in group.topics.values_mut() {
+                        config.perm &= !PERM_WRITE;
+                    }
+                }
+            }
+            // Retain topics during master outages while a slave still advertises the group.
+            state.brokers.retain(|_, group| !group.instances.is_empty());
         }
     }
 
@@ -285,10 +312,14 @@ impl Namesrv {
             206 | 224 => self.topic_list(request),
             216 => self.delete_topic(request),
             100..=102 | 219 => self.kv_request(request),
+            // RequestCode.WIPE_WRITE_PERM_OF_BROKER / ADD_WRITE_PERM_OF_BROKER.
+            205 | 327 => self.write_perm(request),
+            // RequestCode.GET_BROKER_MEMBER_GROUP.
+            901 => self.broker_member_group(request),
             319 => {
                 no_body(request)?;
                 Ok(Command::response(request, SUCCESS).with_body(format!(
-                    "brokerChannelExpiredTime={}\nenableAllTopicList=true\nenableTopicList=true\norderMessageEnable=true\ndeleteTopicWithBrokerRegistration=true\nsupportActingMaster=false\nsupportStaticTopic=false\n",
+                    "brokerChannelExpiredTime={}\nenableAllTopicList=true\nenableTopicList=true\norderMessageEnable=true\ndeleteTopicWithBrokerRegistration=true\nsupportActingMaster=true\nsupportStaticTopic=true\n",
                     self.broker_timeout.as_millis()
                 ).into_bytes()))
             }
@@ -315,35 +346,57 @@ impl Namesrv {
         }) {
             return invalid("broker address already belongs to another broker");
         }
-        let group = state
-            .brokers
-            .entry(registration.name)
-            .or_insert_with(|| BrokerGroup {
-                cluster: registration.cluster,
-                instances: BTreeMap::new(),
-                topics: BTreeMap::new(),
-            });
-        // Address migration / slave promotion: one address has exactly one ID.
-        group
-            .instances
-            .retain(|id, instance| *id == registration.id || instance.addr != registration.addr);
-        group.instances.insert(
-            registration.id,
-            BrokerInstance {
-                addr: registration.addr,
-                ha_addr: registration.ha_addr,
-                filters: registration.filters,
-                last_seen: Instant::now(),
-            },
-        );
+        // Scoped block so the mutable borrow of the broker group ends before the
+        // static-topic mapping table is updated (both live behind one MutexGuard).
+        let master = {
+            let group = state
+                .brokers
+                .entry(registration.name)
+                .or_insert_with(|| BrokerGroup {
+                    cluster: registration.cluster,
+                    instances: BTreeMap::new(),
+                    topics: BTreeMap::new(),
+                    enable_acting_master: false,
+                });
+            // Java sets enableActingMaster on every registration (isOldVersionBroker -> false).
+            group.enable_acting_master = registration.enable_acting_master;
+            // Address migration / slave promotion: one address has exactly one ID.
+            group
+                .instances
+                .retain(|id, instance| *id == registration.id || instance.addr != registration.addr);
+            group.instances.insert(
+                registration.id,
+                BrokerInstance {
+                    addr: registration.addr,
+                    ha_addr: registration.ha_addr,
+                    filters: registration.filters,
+                    last_seen: Instant::now(),
+                },
+            );
+            if registration.id == 0 {
+                group.topics = registration.topics;
+            }
+            group
+                .instances
+                .get(&0)
+                .map(|master| (master.addr.clone(), master.ha_addr.clone()))
+        };
+        // Java updates the mapping table on data-version change or first registration;
+        // this port tracks no per-broker DataVersion, so it merges on every master
+        // registration. Java accumulates per (topic, bname) and never removes entries.
         if registration.id == 0 {
-            group.topics = registration.topics;
+            for (topic, inner) in registration.mappings {
+                let slot = state.topic_mappings.entry(topic).or_default();
+                for (bname, info) in inner {
+                    slot.insert(bname, info);
+                }
+            }
         }
         let mut response = Command::response(request, SUCCESS);
-        if let Some(master) = group.instances.get(&0) {
+        if let Some((addr, ha)) = master {
             response = response
-                .with_ext("masterAddr", &master.addr)
-                .with_ext("haServerAddr", &master.ha_addr);
+                .with_ext("masterAddr", addr)
+                .with_ext("haServerAddr", ha);
         }
         if !state.kv_failed
             && let Some(table) = state.kv.get(ORDER_NAMESPACE)
@@ -375,6 +428,16 @@ impl Namesrv {
             ));
         }
         group.instances.remove(&id);
+        // Java cleanTopicByUnRegisterRequests: with acting master enabled, losing the
+        // master wipes the write permission of the remaining group until re-registration.
+        if group.enable_acting_master
+            && !group.instances.is_empty()
+            && *group.instances.keys().next().expect("checked non-empty") > 0
+        {
+            for config in group.topics.values_mut() {
+                config.perm &= !PERM_WRITE;
+            }
+        }
         if group.instances.is_empty() {
             state.brokers.remove(name);
         }
@@ -452,6 +515,14 @@ impl Namesrv {
         }
         let mut route =
             json!({"queueDatas": queues, "brokerDatas": brokers, "filterServerTable": filters});
+        // Java pickupTopicRouteData sets topicQueueMappingByBroker (may be absent) before
+        // the acting-master handling; fastjson omits null fields, so only set non-empty.
+        if let Some(mapping) = state.topic_mappings.get(topic)
+            && !mapping.is_empty()
+        {
+            route["topicQueueMappingByBroker"] = json!(mapping);
+        }
+        apply_acting_master(&mut route["brokerDatas"], &state, topic);
         if let Some(value) = state
             .kv
             .get(ORDER_NAMESPACE)
@@ -597,6 +668,61 @@ impl Namesrv {
         File::open(&self.directory)?.sync_all()?;
         Ok(())
     }
+
+    // RequestCode 205 WIPE_WRITE_PERM_OF_BROKER / 327 ADD_WRITE_PERM_OF_BROKER
+    // (Java RouteInfoManager.operateWritePermOfBroker): wipe clears the write bit of
+    // every queue data of the broker, add resets it to READ|WRITE, and the response
+    // carries the affected topic count in wipeTopicCount / addTopicCount. Unknown
+    // brokers still succeed with a count of zero, as in Java. Unlike Java, this port
+    // keeps topic snapshots only for masters, so slaves always report zero.
+    fn write_perm(&self, request: &Command) -> Result<Command> {
+        no_body(request)?;
+        let name = name_field(request, "brokerName")?;
+        let mut state = self.lock()?;
+        let mut count = 0usize;
+        if let Some(group) = state.brokers.get_mut(name) {
+            for config in group.topics.values_mut() {
+                if request.code == 205 {
+                    config.perm &= !PERM_WRITE;
+                } else {
+                    config.perm = PERM_READ | PERM_WRITE;
+                }
+                count += 1;
+            }
+        }
+        let mut response = Command::response(request, SUCCESS);
+        if request.code == 205 {
+            response = response.with_ext("wipeTopicCount", count);
+        } else {
+            response = response.with_ext("addTopicCount", count);
+        }
+        Ok(response)
+    }
+
+    // RequestCode 901 GET_BROKER_MEMBER_GROUP (Java RouteInfoManager.getBrokerMemberGroup):
+    // mirrors the requested cluster/broker names verbatim and returns the group's
+    // addresses, succeeding with an empty group when the broker is unknown.
+    fn broker_member_group(&self, request: &Command) -> Result<Command> {
+        no_body(request)?;
+        let cluster = name_field(request, "clusterName")?;
+        let name = name_field(request, "brokerName")?;
+        let state = self.lock()?;
+        let addrs: BTreeMap<String, &str> = state
+            .brokers
+            .get(name)
+            .map(|group| {
+                group
+                    .instances
+                    .iter()
+                    .map(|(id, instance)| (id.to_string(), instance.addr.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        json_response(
+            request,
+            &json!({"brokerMemberGroup": {"cluster": cluster, "brokerName": name, "brokerAddrs": addrs}}),
+        )
+    }
 }
 
 impl Handler for Namesrv {
@@ -632,17 +758,17 @@ fn decode_registration(request: &Command) -> Result<Registration> {
     {
         return invalid("registration CRC mismatch");
     }
-    if optional_bool(request, "enableActingMaster")?.unwrap_or(false) {
-        return Err(Error::Unsupported("acting master".into()));
-    }
-    if optional_bool(request, "isInBrokerContainer")?.unwrap_or(false) {
-        return Err(Error::Unsupported("broker container registration".into()));
-    }
+    // Java RegisterBrokerRequestHeader.enableActingMaster is nullable: an absent header
+    // marks an old-version broker and enables nothing (RouteInfoManager.isOldVersionBroker).
+    let enable_acting_master = optional_bool(request, "enableActingMaster")?.unwrap_or(false);
+    // Java stores isInBrokerContainer on the broker-side identity only; the NameServer
+    // registration path carries no extra container fields, so accept and ignore the flag.
+    optional_bool(request, "isInBrokerContainer")?;
     // Keep the operator's timeout authoritative so remote brokers cannot defeat expiry.
     if optional_number(request, "heartbeatTimeoutMillis")? == Some(0) {
         return invalid("invalid heartbeat timeout");
     }
-    let (topics, filters) = if compressed {
+    let (topics, filters, mappings) = if compressed {
         decode_compressed(&request.body)?
     } else {
         let body: RegisterBody = serde_json::from_slice(&request.body)?;
@@ -651,17 +777,9 @@ fn decode_registration(request: &Command) -> Result<Registration> {
         if let Some(version) = &wrapper.mapping_data_version {
             version.validate()?;
         }
-        if wrapper
-            .topic_queue_mapping_info_map
-            .as_ref()
-            .is_some_and(|m| !m.is_empty())
-            || wrapper
-                .topic_queue_mapping_detail_map
-                .as_ref()
-                .is_some_and(|m| !m.is_empty())
-        {
-            return Err(Error::Unsupported("static topic mappings".into()));
-        }
+        // Java RouteInfoManager only consumes topicQueueMappingInfoMap; the detail map is
+        // carried on the wire for broker-side consumption and is accepted but ignored here.
+        let mappings = decode_mapping_info_map(wrapper.topic_queue_mapping_info_map)?;
         if wrapper.topic_config_table.len() > MAX_TOPICS {
             return invalid("too many topics");
         }
@@ -672,7 +790,7 @@ fn decode_registration(request: &Command) -> Result<Registration> {
             }
             topics.insert(key, wire.into_config()?);
         }
-        (topics, body.filter_server_list)
+        (topics, body.filter_server_list, mappings)
     };
     if filters.len() > MAX_FILTERS {
         return invalid("too many filter servers");
@@ -688,10 +806,46 @@ fn decode_registration(request: &Command) -> Result<Registration> {
         ha_addr,
         topics,
         filters,
+        enable_acting_master,
+        mappings,
     })
 }
 
-fn decode_compressed(body: &[u8]) -> Result<(BTreeMap<String, TopicConfig>, Vec<String>)> {
+// Validates raw TopicQueueMappingInfo JSON from the wire. Java keys the table by the
+// map key (topic) and the inner info's bname (RouteInfoManager.registerBroker), so both
+// must be present and well-formed; the rest of the info is echoed verbatim.
+fn decode_mapping_info_map(
+    map: Option<BTreeMap<String, Value>>,
+) -> Result<BTreeMap<String, BTreeMap<String, Value>>> {
+    let mut mappings = BTreeMap::new();
+    let Some(map) = map else {
+        return Ok(mappings);
+    };
+    if map.len() > MAX_TOPICS {
+        return invalid("too many static topic mappings");
+    }
+    for (topic, info) in map {
+        validate_name(&topic)?;
+        let bname = info
+            .get("bname")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Invalid("mapping info missing broker name".into()))?;
+        validate_name(bname)?;
+        mappings
+            .entry(topic)
+            .or_insert_with(BTreeMap::new)
+            .insert(bname.to_owned(), info);
+    }
+    Ok(mappings)
+}
+
+fn decode_compressed(
+    body: &[u8],
+) -> Result<(
+    BTreeMap<String, TopicConfig>,
+    Vec<String>,
+    BTreeMap<String, BTreeMap<String, Value>>,
+)> {
     let inflated = inflate_bounded(body)?;
     let mut cursor = BinaryCursor(&inflated);
     let version: DataVersion = serde_json::from_slice(cursor.bytes()?)?;
@@ -742,15 +896,38 @@ fn decode_compressed(body: &[u8]) -> Result<(BTreeMap<String, TopicConfig>, Vec<
         }
     }
     let filters = serde_json::from_slice(cursor.bytes()?)?;
+    // Java RegisterBrokerBody (V5_0_0+): mapping count, then length-prefixed JSON infos
+    // keyed by info.getTopic() on decode and by bname in RouteInfoManager.
+    let mut mappings = BTreeMap::new();
     if !cursor.0.is_empty() {
-        if cursor.number()? != 0 {
-            return Err(Error::Unsupported("static topic mappings".into()));
+        let count = cursor.number()?;
+        if count > MAX_TOPICS {
+            return invalid("too many static topic mappings");
+        }
+        for _ in 0..count {
+            let text = std::str::from_utf8(cursor.bytes()?)
+                .map_err(|_| Error::Invalid("invalid mapping encoding".into()))?;
+            let info: Value = serde_json::from_str(text)?;
+            let topic = info
+                .get("topic")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Invalid("mapping info missing topic".into()))?;
+            let bname = info
+                .get("bname")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Invalid("mapping info missing broker name".into()))?;
+            validate_name(topic)?;
+            validate_name(bname)?;
+            mappings
+                .entry(topic.to_owned())
+                .or_insert_with(BTreeMap::new)
+                .insert(bname.to_owned(), info);
         }
         if !cursor.0.is_empty() {
             return invalid("trailing registration data");
         }
     }
-    Ok((topics, filters))
+    Ok((topics, filters, mappings))
 }
 
 fn inflate_bounded(body: &[u8]) -> Result<Vec<u8>> {
@@ -818,7 +995,65 @@ fn broker_data(name: &str, group: &BrokerGroup) -> Value {
         .iter()
         .map(|(id, b)| (id.to_string(), b.addr.as_str()))
         .collect();
-    json!({"cluster": group.cluster, "brokerName": name, "brokerAddrs": addresses, "enableActingMaster": false})
+    json!({"cluster": group.cluster, "brokerName": name, "brokerAddrs": addresses, "enableActingMaster": group.enable_acting_master})
+}
+
+// Java RouteInfoManager.pickupTopicRouteData acting-master block (this port always runs
+// it and reports supportActingMaster=true in code 319): when a group advertised
+// enableActingMaster and its master is gone, the surviving slave with the smallest
+// brokerId is re-keyed as id 0 in the emitted route, but only when the group's queue
+// data lost its write permission (wiped on master loss). Like Java, this mutates only
+// the response clone, never stored state.
+fn apply_acting_master(broker_datas: &mut Value, state: &State, topic: &str) {
+    if topic.starts_with(SYNC_BROKER_MEMBER_GROUP_PREFIX) {
+        return;
+    }
+    let Some(datas) = broker_datas.as_array_mut() else {
+        return;
+    };
+    let needs_master = datas.iter().any(|data| {
+        data["brokerAddrs"]
+            .as_object()
+            .is_some_and(|addrs| !addrs.is_empty() && !addrs.contains_key("0"))
+    });
+    if !needs_master {
+        return;
+    }
+    for data in datas {
+        let Some(name) = data["brokerName"].as_str() else {
+            continue;
+        };
+        let Some(group) = state.brokers.get(name) else {
+            continue;
+        };
+        if !group.enable_acting_master
+            || group.instances.is_empty()
+            || group.instances.contains_key(&0)
+        {
+            continue;
+        }
+        // Java promotes the acting master only when the group's queue data is not
+        // writeable (PermName.isWriteable(queueData.getPerm()) is false).
+        if !group
+            .topics
+            .get(topic)
+            .is_some_and(|config| config.perm & PERM_WRITE == 0)
+        {
+            continue;
+        }
+        let min_id = match group.instances.keys().next() {
+            Some(id) => *id,
+            None => continue,
+        };
+        let addr = match group.instances.get(&min_id) {
+            Some(instance) => instance.addr.clone(),
+            None => continue,
+        };
+        if let Some(addrs) = data["brokerAddrs"].as_object_mut() {
+            addrs.remove(&min_id.to_string());
+            addrs.insert("0".to_owned(), Value::String(addr));
+        }
+    }
 }
 
 fn json_response(request: &Command, value: &impl Serialize) -> Result<Command> {
@@ -1602,7 +1837,7 @@ mod tests {
     }
 
     #[test]
-    fn compressed_lengths_and_static_mappings_do_not_mutate_routing() {
+    fn compressed_lengths_are_rejected_and_static_mappings_do_not_mutate_routing() {
         let (_dir, ns) = server();
         for plain in [
             vec![],
@@ -1614,14 +1849,26 @@ mod tests {
                 .with_body(compressed_bytes(&plain));
             assert_eq!(ns.process(&request).code, SYSTEM_ERROR);
         }
+        // A valid compressed mapping trailer registers the broker and its mapping.
         let mut plain = java_registration(false);
         plain.extend_from_slice(&1i32.to_be_bytes());
-        framed(&mut plain, br#"{"topic":"t"}"#);
+        framed(&mut plain, br#"{"topic":"t","bname":"a","totalQueues":8,"epoch":1}"#);
         let request = register("c", "a", 0, "a:10911", &[])
             .with_ext("compressed", true)
             .with_body(compressed_bytes(&plain));
-        assert_eq!(ns.process(&request).code, NOT_SUPPORTED);
-        assert_eq!(ns.broker_count(), 0);
+        assert_eq!(ns.process(&request).code, 0);
+        assert_eq!(ns.broker_count(), 1);
+        // Malformed mapping infos never register anything.
+        for info in [br#"{"topic":"t"}"#.as_slice(), br#"{"bname":"a"}"#.as_slice()] {
+            let mut plain = java_registration(false);
+            plain.extend_from_slice(&1i32.to_be_bytes());
+            framed(&mut plain, info);
+            let request = register("c", "a", 0, "a:10911", &[])
+                .with_ext("compressed", true)
+                .with_body(compressed_bytes(&plain));
+            assert_eq!(ns.process(&request).code, SYSTEM_ERROR);
+        }
+        assert_eq!(ns.broker_count(), 1);
     }
 
     #[test]
@@ -1702,17 +1949,6 @@ mod tests {
                 .code,
             NOT_SUPPORTED
         );
-        assert_eq!(
-            ns.process(&register("c", "a", 0, "a:10911", &[]).with_ext("enableActingMaster", true))
-                .code,
-            NOT_SUPPORTED
-        );
-        let mut request = register("c", "a", 0, "a:10911", &[]);
-        let mut value: Value = serde_json::from_slice(&request.body).unwrap();
-        value["topicConfigSerializeWrapper"]["topicQueueMappingInfoMap"] =
-            json!({"t":{"topic":"t"}});
-        request.body = serde_json::to_vec(&value).unwrap();
-        assert_eq!(ns.process(&request).code, NOT_SUPPORTED);
         assert_eq!(ns.broker_count(), 0);
         let config = ns.process(&Command::request(319));
         assert_eq!(config.code, 0);
@@ -1760,6 +1996,201 @@ mod tests {
                 .await
                 .code,
             0
+        );
+    }
+
+    #[test]
+    fn static_topic_mappings_are_registered_and_returned_in_routes() {
+        let (_dir, ns) = server();
+        let mut request = register("c", "a", 0, "a:10911", &[("t", 4)]);
+        let mut value: Value = serde_json::from_slice(&request.body).unwrap();
+        value["topicConfigSerializeWrapper"]["topicQueueMappingInfoMap"] = json!({
+            "t": {"topic": "t", "bname": "a", "totalQueues": 8, "epoch": 1,
+                  "dirty": false, "currIdMap": {"0": 0}}
+        });
+        // The detail map is accepted but never stored, like the Java NameServer.
+        value["topicConfigSerializeWrapper"]["topicQueueMappingDetailMap"] =
+            json!({"t": {"topic": "t"}});
+        request.body = serde_json::to_vec(&value).unwrap();
+        assert_eq!(ns.process(&request).code, 0);
+        // Java TopicRouteData.topicQueueMappingByBroker is keyed by bname and echoes
+        // the registered info verbatim.
+        let route = body(request_route(&ns, "t"));
+        assert_eq!(route["topicQueueMappingByBroker"]["a"]["totalQueues"], 8);
+        assert_eq!(route["topicQueueMappingByBroker"]["a"]["currIdMap"]["0"], 0);
+        assert_eq!(route["topicQueueMappingByBroker"]["a"]["epoch"], 1);
+        // Topics without mappings keep the field absent; fastjson omits nulls in Java.
+        assert_eq!(
+            ns.process(&register("c", "b", 0, "b:10911", &[("other", 1)]))
+                .code,
+            0
+        );
+        let route = body(request_route(&ns, "other"));
+        assert!(route.get("topicQueueMappingByBroker").is_none());
+        // Malformed mapping infos are rejected before any state mutation.
+        let mut request = register("c", "a", 0, "a:10911", &[("t", 4)]);
+        let mut value: Value = serde_json::from_slice(&request.body).unwrap();
+        value["topicConfigSerializeWrapper"]["topicQueueMappingInfoMap"] =
+            json!({"t": {"topic": "t"}});
+        request.body = serde_json::to_vec(&value).unwrap();
+        assert_eq!(ns.process(&request).code, SYSTEM_ERROR);
+        assert_eq!(ns.broker_count(), 2);
+    }
+
+    #[test]
+    fn acting_master_promotes_smallest_slave_and_wipes_write_perm_on_master_loss() {
+        let (_dir, ns) = server();
+        assert_eq!(
+            ns.process(
+                &register("c", "a", 0, "master:10911", &[("t", 6)])
+                    .with_ext("enableActingMaster", true)
+            )
+            .code,
+            0
+        );
+        assert_eq!(
+            ns.process(
+                &register("c", "a", 3, "slave3:10911", &[]).with_ext("enableActingMaster", true)
+            )
+            .code,
+            0
+        );
+        assert_eq!(
+            ns.process(
+                &register("c", "a", 1, "slave1:10911", &[]).with_ext("enableActingMaster", true)
+            )
+            .code,
+            0
+        );
+        // Master alive: addresses keep their registered ids and the flag echoes true.
+        let route = body(request_route(&ns, "t"));
+        assert_eq!(route["brokerDatas"][0]["enableActingMaster"], true);
+        assert_eq!(route["brokerDatas"][0]["brokerAddrs"]["0"], "master:10911");
+        assert_eq!(route["brokerDatas"][0]["brokerAddrs"]["1"], "slave1:10911");
+        // Master lost by unregistration: write perm wiped, smallest slave re-keyed as 0.
+        assert_eq!(
+            ns.process(&instance_request(104, "c", "a", 0, "master:10911"))
+                .code,
+            0
+        );
+        let route = body(request_route(&ns, "t"));
+        assert_eq!(route["queueDatas"][0]["perm"], 6 & !PERM_WRITE);
+        assert_eq!(route["brokerDatas"][0]["brokerAddrs"]["0"], "slave1:10911");
+        assert!(route["brokerDatas"][0]["brokerAddrs"].get("1").is_none());
+        assert!(route["brokerDatas"][0]["brokerAddrs"].get("3").is_some());
+        // Groups without the acting-master flag are never promoted or wiped.
+        assert_eq!(
+            ns.process(&register("c", "b", 0, "bmaster:10911", &[("t", 6)]))
+                .code,
+            0
+        );
+        assert_eq!(
+            ns.process(&register("c", "b", 2, "bslave:10911", &[])).code,
+            0
+        );
+        assert_eq!(
+            ns.process(&instance_request(104, "c", "b", 0, "bmaster:10911"))
+                .code,
+            0
+        );
+        let route = body(request_route(&ns, "t"));
+        let group_b = route["brokerDatas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|data| data["brokerName"] == "b")
+            .unwrap();
+        assert_eq!(group_b["enableActingMaster"], false);
+        assert_eq!(group_b["brokerAddrs"]["2"], "bslave:10911");
+        assert!(group_b["brokerAddrs"].get("0").is_none());
+        let perm = route["queueDatas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|data| data["brokerName"] == "b")
+            .unwrap()["perm"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(perm & PERM_WRITE as i64, PERM_WRITE as i64);
+    }
+
+    #[test]
+    fn broker_container_registrations_are_accepted_like_plain_ones() {
+        let (_dir, ns) = server();
+        let request =
+            register("c", "a", 0, "a:10911", &[("t", 4)]).with_ext("isInBrokerContainer", true);
+        assert_eq!(ns.process(&request).code, 0);
+        let route = body(request_route(&ns, "t"));
+        assert_eq!(route["queueDatas"][0]["readQueueNums"], 4);
+        assert_eq!(route["brokerDatas"][0]["brokerAddrs"]["0"], "a:10911");
+        // An invalid flag value is still rejected before registration.
+        let request =
+            register("c", "a", 0, "a:10911", &[("t", 4)]).with_ext("isInBrokerContainer", "TRUE");
+        assert_eq!(ns.process(&request).code, SYSTEM_ERROR);
+    }
+
+    #[test]
+    fn write_perm_requests_wipe_and_restore_and_member_group_reports_addresses() {
+        let (_dir, ns) = server();
+        ns.process(&register("c", "a", 0, "a:10911", &[("t1", 6), ("t2", 7)]));
+        ns.process(&register("c", "b", 0, "b:10911", &[("t1", 6)]));
+        // Unknown brokers succeed with a zero count, as in Java.
+        let wipe = ns.process(&Command::request(205).with_ext("brokerName", "missing"));
+        assert_eq!(wipe.code, 0);
+        assert_eq!(wipe.ext_fields.get("wipeTopicCount").unwrap(), "0");
+        let wipe = ns.process(&Command::request(205).with_ext("brokerName", "a"));
+        assert_eq!(wipe.code, 0);
+        assert_eq!(wipe.ext_fields.get("wipeTopicCount").unwrap(), "2");
+        // Permissions are per broker: a is wiped, b is untouched.
+        let route = body(request_route(&ns, "t1"));
+        let perm_of = |name: &str| {
+            route["queueDatas"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|data| data["brokerName"] == name)
+                .unwrap()["perm"]
+                .as_i64()
+                .unwrap()
+        };
+        assert_eq!(perm_of("a"), (6 & !PERM_WRITE) as i64);
+        assert_eq!(perm_of("b"), 6);
+        // Add resets to READ|WRITE unconditionally, dropping any other bits.
+        let add = ns.process(&Command::request(327).with_ext("brokerName", "a"));
+        assert_eq!(add.code, 0);
+        assert_eq!(add.ext_fields.get("addTopicCount").unwrap(), "2");
+        let route = body(request_route(&ns, "t2"));
+        let perm = route["queueDatas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|data| data["brokerName"] == "a")
+            .unwrap()["perm"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(perm, (PERM_READ | PERM_WRITE) as i64);
+        // GET_BROKER_MEMBER_GROUP mirrors the request names and current addresses.
+        let member = ns.process(
+            &Command::request(901)
+                .with_ext("clusterName", "c")
+                .with_ext("brokerName", "a"),
+        );
+        assert_eq!(member.code, 0);
+        let value: Value = serde_json::from_slice(&member.body).unwrap();
+        assert_eq!(value["brokerMemberGroup"]["cluster"], "c");
+        assert_eq!(value["brokerMemberGroup"]["brokerName"], "a");
+        assert_eq!(value["brokerMemberGroup"]["brokerAddrs"]["0"], "a:10911");
+        // Unknown brokers return an empty group with success, as in Java.
+        let member = ns.process(
+            &Command::request(901)
+                .with_ext("clusterName", "c")
+                .with_ext("brokerName", "missing"),
+        );
+        assert_eq!(member.code, 0);
+        let value: Value = serde_json::from_slice(&member.body).unwrap();
+        assert_eq!(
+            value["brokerMemberGroup"]["brokerAddrs"],
+            json!({})
         );
     }
 }

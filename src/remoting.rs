@@ -19,6 +19,12 @@ use tokio::{
     sync::{Mutex, Semaphore, watch},
     task::{JoinError, JoinSet},
 };
+use tokio_rustls::rustls::{
+    self, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 pub use crate::common::MAX_FRAME_SIZE;
 use crate::common::{Error, Reader, Result, checked_size, invalid, utf8};
@@ -365,15 +371,32 @@ async fn serve_connection(
     stream: TcpStream,
     peer: SocketAddr,
     handler: Arc<dyn Handler>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     capacity: Arc<Semaphore>,
 ) -> Result<()> {
+    stream.set_nodelay(true)?;
+    let (reader, writer) = stream.into_split();
+    serve_io(reader, writer, peer, handler, shutdown, capacity).await
+}
+
+/// Shared connection loop for plaintext and TLS streams; the framed protocol
+/// only needs `AsyncRead`/`AsyncWrite`, so the TLS stream plugs straight in.
+async fn serve_io<R, W>(
+    mut reader: R,
+    writer: W,
+    peer: SocketAddr,
+    handler: Arc<dyn Handler>,
+    mut shutdown: watch::Receiver<bool>,
+    capacity: Arc<Semaphore>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let _disconnected = DisconnectGuard {
         handler: handler.clone(),
         peer,
     };
-    stream.set_nodelay(true)?;
-    let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
     let mut requests = JoinSet::new();
     let mut oneway_requests = JoinSet::new();
@@ -545,6 +568,425 @@ pub async fn invoke(addr: &str, request: Command, timeout: Duration) -> Result<C
     })
     .await
     .map_err(|_| Error::Io(io::Error::new(io::ErrorKind::TimedOut, "RPC timed out")))?
+}
+
+/// Server TLS mode, mirroring Java `TlsMode` (DISABLED / PERMISSIVE / ENFORCING).
+///
+/// * `Disabled`: TLS is not served; plaintext connections are handled by [`serve`].
+///   Passing this mode to [`serve_tls`] is an error.
+/// * `Permissive`: SSL is optional. Unlike Java, which sniffs the first bytes of a
+///   single port and upgrades TLS dynamically, this implementation dedicates each
+///   port to one protocol: the upper layer picks the port layout, running plain
+///   [`serve`] and [`serve_tls`] side by side. A plaintext client hitting the TLS
+///   port is closed with a handshake failure, and vice versa.
+/// * `Enforced`: TLS is required; non-TLS connections are rejected by the
+///   handshake and closed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    Disabled,
+    /// Matches the Java server default (`tls.server.mode=permissive`).
+    #[default]
+    Permissive,
+    Enforced,
+}
+
+impl TlsMode {
+    /// Java `TlsMode.parse` semantics: unrecognized values fall back to `Permissive`.
+    pub fn parse(mode: &str) -> Self {
+        match mode.to_ascii_lowercase().as_str() {
+            "disabled" => Self::Disabled,
+            "enforcing" | "enforced" => Self::Enforced,
+            _ => Self::Permissive,
+        }
+    }
+}
+
+impl FromStr for TlsMode {
+    type Err = Error;
+
+    fn from_str(mode: &str) -> Result<Self> {
+        match mode.to_ascii_lowercase().as_str() {
+            "disabled" => Ok(Self::Disabled),
+            "permissive" => Ok(Self::Permissive),
+            "enforcing" | "enforced" => Ok(Self::Enforced),
+            _ => Err(invalid(format!("unknown TLS mode {mode}"))),
+        }
+    }
+}
+
+/// Paths for the TLS material, serializable so upper layers can load it from
+/// their configuration files. Field names align with Java `TlsSystemConfig`:
+/// `serverCertPath`/`serverKeyPath`/`serverTrustCertPath` and the client
+/// equivalents, plus the `tls.server.authClient`/`tls.client.authServer`
+/// switches for mutual TLS.
+///
+/// Unlike Java's `tlsTestModeEnable` (which generates a self-signed server
+/// certificate at runtime), server certificates must always be provided
+/// explicitly here; `test_mode_enabled` only affects the client side, where it
+/// mirrors Java's `InsecureTrustManagerFactory` by accepting any server
+/// certificate.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TlsConfig {
+    pub mode: TlsMode,
+    pub test_mode_enabled: bool,
+    /// Server verifies client certificates (Java `tls.server.authClient`).
+    pub auth_client: bool,
+    /// Client verifies the server certificate strictly (Java `tls.client.authServer`).
+    pub auth_server: bool,
+    pub server_cert_path: Option<String>,
+    pub server_key_path: Option<String>,
+    pub server_trust_cert_path: Option<String>,
+    pub client_cert_path: Option<String>,
+    pub client_key_path: Option<String>,
+    pub client_trust_cert_path: Option<String>,
+}
+
+// Environment variable names mirror the Java `TlsSystemConfig` system
+// properties (dotted `tls.server.certPath` style upper-cased with underscores).
+// Both the short name and the `ORG_APACHE_ROCKETMQ_REMOTING_` prefixed name
+// are accepted; the short name wins.
+const ENV_PREFIX: &str = "ORG_APACHE_ROCKETMQ_REMOTING_";
+const ENV_TLS_SERVER_MODE: &[&str] = &["TLS_SERVER_MODE"];
+const ENV_TLS_TEST_MODE_ENABLE: &[&str] = &["TLS_TEST_MODE_ENABLE"];
+const ENV_TLS_SERVER_AUTHCLIENT: &[&str] = &["TLS_SERVER_AUTHCLIENT"];
+const ENV_TLS_CLIENT_AUTHSERVER: &[&str] = &["TLS_CLIENT_AUTHSERVER"];
+const ENV_TLS_SERVER_CERT: &[&str] = &["TLS_SERVER_CERT", "TLS_SERVER_CERT_PATH"];
+const ENV_TLS_SERVER_KEY: &[&str] = &["TLS_SERVER_KEY", "TLS_SERVER_KEY_PATH"];
+const ENV_TLS_SERVER_TRUST_CERT: &[&str] = &["TLS_SERVER_TRUST_CERT", "TLS_SERVER_TRUST_CERT_PATH"];
+const ENV_TLS_CLIENT_CERT: &[&str] = &["TLS_CLIENT_CERT", "TLS_CLIENT_CERT_PATH"];
+const ENV_TLS_CLIENT_KEY: &[&str] = &["TLS_CLIENT_KEY", "TLS_CLIENT_KEY_PATH"];
+const ENV_TLS_CLIENT_TRUST_CERT: &[&str] = &["TLS_CLIENT_TRUST_CERT", "TLS_CLIENT_TRUST_CERT_PATH"];
+
+/// Build a [`TlsConfig`] from environment variables, aligning with Java
+/// `TlsSystemConfig`: `TLS_SERVER_MODE` (parsed with Java `TlsMode.parse`
+/// fallback semantics), `TLS_TEST_MODE_ENABLE` (defaults to `true`, as in
+/// Java), `TLS_SERVER_CERT`/`TLS_SERVER_KEY`/`TLS_SERVER_TRUST_CERT` and the
+/// client-side counterparts. Each name is also probed with the
+/// `ORG_APACHE_ROCKETMQ_REMOTING_` prefix.
+pub fn tls_config_from_env() -> TlsConfig {
+    TlsConfig {
+        mode: env_value(ENV_TLS_SERVER_MODE)
+            .map(|value| TlsMode::parse(&value))
+            .unwrap_or_default(),
+        // Java defaults tlsTestModeEnable to true.
+        test_mode_enabled: env_flag(ENV_TLS_TEST_MODE_ENABLE).unwrap_or(true),
+        auth_client: env_flag(ENV_TLS_SERVER_AUTHCLIENT).unwrap_or(false),
+        auth_server: env_flag(ENV_TLS_CLIENT_AUTHSERVER).unwrap_or(false),
+        server_cert_path: env_value(ENV_TLS_SERVER_CERT),
+        server_key_path: env_value(ENV_TLS_SERVER_KEY),
+        server_trust_cert_path: env_value(ENV_TLS_SERVER_TRUST_CERT),
+        client_cert_path: env_value(ENV_TLS_CLIENT_CERT),
+        client_key_path: env_value(ENV_TLS_CLIENT_KEY),
+        client_trust_cert_path: env_value(ENV_TLS_CLIENT_TRUST_CERT),
+    }
+}
+
+fn env_value(names: &[&str]) -> Option<String> {
+    for name in names {
+        for candidate in [(*name).to_string(), format!("{ENV_PREFIX}{name}")] {
+            if let Ok(value) = std::env::var(&candidate) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Java `Boolean.parseBoolean` semantics plus the common `1` shorthand.
+fn env_flag(names: &[&str]) -> Option<bool> {
+    env_value(names).map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+}
+
+/// Serve framed RocketMQ remoting commands over TLS.
+///
+/// The frame protocol is unchanged: the existing 4-byte length header and
+/// command encoding travel inside the TLS stream. Connections whose handshake
+/// fails (including plaintext clients in `Permissive` mode, where the upper
+/// layer is expected to run a plaintext [`serve`] port alongside this one) are
+/// simply closed; they never stop the server.
+pub async fn serve_tls(
+    listener: TcpListener,
+    handler: Arc<dyn Handler>,
+    mut shutdown: watch::Receiver<bool>,
+    tls: TlsConfig,
+) -> Result<()> {
+    if tls.mode == TlsMode::Disabled {
+        return Err(invalid(
+            "serve_tls cannot serve with TLS disabled; use serve for plaintext connections",
+        ));
+    }
+    let acceptor = TlsAcceptor::from(build_server_config(&tls)?);
+    let (stop, stopped) = watch::channel(false);
+    let capacity = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
+    let mut connections = JoinSet::new();
+    let result = loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_signal(&mut shutdown) => break Ok(()),
+            result = connections.join_next(), if !connections.is_empty() => {
+                log_connection_result(result);
+            }
+            accepted = listener.accept(), if connections.len() < MAX_CONNECTIONS => {
+                match accepted {
+                    Ok((stream, peer)) => {
+                        let handler = handler.clone();
+                        let shutdown = stopped.clone();
+                        let capacity = capacity.clone();
+                        let acceptor = acceptor.clone();
+                        connections.spawn(async move {
+                            let result =
+                                accept_tls_connection(acceptor, stream, peer, handler, shutdown, capacity)
+                                    .await;
+                            if let Err(error) = &result {
+                                tracing::warn!(%peer, %error, "remoting TLS connection failed");
+                            }
+                            result
+                        });
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "remoting accept failed");
+                        break Err(Error::Io(error));
+                    }
+                }
+            }
+        }
+    };
+    let _ = stop.send(true);
+    while let Some(result) = connections.join_next().await {
+        log_connection_result(Some(result));
+    }
+    result
+}
+
+async fn accept_tls_connection(
+    acceptor: TlsAcceptor,
+    stream: TcpStream,
+    peer: SocketAddr,
+    handler: Arc<dyn Handler>,
+    shutdown: watch::Receiver<bool>,
+    capacity: Arc<Semaphore>,
+) -> Result<()> {
+    stream.set_nodelay(true)?;
+    // A failed handshake (e.g. a plaintext client) drops the connection; the
+    // disconnect callback intentionally does not fire, matching Java.
+    let stream = acceptor
+        .accept(stream)
+        .await
+        .map_err(|error| Error::Io(io::Error::new(io::ErrorKind::ConnectionAborted, error)))?;
+    let (reader, writer) = tokio::io::split(stream);
+    serve_io(reader, writer, peer, handler, shutdown, capacity).await
+}
+
+/// Single RPC over TLS; mirrors [`invoke`] with a TLS handshake first.
+pub async fn invoke_tls(
+    addr: &str,
+    request: Command,
+    timeout: Duration,
+    tls: TlsConfig,
+) -> Result<Command> {
+    if request.flag & (RESPONSE_FLAG | ONEWAY_FLAG) != 0 {
+        return Err(invalid("invoke requires a two-way request"));
+    }
+    let connector = TlsConnector::from(build_client_config(&tls)?);
+    let server_name = server_name_from_addr(addr)?;
+    tokio::time::timeout(timeout, async move {
+        let stream = TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        let mut stream = connector.connect(server_name, stream).await?;
+        write_command(&mut stream, &request).await?;
+        let response = read_command(&mut stream).await?.ok_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "peer closed before RPC response",
+            ))
+        })?;
+        if response.flag & RESPONSE_FLAG == 0 || response.flag & ONEWAY_FLAG != 0 {
+            return Err(invalid("RPC response has invalid flags"));
+        }
+        if response.opaque != request.opaque {
+            return Err(invalid("RPC response opaque mismatch"));
+        }
+        Ok(response)
+    })
+    .await
+    .map_err(|_| Error::Io(io::Error::new(io::ErrorKind::TimedOut, "RPC timed out")))?
+}
+
+fn server_name_from_addr(addr: &str) -> Result<ServerName<'static>> {
+    let host = addr.rsplit_once(':').map(|(host, _)| host).unwrap_or(addr);
+    ServerName::try_from(host.to_string())
+        .map_err(|_| invalid(format!("invalid TLS server name in address {addr}")))
+}
+
+/// CryptoProvider choice: ring. rustls 0.23 requires an explicit provider;
+/// `ring` is selected over `aws-lc-rs` for its smaller dependency footprint and
+/// broad platform portability. The provider is passed per-config instead of
+/// installing a process-wide default, avoiding install races.
+fn build_server_config(tls: &TlsConfig) -> Result<Arc<rustls::ServerConfig>> {
+    let cert_path = tls
+        .server_cert_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| invalid("TLS server requires server_cert_path (tls.server.certPath)"))?;
+    let key_path = tls
+        .server_key_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| invalid("TLS server requires server_key_path (tls.server.keyPath)"))?;
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|error| invalid(format!("TLS protocol versions unavailable: {error}")))?;
+    if tls.auth_client {
+        let trust_path = tls
+            .server_trust_cert_path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| {
+                invalid("TLS server client authentication requires server_trust_cert_path")
+            })?;
+        let verifier =
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(load_root_store(trust_path)?))
+                .build()
+                .map_err(|error| invalid(format!("TLS client verifier build failed: {error}")))?;
+        let config = builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .map_err(|error| invalid(format!("TLS server certificate setup failed: {error}")))?;
+        Ok(Arc::new(config))
+    } else {
+        let config = builder
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|error| invalid(format!("TLS server certificate setup failed: {error}")))?;
+        Ok(Arc::new(config))
+    }
+}
+
+/// Client trust mirrors Java `TlsHelper.buildSslContext(forClient)`: test mode
+/// or `auth_server == false` accepts any server certificate (Java's
+/// `InsecureTrustManagerFactory`); strict verification requires
+/// `client_trust_cert_path`.
+fn build_client_config(tls: &TlsConfig) -> Result<Arc<rustls::ClientConfig>> {
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|error| invalid(format!("TLS protocol versions unavailable: {error}")))?;
+    let builder = if tls.auth_server && !tls.test_mode_enabled {
+        let trust_path = tls
+            .client_trust_cert_path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| invalid("TLS client verification requires client_trust_cert_path"))?;
+        builder.with_root_certificates(load_root_store(trust_path)?)
+    } else {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureServerCertVerifier))
+    };
+    let config = match (
+        tls.client_cert_path
+            .as_deref()
+            .filter(|path| !path.is_empty()),
+        tls.client_key_path
+            .as_deref()
+            .filter(|path| !path.is_empty()),
+    ) {
+        (Some(cert_path), Some(key_path)) => builder
+            .with_client_auth_cert(load_certs(cert_path)?, load_private_key(key_path)?)
+            .map_err(|error| invalid(format!("TLS client certificate setup failed: {error}")))?,
+        (None, None) => builder.with_no_client_auth(),
+        _ => {
+            return Err(invalid(
+                "TLS client requires both client_cert_path and client_key_path",
+            ));
+        }
+    };
+    Ok(Arc::new(config))
+}
+
+/// Client-side counterpart of Java `InsecureTrustManagerFactory`: trust every
+/// server certificate and every handshake signature.
+#[derive(Debug)]
+struct InsecureServerCertVerifier;
+
+impl ServerCertVerifier for InsecureServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
+fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let file = std::fs::File::open(path)?;
+    rustls_pemfile::certs(&mut io::BufReader::new(file))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::Io)
+}
+
+fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
+    let file = std::fs::File::open(path)?;
+    rustls_pemfile::private_key(&mut io::BufReader::new(file))
+        .map_err(Error::Io)?
+        .ok_or_else(|| invalid(format!("no private key found in {path}")))
+}
+
+fn load_root_store(path: &str) -> Result<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    for cert in load_certs(path)? {
+        roots
+            .add(cert)
+            .map_err(|error| invalid(format!("TLS trust certificate rejected: {error}")))?;
+    }
+    Ok(roots)
 }
 
 #[cfg(test)]
@@ -1253,6 +1695,259 @@ mod tests {
             invoke(&addr.to_string(), oneway, Duration::from_secs(1)).await,
             Err(Error::Invalid(_))
         ));
+        stop.send(true).unwrap();
+        within(server).await.unwrap().unwrap();
+    }
+
+    // Fixed self-signed test material (P-256, CN=rocketmq-rs-test,
+    // SAN: IP:127.0.0.1 / DNS:localhost, valid until 2126, basicConstraints
+    // CA:FALSE). Generated once with openssl and embedded so tests need no
+    // certificate-generation dependency. webpki refuses a CA certificate in the
+    // end-entity slot, so the leaf must never carry CA:TRUE.
+    const TLS_TEST_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIB1jCCAX2gAwIBAgIUbKII4JKg0mFQENV4tfqP1axVoyowCgYIKoZIzj0EAwIw
+GzEZMBcGA1UEAwwQcm9ja2V0bXEtcnMtdGVzdDAgFw0yNjEwMTUxMDExMTNaGA8y
+MTI2MDkyMTEwMTExM1owGzEZMBcGA1UEAwwQcm9ja2V0bXEtcnMtdGVzdDBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABAG11LjFIIRuLYtyjaz1q0FIO9PfyH5BcCEu
+2aqDVIHfIjXXhMKjZpdmhoq8oxeGarOEoNPkXJAb9XJixCBszE2jgZwwgZkwHQYD
+VR0OBBYEFCjdLMW7XG3qcM3n6FtdStEISA8GMB8GA1UdIwQYMBaAFCjdLMW7XG3q
+cM3n6FtdStEISA8GMBoGA1UdEQQTMBGHBH8AAAGCCWxvY2FsaG9zdDAMBgNVHRMB
+Af8EAjAAMA4GA1UdDwEB/wQEAwIFoDAdBgNVHSUEFjAUBggrBgEFBQcDAQYIKwYB
+BQUHAwIwCgYIKoZIzj0EAwIDRwAwRAIgMJgKHbG2z1X3FVK/0sMRNB6z5JaivDt+
+Rv+qS8kPfjkCIDMvJhIwV/4GxvJUSTLsRwgUyqmGPXKRKIZAkFQmCDG0
+-----END CERTIFICATE-----
+";
+    const TLS_TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQggmxtZ/Gw0uqQXoR0
+OVPVxuV7HzkALaaMC0pk0bUPyuahRANCAAQBtdS4xSCEbi2Lco2s9atBSDvT38h+
+QXAhLtmqg1SB3yI114TCo2aXZoaKvKMXhmqzhKDT5FyQG/VyYsQgbMxN
+-----END PRIVATE KEY-----
+";
+
+    fn temp_pem(content: &str) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file
+    }
+
+    #[test]
+    fn tls_mode_matches_java_parse_semantics() {
+        assert_eq!(TlsMode::parse("disabled"), TlsMode::Disabled);
+        assert_eq!(TlsMode::parse("permissive"), TlsMode::Permissive);
+        assert_eq!(TlsMode::parse("enforcing"), TlsMode::Enforced);
+        assert_eq!(TlsMode::parse("ENFORCED"), TlsMode::Enforced);
+        // Java TlsMode.parse falls back to PERMISSIVE on unknown input.
+        assert_eq!(TlsMode::parse("unknown"), TlsMode::Permissive);
+        assert_eq!("disabled".parse::<TlsMode>().unwrap(), TlsMode::Disabled);
+        assert!("nonsense".parse::<TlsMode>().is_err());
+    }
+
+    #[test]
+    fn tls_config_serializes_camel_case_for_upper_layers() {
+        let config = TlsConfig {
+            mode: TlsMode::Enforced,
+            auth_client: true,
+            server_cert_path: Some("server.pem".into()),
+            server_key_path: Some("key.pem".into()),
+            server_trust_cert_path: Some("trust.pem".into()),
+            ..TlsConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"mode\":\"enforced\""));
+        assert!(json.contains("\"serverCertPath\":\"server.pem\""));
+        assert!(json.contains("\"serverKeyPath\":\"key.pem\""));
+        assert!(json.contains("\"serverTrustCertPath\":\"trust.pem\""));
+        assert!(json.contains("\"authClient\":true"));
+        let parsed: TlsConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, config);
+        // Absent fields fall back instead of failing deserialization.
+        let minimal: TlsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(minimal, TlsConfig::default());
+    }
+
+    #[test]
+    fn tls_config_from_env_aligns_with_java_names() {
+        // SAFETY: this test is the only reader of these variables; cargo runs
+        // other tests on separate threads but none touch the TLS_* namespace.
+        unsafe {
+            std::env::set_var("TLS_SERVER_MODE", "enforcing");
+            std::env::set_var("TLS_TEST_MODE_ENABLE", "false");
+            std::env::set_var("TLS_SERVER_CERT", "/tmp/server.crt");
+            std::env::set_var(
+                "ORG_APACHE_ROCKETMQ_REMOTING_TLS_SERVER_KEY",
+                "/tmp/server.key",
+            );
+            std::env::set_var(
+                "ORG_APACHE_ROCKETMQ_REMOTING_TLS_SERVER_TRUST_CERT",
+                "/tmp/trust.crt",
+            );
+            std::env::set_var("TLS_CLIENT_TRUST_CERT", "/tmp/client-trust.crt");
+        }
+        let config = tls_config_from_env();
+        assert_eq!(config.mode, TlsMode::Enforced);
+        assert!(!config.test_mode_enabled);
+        assert_eq!(config.server_cert_path.as_deref(), Some("/tmp/server.crt"));
+        assert_eq!(config.server_key_path.as_deref(), Some("/tmp/server.key"));
+        assert_eq!(
+            config.server_trust_cert_path.as_deref(),
+            Some("/tmp/trust.crt")
+        );
+        assert_eq!(
+            config.client_trust_cert_path.as_deref(),
+            Some("/tmp/client-trust.crt")
+        );
+        unsafe {
+            for name in [
+                "TLS_SERVER_MODE",
+                "TLS_TEST_MODE_ENABLE",
+                "TLS_SERVER_CERT",
+                "TLS_CLIENT_TRUST_CERT",
+                "ORG_APACHE_ROCKETMQ_REMOTING_TLS_SERVER_KEY",
+                "ORG_APACHE_ROCKETMQ_REMOTING_TLS_SERVER_TRUST_CERT",
+            ] {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_tls_rejects_disabled_mode_and_missing_material() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_, shutdown) = watch::channel(false);
+        let config = TlsConfig {
+            mode: TlsMode::Disabled,
+            ..TlsConfig::default()
+        };
+        assert!(
+            serve_tls(listener, Arc::new(TestHandler::default()), shutdown, config)
+                .await
+                .is_err()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_, shutdown) = watch::channel(false);
+        assert!(
+            serve_tls(
+                listener,
+                Arc::new(TestHandler::default()),
+                shutdown,
+                TlsConfig::default()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_loopback_roundtrip_and_plaintext_rejection() {
+        let cert = temp_pem(TLS_TEST_CERT);
+        let key = temp_pem(TLS_TEST_KEY);
+        let cert_path = cert.path().to_string_lossy().into_owned();
+        let key_path = key.path().to_string_lossy().into_owned();
+        let server_config = TlsConfig {
+            mode: TlsMode::Enforced,
+            server_cert_path: Some(cert_path.clone()),
+            server_key_path: Some(key_path),
+            ..TlsConfig::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, shutdown) = watch::channel(false);
+        let handler = Arc::new(TestHandler::default());
+        let server = tokio::spawn(serve_tls(
+            listener,
+            handler.clone(),
+            shutdown,
+            server_config,
+        ));
+
+        // A plaintext client against the TLS port fails without stopping the server.
+        assert!(
+            invoke(
+                &addr.to_string(),
+                Command::request(2),
+                Duration::from_millis(500),
+            )
+            .await
+            .is_err()
+        );
+
+        // Insecure client: test mode mirrors Java InsecureTrustManagerFactory.
+        let insecure = TlsConfig {
+            test_mode_enabled: true,
+            ..TlsConfig::default()
+        };
+        let response = invoke_tls(
+            &addr.to_string(),
+            Command::request(2),
+            Duration::from_secs(5),
+            insecure,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.code, 2);
+
+        // Strict client: verifies the self-signed test root and IP SAN.
+        let strict = TlsConfig {
+            auth_server: true,
+            client_trust_cert_path: Some(cert_path),
+            ..TlsConfig::default()
+        };
+        let response = invoke_tls(
+            &addr.to_string(),
+            Command::request(2),
+            Duration::from_secs(5),
+            strict,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.code, 2);
+
+        stop.send(true).unwrap();
+        within(server).await.unwrap().unwrap();
+        // Two TLS connections completed (the failed handshake fires no callback).
+        assert_eq!(handler.disconnected.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn tls_loopback_preserves_framing_and_serializations() {
+        let cert = temp_pem(TLS_TEST_CERT);
+        let key = temp_pem(TLS_TEST_KEY);
+        let server_config = TlsConfig {
+            mode: TlsMode::Enforced,
+            server_cert_path: Some(cert.path().to_string_lossy().into_owned()),
+            server_key_path: Some(key.path().to_string_lossy().into_owned()),
+            ..TlsConfig::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, shutdown) = watch::channel(false);
+        let handler = Arc::new(TestHandler::default());
+        let server = tokio::spawn(serve_tls(
+            listener,
+            handler.clone(),
+            shutdown,
+            server_config,
+        ));
+        let client = TlsConfig {
+            test_mode_enabled: true,
+            ..TlsConfig::default()
+        };
+        for serialize_type in [SerializeType::Json, SerializeType::RocketMq] {
+            let mut request = Command::request(2).with_body(vec![0xcd; 64 * 1024]);
+            request.serialize_type = serialize_type;
+            let response = invoke_tls(
+                &addr.to_string(),
+                request.clone(),
+                Duration::from_secs(5),
+                client.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.opaque, request.opaque);
+            assert_eq!(response.serialize_type, serialize_type);
+            assert_eq!(response.body, request.body);
+        }
         stop.send(true).unwrap();
         within(server).await.unwrap().unwrap();
     }

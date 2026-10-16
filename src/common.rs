@@ -16,6 +16,14 @@ pub enum Error {
     Invalid(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("already exists: {0}")]
+    AlreadyExists(String),
+    #[error("timeout: {0}")]
+    Timeout(String),
+    #[error("authentication/authorization failed: {0}")]
+    Auth(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

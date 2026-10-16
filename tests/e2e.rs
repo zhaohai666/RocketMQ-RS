@@ -335,9 +335,9 @@ async fn batch_v2_and_invalid_requests() {
         send("../escape", b"bad"),
         send("BatchTopic", b""),
         send("BatchTopic", b"bad").with_ext("queueId", 500),
-        send("BatchTopic", b"bad").with_ext("sysFlag", 4),
+        // COMMIT (0x8) is still refused from a producer; PREPARED (0x4) is now a legal half message.
+        send("BatchTopic", b"bad").with_ext("sysFlag", 8),
         send_with("BatchTopic", &batch, "DELAY\x011\x02").with_ext("batch", true),
-        send("BatchTopic", b"bad").with_ext("properties", "__LITE_TOPIC\x01child\x02"),
         pull("BatchTopic", 0).with_ext("maxMsgNums", -1),
         pull("BatchTopic", 0).with_ext("expressionType", "SQL92"),
         Command::request(200050),

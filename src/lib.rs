@@ -1,7 +1,15 @@
+pub mod auth;
 pub mod broker;
 pub mod common;
+pub mod container;
+pub mod controller;
 pub mod filter;
 pub mod namesrv;
+pub mod openmessaging;
+pub mod proxy;
+pub mod raft;
 pub mod remoting;
 pub mod schedule;
+pub mod srvutil;
 pub mod store;
+pub mod tieredstore;

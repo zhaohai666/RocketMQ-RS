@@ -444,6 +444,27 @@ impl Store {
         Ok(Some(read_record(&mut inner.log, physical_offset, length)?))
     }
 
+    /// One record of a queue by its queue offset, the inverse of `read`'s page walk.
+    pub fn message_by_queue_offset(
+        &self,
+        topic: &str,
+        queue_id: i32,
+        offset: u64,
+    ) -> Result<Option<Message>> {
+        let mut inner = self.lock()?;
+        let Some(queue) = inner.queues.get(&(topic.to_owned(), queue_id)) else {
+            return Ok(None);
+        };
+        let Some(&location) = queue.get(offset as usize) else {
+            return Ok(None);
+        };
+        Ok(Some(read_record(
+            &mut inner.log,
+            location.physical,
+            location.length,
+        )?))
+    }
+
     pub fn search_offset(&self, topic: &str, queue_id: i32, timestamp: i64) -> Result<u64> {
         validate_name(topic, "topic")?;
         validate_queue(queue_id)?;

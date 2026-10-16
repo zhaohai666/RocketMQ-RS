@@ -45,6 +45,33 @@ const SCHEDULE_BATCH: usize = 32;
 /// `TopicValidator.GROUP_MAX_LENGTH`
 const GROUP_MAX_LENGTH: usize = 120;
 
+/// `TransactionalMessageUtil.buildHalfTopic`: prepared messages land here, invisible to
+/// consumers, until the producer resolves them.
+pub const TRANS_HALF_TOPIC: &str = "RMQ_SYS_TRANS_HALF_TOPIC";
+/// `TransactionalMessageUtil.buildOpTopic`: one record per resolved half message, carrying the
+/// half record's physical offset, so a restart can rebuild the pending set.
+pub const TRANS_OP_TOPIC: &str = "RMQ_SYS_TRANS_OP_HALF_TOPIC";
+/// `MessageConst.PROPERTY_TRANSACTION_PREPARED`
+const TRAN_MSG: &str = "TRAN_MSG";
+/// `MessageConst.PROPERTY_REAL_QUEUE_ID`; the topic itself is `schedule::REAL_TOPIC`.
+const REAL_QID: &str = "REAL_QID";
+/// `MessageConst.PROPERTY_POP_CK`, stamped on every message a pop hands out.
+const POP_CK: &str = "RMQ_SYS_POP_CK";
+/// `MessageSysFlag.TRANSACTION_PREPARED_TYPE`
+const TRANS_PREPARED_FLAG: i32 = 0x4;
+/// `MessageSysFlag.TRANSACTION_COMMIT_TYPE`; ROLLBACK (0xC) carries this bit too.
+const TRANS_COMMIT_FLAG: i32 = 0x8;
+/// `MessageSysFlag.INNER_BATCH_FLAG`: one record whose body splits into separate queue entries.
+const INNER_BATCH_FLAG: i32 = 0x80;
+/// `BrokerConfig.transactionTimeOut`, the age a half message must reach before a check round.
+const TRANS_CHECK_TIMEOUT_MS: i64 = 6_000;
+/// `BrokerConfig.transactionCheckInterval`
+const TRANS_CHECK_INTERVAL_MS: i64 = 60_000;
+/// `PopMessageProcessor`: one page of the real queue a pop round inspects.
+const POP_SCAN_BATCH: usize = 64;
+/// The per-queue page window stays proportional to what the caller may receive.
+const POP_MAX_NUMS: usize = 32;
+
 #[derive(Clone, Debug)]
 pub struct BrokerConfig {
     pub broker_name: String,
@@ -390,8 +417,14 @@ pub struct Broker {
     wheel: Mutex<Wheel>,
     /// Stands in for the `RANDOM` draw `TimerMessageStore.isReject` makes in its middle band.
     reject_roll: AtomicU64,
+    /// `PopMessageProcessor`'s buffer: offsets handed out and still inside their invisible span,
+    /// keyed by (group, topic, queue) and holding offset -> invisible-until epoch millis.
+    pop_invisible: Mutex<BTreeMap<(String, String, i32), BTreeMap<u64, u64>>>,
+    /// `ConsumerOffsetManager`'s pop side: the next offset each (group, topic, queue) scans from.
+    pop_offsets: Mutex<BTreeMap<(String, String, i32), u64>>,
 }
 
+#[derive(Debug)]
 struct Failure {
     code: i32,
     message: String,
@@ -429,6 +462,7 @@ impl From<Error> for Failure {
             Error::Invalid(_) | Error::Json(_) => 29,
             Error::Unsupported(_) => 3,
             Error::Io(_) => 1,
+            Error::NotFound(_) | Error::AlreadyExists(_) | Error::Timeout(_) | Error::Auth(_) => 29,
         };
         Self::new(code, error.to_string())
     }
@@ -521,6 +555,14 @@ impl Broker {
                 store.put_topic(config)?;
             }
         }
+        // `TransactionalMessageBridge`: the half and op topics exist from the first start.
+        for topic in [TRANS_HALF_TOPIC, TRANS_OP_TOPIC] {
+            if !store.topics()?.contains_key(topic) {
+                let mut config = TopicConfig::new(topic, 1);
+                config.perm = 7;
+                store.put_topic(config)?;
+            }
+        }
         let mut delay_offsets = store.delay_offsets()?;
         correct_delay_offsets(&store, &levels, &mut delay_offsets);
         let mut checkpoint = store.timer_checkpoint()?;
@@ -548,6 +590,8 @@ impl Broker {
                 slots: BTreeMap::new(),
             }),
             reject_roll: AtomicU64::new(0),
+            pop_invisible: Mutex::new(BTreeMap::new()),
+            pop_offsets: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -625,10 +669,12 @@ impl Broker {
             ));
         }
         let sys_flag: i32 = request.field(key("sysFlag", "f"))?;
-        if sys_flag & (0x0c | 0xc0) != 0 {
+        // COMMIT and ROLLBACK never reach this path from a producer (0xC carries the COMMIT bit),
+        // and 0x40 is reserved; prepared and inner-batch records are accepted below.
+        if sys_flag & (TRANS_COMMIT_FLAG | 0x40) != 0 {
             return Err(Failure::new(
                 3,
-                "transactional and inner-batch messages are not implemented",
+                "commit, rollback and reserved sys flags are not accepted from producers",
             ));
         }
         let properties = decode_properties(
@@ -637,7 +683,6 @@ impl Broker {
                 .get(key("properties", "i"))
                 .map_or("", String::as_str),
         )?;
-        reject_unsupported_properties(&properties)?;
         let flag: i32 = request.field(key("flag", "h"))?;
         let born_timestamp: i64 = request.field(key("bornTimestamp", "g"))?;
         let reconsume_times = optional_field(request, key("reconsumeTimes", "j"), 0i32)?;
@@ -686,7 +731,6 @@ impl Broker {
             message.flag = entry_flag;
             message.body = body;
             message.properties.extend(entry_properties);
-            reject_unsupported_properties(&message.properties)?;
             message.encode()?;
             messages.push(message);
         }
@@ -731,6 +775,30 @@ impl Broker {
         }
         self.redirect_expired_retry(request, &topic, &mut messages)
             .await?;
+        // `SendMessageProcessor` marks a record whose producer asked for a transaction. The
+        // half copy keeps the producer's own flags (the prepared bit is re-set here because a
+        // `TRAN_MSG` property alone must still store as prepared).
+        let transactional = template
+            .properties
+            .get(TRAN_MSG)
+            .is_some_and(|value| value == "true")
+            || template.sys_flag & TRANS_PREPARED_FLAG != 0;
+        if transactional {
+            if batch_flag {
+                return Err(Failure::new(
+                    13,
+                    "a transactional message cannot be a batch",
+                ));
+            }
+            if schedule::delay_level(&template).is_ok_and(|level| level > 0)
+                || template.properties.contains_key(TIMER_OUT_MS)
+            {
+                return Err(Failure::new(
+                    3,
+                    "a transactional message cannot carry a delay level or a timer",
+                ));
+            }
+        }
         // `CommitLog.asyncPutMessages` refuses a batch that carries a delay level, and
         // `ScheduleMessageHook` parks the rest in the schedule queue instead of the real topic.
         if batch_flag {
@@ -740,6 +808,24 @@ impl Broker {
                     13,
                     "a batch message cannot carry a delay level",
                 ));
+            }
+        } else if transactional {
+            // `TransactionalMessageBridge.putHalfMessage`: the real destination moves into the
+            // properties, the record lands on the half topic, and consumers never see it.
+            for message in &mut messages {
+                message.sys_flag |= TRANS_PREPARED_FLAG;
+                message.properties.insert(
+                    schedule::REAL_TOPIC.to_owned(),
+                    std::mem::take(&mut message.topic),
+                );
+                message
+                    .properties
+                    .insert(REAL_QID.to_owned(), message.queue_id.to_string());
+                message.topic = TRANS_HALF_TOPIC.to_owned();
+                message.queue_id = 0;
+                message
+                    .properties
+                    .insert(TRAN_MSG.to_owned(), "true".to_owned());
             }
         } else {
             for message in &mut messages {
@@ -752,6 +838,37 @@ impl Broker {
                 )
                 .map_err(|error| self.schedule_failure(&error))?;
             }
+        }
+        // `CommitLog.splitInnerBatchMessage`: one record flagged `INNER_BATCH` carries several
+        // encoded records in its body; each becomes its own queue entry with the parent's
+        // destination and flags. A body that does not decode is refused at send time.
+        if !batch_flag && template.sys_flag & INNER_BATCH_FLAG != 0 {
+            let mut split = Vec::new();
+            for parent in &messages {
+                let mut rest = parent.body.as_slice();
+                while !rest.is_empty() {
+                    let (sub, consumed) = Message::decode(rest)
+                        .map_err(|_| Failure::new(13, "inner batch body does not decode"))?;
+                    rest = &rest[consumed..];
+                    split.push(Message {
+                        topic: parent.topic.clone(),
+                        queue_id: parent.queue_id,
+                        sys_flag: parent.sys_flag,
+                        flag: sub.flag,
+                        born_timestamp: parent.born_timestamp,
+                        born_host: parent.born_host,
+                        store_host: parent.store_host,
+                        reconsume_times: parent.reconsume_times,
+                        body: sub.body,
+                        properties: sub.properties,
+                        ..Message::default()
+                    });
+                }
+            }
+            if split.is_empty() || split.len() > 4096 {
+                return Err(Failure::new(13, "an inner batch must carry 1..4096 messages"));
+            }
+            messages = split;
         }
         let creating = !configs.contains_key(&topic);
         let saved = self
@@ -776,7 +893,12 @@ impl Broker {
             .with_ext("msgId", ids)
             .with_ext("queueId", queue_id)
             .with_ext("queueOffset", saved[0].queue_offset)
-            .with_ext("transactionId", "")
+            // `SendMessageProcessor` answers a prepared send with the half message's own id;
+            // the producer parses the physical offset back out of it for `END_TRANSACTION`.
+            .with_ext(
+                "transactionId",
+                transactional.then(|| saved[0].message_id()).unwrap_or_default(),
+            )
             .with_ext("MSG_REGION", "DefaultRegion")
             .with_ext("TRACE_ON", false);
         // `attachRecallHandle` only names a message the wheel is going to release, so a producer
@@ -1017,7 +1139,10 @@ impl Broker {
             return Err(Failure::new(29, "queueId out of range"));
         }
         let sys_flag: i32 = request.field("sysFlag")?;
-        if sys_flag & 16 != 0 || request.ext_fields.contains_key("liteTopic") {
+        // Lite pulling rides `LITE_PULL_MESSAGE`; the ordinary pull path still refuses it.
+        if request.code != 361
+            && (sys_flag & 16 != 0 || request.ext_fields.contains_key("liteTopic"))
+        {
             return Err(Failure::new(3, "Lite message pulling is not implemented"));
         }
         let filter = self.subscription(request, &group, &topic, sys_flag)?;
@@ -1275,6 +1400,447 @@ impl Broker {
         self.messages
             .send_modify(|generation| *generation = generation.wrapping_add(1));
         Ok(saved)
+    }
+
+    /// `EndTransactionProcessor.processRequest`: the producer resolves a half message. The half
+    /// record is looked up by the physical offset the producer parsed from its msg id; a commit
+    /// re-puts the original record on its real topic, and every outcome appends an op record so
+    /// the sweep never reports a resolved half message again.
+    async fn end_transaction(&self, request: &Command) -> BrokerResult<Command> {
+        let commit_offset: u64 = request.field("commitLogOffset")?;
+        let commit_or_rollback: i32 = request.field("commitOrRollback")?;
+        // The gRPC proxy has no producer group in its EndTransaction request, so the check is
+        // only applied when the remoting header actually carries one.
+        if let Some(group) = request.ext_fields.get("producerGroup") {
+            validate_group(group).map_err(|error| Failure::new(29, error.to_string()))?;
+        }
+        let half = self
+            .storage(move |store| store.message_at(commit_offset))
+            .await?
+            .ok_or_else(|| Failure::new(22, "the half message does not exist"))?;
+        if half.topic != TRANS_HALF_TOPIC {
+            return Err(Failure::new(
+                3,
+                "the message is not a transactional half message",
+            ));
+        }
+        match commit_or_rollback {
+            // COMMIT: `TransactionalMessageBridge.finishMessage` restores the real destination.
+            0 => {
+                let real_topic = half
+                    .properties
+                    .get(schedule::REAL_TOPIC)
+                    .cloned()
+                    .ok_or_else(|| Failure::new(3, "the half message has no real topic"))?;
+                let real_queue = half
+                    .properties
+                    .get(REAL_QID)
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .unwrap_or(half.queue_id);
+                let mut restored = half.clone();
+                restored.topic = real_topic;
+                restored.queue_id = real_queue;
+                restored.sys_flag &= !TRANS_PREPARED_FLAG;
+                restored.prepared_transaction_offset = half.physical_offset;
+                restored.properties.remove(schedule::REAL_TOPIC);
+                restored.properties.remove(REAL_QID);
+                restored.properties.remove(TRAN_MSG);
+                self.put_internal(restored).await?;
+                self.append_trans_op(half.physical_offset).await?;
+            }
+            // ROLLBACK and the producer's "no type" answer both discard the record, leaving
+            // only the op marker behind, exactly like `eraseMessage`.
+            1 | 2 => {
+                self.append_trans_op(half.physical_offset).await?;
+            }
+            _ => {
+                return Err(Failure::new(
+                    29,
+                    "commitOrRollback must be commit, rollback or not type",
+                ));
+            }
+        }
+        Ok(Command::response(request, 0))
+    }
+
+    /// `TransactionalMessageBridge.updateOpMessage`: one 8 byte big-endian half offset per record.
+    async fn append_trans_op(&self, half_offset: u64) -> BrokerResult<()> {
+        let record = Message {
+            topic: TRANS_OP_TOPIC.to_owned(),
+            queue_id: 0,
+            store_host: self.config.advertised_addr,
+            body: half_offset.to_be_bytes().to_vec(),
+            ..Message::default()
+        };
+        self.storage(move |store| store.append_internal(vec![record]))
+            .await?;
+        Ok(())
+    }
+
+    /// `PopMessageProcessor.processRequest`: consume through an invisible buffer instead of a
+    /// plain offset. Expired invisible entries are handed out first, then a fresh page of the
+    /// real queue is scanned from this group's pop cursor.
+    async fn pop(&self, request: &Command) -> BrokerResult<Command> {
+        let group = request.required("consumerGroup")?.to_owned();
+        let topic = request.required("topic")?.to_owned();
+        let queue_id: i32 = request.field("queueId")?;
+        let max_nums = optional_field(request, "maxMsgNums", 1usize)?
+            .clamp(1, POP_MAX_NUMS);
+        let invisible_time = optional_field(request, "invisibleTime", 15_000i64)?.clamp(0, 3_600_000);
+        validate_name(&group)?;
+        validate_topic_name(&topic)?;
+        let group_config = match self.group_config(&group).await? {
+            Some(config) => config,
+            None => {
+                return Err(Failure::new(
+                    26,
+                    format!("subscription group [{group}] does not exist"),
+                ));
+            }
+        };
+        if !group_config.consume_enable {
+            return Err(
+                Failure::new(16, format!("subscription group no permission, {group}"))
+                    .forbidden(2),
+            );
+        }
+        let config = self
+            .store
+            .topics()?
+            .get(&topic)
+            .cloned()
+            .ok_or_else(|| Failure::new(17, "topic does not exist"))?;
+        if config.perm & 4 == 0 {
+            return Err(Failure::new(
+                16,
+                format!("the topic[{topic}] pulling message is forbidden"),
+            )
+            .forbidden(3));
+        }
+        let queues: Vec<i32> = if queue_id < 0 {
+            (0..config.read_queue_nums).collect()
+        } else {
+            if queue_id >= config.read_queue_nums {
+                return Err(Failure::new(29, "queueId out of range"));
+            }
+            vec![queue_id]
+        };
+        // `PopMessageProcessor` evaluates the request's expression; only tags are modelled.
+        let expression = request.ext_fields.get("exp").cloned().unwrap_or_default();
+        let expression_type = request
+            .ext_fields
+            .get("expType")
+            .cloned()
+            .unwrap_or_else(|| "TAG".to_owned());
+        let subscription = if expression.is_empty() || expression == "*" {
+            None
+        } else {
+            if !filter::is_tag_type(Some(&expression_type)) {
+                return Err(Failure::new(
+                    1,
+                    format!("the broker does not support pop filtering by {expression_type}"),
+                ));
+            }
+            Some(
+                Subscription::build(Some("TAG"), &expression)
+                    .map_err(|_| Failure::new(23, "parse the consumer's subscription failed"))?,
+            )
+        };
+        let now = now_millis();
+        let invisible_until = now + invisible_time;
+        // Phase one, under the locks: expired offsets and scan starts per queue. The guards are
+        // dropped before any I/O, exactly like the pull path keeps its lock scope tight.
+        struct Plan {
+            expired: Vec<u64>,
+            start: u64,
+        }
+        let mut plans: BTreeMap<i32, Plan> = BTreeMap::new();
+        {
+            let invisible = self.pop_invisible.lock().unwrap();
+            let offsets = self.pop_offsets.lock().unwrap();
+            for queue in &queues {
+                let key = (group.clone(), topic.clone(), *queue);
+                let expired = invisible
+                    .get(&key)
+                    .map(|seen| {
+                        seen.iter()
+                            .filter(|(_, until)| **until <= now as u64)
+                            .map(|(offset, _)| *offset)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let start = offsets.get(&key).copied().unwrap_or_else(|| {
+                    self.store
+                        .consumer_offset(&group, &topic, *queue)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0)
+                });
+                plans.insert(*queue, Plan { expired, start });
+            }
+        }
+        // Phase two: the reads. Expired entries are offered before a fresh page of the queue,
+        // in queue order, until the caller's count is reached.
+        let mut delivered: Vec<Message> = Vec::new();
+        for queue_id in &queues {
+            let queue = *queue_id;
+            let Some(plan) = plans.get(&queue) else { continue };
+            for offset in &plan.expired {
+                if delivered.len() >= max_nums {
+                    break;
+                }
+                let topic = topic.clone();
+                let offset = *offset;
+                if let Some(message) = self
+                    .storage(move |store| store.message_by_queue_offset(&topic, queue, offset))
+                    .await?
+                {
+                    if subscription.as_ref().is_none_or(|s| s.matches(&message)) {
+                        delivered.push(message);
+                    }
+                }
+            }
+            if delivered.len() >= max_nums {
+                continue;
+            }
+            let topic = topic.clone();
+            let start = plan.start;
+            let read = self
+                .storage(move |store| {
+                    store.read(&topic, queue, start, POP_SCAN_BATCH, MAX_PULL_BYTES, None)
+                })
+                .await?;
+            for message in read.messages {
+                if delivered.len() >= max_nums {
+                    break;
+                }
+                if !subscription.as_ref().is_none_or(|s| s.matches(&message)) {
+                    continue;
+                }
+                delivered.push(message);
+            }
+        }
+        // Phase three: register what was handed out and advance the cursors. A racing pop that
+        // already claimed an offset loses it here, which mirrors the buffer's atomic claim.
+        let mut new_offsets: BTreeMap<i32, u64> = BTreeMap::new();
+        {
+            let mut invisible = self.pop_invisible.lock().unwrap();
+            let mut offsets = self.pop_offsets.lock().unwrap();
+            for message in &delivered {
+                let key = (group.clone(), topic.clone(), message.queue_id);
+                let seen = invisible.entry(key).or_default();
+                seen.insert(message.queue_offset, invisible_until as u64);
+                let next = new_offsets
+                    .entry(message.queue_id)
+                    .or_insert_with(|| {
+                        offsets
+                            .get(&(group.clone(), topic.clone(), message.queue_id))
+                            .copied()
+                            .unwrap_or_else(|| {
+                                self.store
+                                    .consumer_offset(&group, &topic, message.queue_id)
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(0)
+                            })
+                    });
+                *next = (*next).max(message.queue_offset + 1);
+            }
+            for (queue, next) in &new_offsets {
+                offsets.insert((group.clone(), topic.clone(), *queue), *next);
+            }
+        }
+        if delivered.is_empty() {
+            return Ok(Command::response(request, 0));
+        }
+        let mut body = Vec::new();
+        let mut first_ck = String::new();
+        for (index, message) in delivered.iter().enumerate() {
+            let ck = pop_ck(
+                &topic,
+                &group,
+                message.queue_id,
+                message.queue_offset,
+                now,
+                invisible_until,
+            );
+            if index == 0 {
+                first_ck = ck.clone();
+            }
+            let mut stamped = message.clone();
+            stamped.properties.insert(POP_CK.to_owned(), ck);
+            body.extend(stamped.encode()?);
+        }
+        let rest_num: u64 = delivered
+            .iter()
+            .map(|message| {
+                self.store
+                    .queue_max_offset(&topic, message.queue_id)
+                    .saturating_sub(message.queue_offset + 1)
+            })
+            .sum();
+        Ok(Command::response(request, 0)
+            .with_ext("popCk", first_ck)
+            .with_ext("popTime", now)
+            .with_ext("invisibleTime", invisible_time)
+            .with_ext("reviveQid", 0)
+            .with_ext("restNum", rest_num as i64)
+            .with_body(body))
+    }
+
+    /// `AckMessageProcessor.processRequest`: an ack clears the invisible entry, whether it was
+    /// addressed by its receipt handle or by its coordinates.
+    async fn ack_pop(&self, request: &Command) -> BrokerResult<Command> {
+        // parse_pop_ck yields (topic, group, queue, offset) — the map is keyed (group, topic).
+        let (topic, group, queue_id, offset) = match request.ext_fields.get("extraInfo") {
+            Some(ck) => parse_pop_ck(ck)
+                .ok_or_else(|| Failure::new(3, "the receipt handle does not decode"))?,
+            None => {
+                let group = request.required("consumerGroup")?.to_owned();
+                let topic = request.required("topic")?.to_owned();
+                let queue_id: i32 = request.field("queueId")?;
+                let offset: u64 = request.field("offset")?;
+                (topic, group, queue_id, offset)
+            }
+        };
+        self.pop_invisible
+            .lock()
+            .unwrap()
+            .get_mut(&(group.clone(), topic.clone(), queue_id))
+            .map(|entries| entries.remove(&offset));
+        // `PopBufferMergeService`: an ack eventually becomes the group's committed offset so a
+        // restart does not re-deliver records that were already consumed. Only advancing writes.
+        let next = offset + 1;
+        let committed = {
+            let group = group.clone();
+            let topic = topic.clone();
+            self.storage(move |store| Ok(store.consumer_offset(&group, &topic, queue_id)?))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+        };
+        if next > committed {
+            self.storage(move |store| store.commit_offset(&group, &topic, queue_id, next))
+                .await?;
+        }
+        Ok(Command::response(request, 0))
+    }
+
+    /// `ChangeInvisibleTimeProcessor.processRequest`: replace the invisible span of one
+    /// outstanding message, addressed the same way an ack is.
+    async fn change_invisible(&self, request: &Command) -> BrokerResult<Command> {
+        let invisible_time = request.field::<i64>("invisibleTime")?.clamp(0, 3_600_000);
+        // parse_pop_ck yields (topic, group, queue, offset) — the map is keyed (group, topic).
+        let (topic, group, queue_id, offset) = match request.ext_fields.get("extraInfo") {
+            Some(ck) => parse_pop_ck(ck)
+                .ok_or_else(|| Failure::new(3, "the receipt handle does not decode"))?,
+            None => {
+                let group = request.required("consumerGroup")?.to_owned();
+                let topic = request.required("topic")?.to_owned();
+                let queue_id: i32 = request.field("queueId")?;
+                let offset: u64 = request.field("offset")?;
+                (topic, group, queue_id, offset)
+            }
+        };
+        let until = now_millis() + invisible_time;
+        self.pop_invisible
+            .lock()
+            .unwrap()
+            .get_mut(&(group, topic, queue_id))
+            .map(|entries| entries.insert(offset, until as u64));
+        Ok(Command::response(request, 0))
+    }
+
+    /// `TransactionalMessageService.check`: half messages a producer never resolved are reported
+    /// once `transactionTimeOut` passes. The reference asks its producer over the live channel;
+    /// this server has no push channel, so the sweep only reports, and the half message stays
+    /// pending until an `END_TRANSACTION` arrives. Op records decide what was already resolved.
+    pub async fn run_transaction_check(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        let mut pending: BTreeMap<u64, i64> = BTreeMap::new();
+        let mut reported: BTreeSet<u64> = BTreeSet::new();
+        loop {
+            let mut wake = TRANS_CHECK_INTERVAL_MS;
+            // `TransactionalMessageBridge.fetchOpInfo`: one page of op offsets decides which
+            // half records were resolved.
+            let op_len = self
+                .storage(move |store| Ok(store.queue_max_offset(TRANS_OP_TOPIC, 0)))
+                .await
+                .unwrap_or(0);
+            let resolved: BTreeSet<u64> = if op_len == 0 {
+                BTreeSet::new()
+            } else {
+                match self
+                    .storage(move |store| {
+                        store.read(TRANS_OP_TOPIC, 0, 0, op_len as usize, MAX_PULL_BYTES, None)
+                    })
+                    .await
+                {
+                    Ok(read) => read
+                        .messages
+                        .iter()
+                        .filter_map(|message| {
+                            if message.body.len() == 8 {
+                                Some(u64::from_be_bytes(message.body[..8].try_into().unwrap()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                    Err(error) => {
+                        warn!(error = error.to_string().as_str(), "op topic scan failed");
+                        wake = wake.min(SCHEDULE_POLL_MS);
+                        BTreeSet::new()
+                    }
+                }
+            };
+            pending.retain(|offset, _| !resolved.contains(offset));
+            reported.retain(|offset| resolved.contains(offset) || pending.contains_key(offset));
+            // `TransactionalMessageBridge.fetchHalfMessage`: new half records join the set.
+            let cursor = pending.keys().next_back().copied().unwrap_or(0);
+            let max = self
+                .storage(move |store| Ok(store.queue_max_offset(TRANS_HALF_TOPIC, 0)))
+                .await
+                .unwrap_or(0);
+            if max > cursor {
+                if let Ok(read) = self
+                    .storage(move |store| {
+                        store.read(
+                            TRANS_HALF_TOPIC,
+                            0,
+                            cursor,
+                            ((max - cursor) as usize).min(POP_SCAN_BATCH),
+                            MAX_PULL_BYTES,
+                            None,
+                        )
+                    })
+                    .await
+                {
+                    for message in read.messages {
+                        pending.insert(message.queue_offset, message.store_timestamp);
+                    }
+                }
+            }
+            let now = now_millis();
+            for (offset, stored_at) in &pending {
+                if now - stored_at >= TRANS_CHECK_TIMEOUT_MS && reported.insert(*offset) {
+                    warn!(
+                        half_offset = offset,
+                        age_ms = now - stored_at,
+                        "transaction half message is still unresolved"
+                    );
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(wake.max(1) as u64)) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow_and_update() {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// One level of `DeliverDelayedMessageTimerTask.executeOnTimeUp`; `wake` is the earliest
@@ -1743,7 +2309,21 @@ impl Broker {
             ));
         }
 
-        let message = self.storage(move |store| store.message_at(offset)).await?;
+        let message = if let Some(origin_topic) = request
+            .ext_fields
+            .get("originTopic")
+            .map(String::as_str)
+            .filter(|topic| !topic.is_empty() && self.store.topics().is_ok_and(|topics| topics.contains_key(*topic)))
+        {
+            // `SendMsgBackRequestHeader.originTopic` + `queueId`: the offset names a position in
+            // the origin topic's queue, which is what the gRPC proxy's DLQ forward carries.
+            let queue_id = optional_field(request, "queueId", 0i32)?;
+            let topic = origin_topic.to_owned();
+            self.storage(move |store| store.message_by_queue_offset(&topic, queue_id, offset))
+                .await?
+        } else {
+            self.storage(move |store| store.message_at(offset)).await?
+        };
         let Some(message) = message else {
             return Err(Failure::new(
                 1,
@@ -1880,9 +2460,13 @@ impl Broker {
     async fn process(&self, request: &Command, peer: SocketAddr) -> BrokerResult<Command> {
         match request.code {
             10 | 310 | 320 => self.send(request, peer).await,
-            11 => self.pull(request).await,
+            11 | 361 => self.pull(request).await,
             36 => self.send_back(request).await,
             370 => self.recall(request, peer).await,
+            37 => self.end_transaction(request).await,
+            200050 => self.pop(request).await,
+            200051 => self.ack_pop(request).await,
+            200053 => self.change_invisible(request).await,
             34 => self.heartbeat(request, peer).await,
             35 => {
                 let client_id = request.required("clientID")?;
@@ -2168,27 +2752,31 @@ fn optional_field<T: std::str::FromStr>(request: &Command, key: &str, default: T
     }
 }
 
-/// Properties whose broker-side behaviour this server does not implement yet.
-///
-/// Delay levels, accurate timers and the timer recall are all handled, by
-/// `schedule::handle_schedule_message` and the wheel; only the transaction half message stays
-/// outside the current feature set. A `TIMER_DEL_UNIQKEY` a producer sets by itself is left alone
-/// here, because the reference only inspects it on the timer path and the wheel ignores a record
-/// that carries no deliver time.
-fn reject_unsupported_properties(properties: &BTreeMap<String, String>) -> BrokerResult<()> {
-    if properties.contains_key("__LITE_TOPIC") {
-        return Err(Failure::new(3, "Lite message delivery is not implemented"));
+/// The receipt handle one pop hands out. Names may carry `|` but never `,`, so the comma is a
+/// safe separator; the caller only ever decodes handles this broker produced.
+fn pop_ck(
+    topic: &str,
+    group: &str,
+    queue_id: i32,
+    offset: u64,
+    pop_time: i64,
+    invisible_until: i64,
+) -> String {
+    format!("{topic},{group},{queue_id},{offset},{pop_time},{invisible_until}")
+}
+
+/// Decodes a receipt handle back to its coordinates; the timestamps are informational.
+fn parse_pop_ck(ck: &str) -> Option<(String, String, i32, u64)> {
+    let parts: Vec<&str> = ck.split(',').collect();
+    if parts.len() != 6 {
+        return None;
     }
-    if properties
-        .get("TRAN_MSG")
-        .is_some_and(|value| value == "true")
-    {
-        return Err(Failure::new(
-            3,
-            "transactional half messages are not implemented",
-        ));
-    }
-    Ok(())
+    Some((
+        parts[0].to_owned(),
+        parts[1].to_owned(),
+        parts[2].parse().ok()?,
+        parts[3].parse().ok()?,
+    ))
 }
 
 fn json_response(request: &Command, value: serde_json::Value) -> BrokerResult<Command> {
@@ -2370,5 +2958,300 @@ mod tests {
         let entry = restored.get("orders", "g").unwrap();
         assert!(entry.compiled.is_none());
         assert_eq!(entry.client_version, 9);
+    }
+
+    async fn test_broker() -> (TempDir, Broker) {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let broker = Broker::new(store, BrokerConfig::default()).unwrap();
+        (dir, broker)
+    }
+
+    fn peer() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 5_555))
+    }
+
+    fn encode_props(properties: &[(&str, &str)]) -> String {
+        properties
+            .iter()
+            .map(|(key, value)| format!("{key}\x01{value}\x02"))
+            .collect()
+    }
+
+    fn send_request(topic: &str, body: &[u8], properties: &str, sys_flag: i32) -> Command {
+        // Code 310 is the v2 send: the broker reads the short-name header fields, and the
+        // auto-create branch needs the default-topic template.
+        Command::request(310)
+            .with_ext("b", topic)
+            .with_ext("a", "g")
+            .with_ext("c", "TBW102")
+            .with_ext("d", 8)
+            .with_ext("e", 0)
+            .with_ext("f", sys_flag)
+            .with_ext("h", 0)
+            .with_ext("g", now_millis())
+            .with_body(body.to_vec())
+            .with_ext("i", properties)
+    }
+
+    /// A half message's msg id ends with its physical offset in hex, like the reference's.
+    fn physical_offset_from_msg_id(msg_id: &str) -> u64 {
+        u64::from_str_radix(&msg_id[msg_id.len() - 16..], 16).unwrap()
+    }
+
+    fn decode_records(body: &[u8]) -> Vec<Message> {
+        let mut messages = Vec::new();
+        let mut rest = body;
+        while !rest.is_empty() {
+            let (message, consumed) = Message::decode(rest).unwrap();
+            rest = &rest[consumed..];
+            messages.push(message);
+        }
+        messages
+    }
+
+    #[tokio::test]
+    async fn transactional_messages_resolve_through_end_transaction() {
+        let (_dir, broker) = test_broker().await;
+        let send = send_request("orders", b"payload", &encode_props(&[("TRAN_MSG", "true")]), 0);
+        let response = broker.process(&send, peer()).await.unwrap();
+        // The half record lands on the half topic, never on the real one.
+        assert_eq!(broker.store.queue_max_offset(TRANS_HALF_TOPIC, 0), 1);
+        assert_eq!(broker.store.queue_max_offset("orders", 0), 0);
+        let half = broker
+            .store
+            .message_by_queue_offset(TRANS_HALF_TOPIC, 0, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(half.sys_flag & TRANS_PREPARED_FLAG, TRANS_PREPARED_FLAG);
+        assert_eq!(half.properties.get(schedule::REAL_TOPIC).unwrap(), "orders");
+        assert_eq!(half.properties.get(REAL_QID).unwrap(), "0");
+        assert_eq!(response.ext_fields["msgId"], half.message_id());
+        let parsed = physical_offset_from_msg_id(&response.ext_fields["msgId"]);
+        assert_eq!(parsed, half.physical_offset);
+        assert_eq!(response.ext_fields["transactionId"], half.message_id());
+        // COMMIT restores the real destination with the prepared bit cleared.
+        let commit = Command::request(37)
+            .with_ext("commitLogOffset", half.physical_offset)
+            .with_ext("commitOrRollback", 0)
+            .with_ext("producerGroup", "g");
+        broker.process(&commit, peer()).await.unwrap();
+        assert_eq!(broker.store.queue_max_offset("orders", 0), 1);
+        assert_eq!(broker.store.queue_max_offset(TRANS_OP_TOPIC, 0), 1);
+        let delivered = broker
+            .store
+            .message_by_queue_offset("orders", 0, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.body, b"payload");
+        assert_eq!(delivered.sys_flag & TRANS_PREPARED_FLAG, 0);
+        assert!(!delivered.properties.contains_key(schedule::REAL_TOPIC));
+        assert!(!delivered.properties.contains_key(TRAN_MSG));
+        // ROLLBACK discards the record and appends the op marker only.
+        let second_send =
+            send_request("orders", b"payload2", &encode_props(&[("TRAN_MSG", "true")]), 0);
+        let second = broker.process(&second_send, peer()).await.unwrap();
+        let second_half = broker
+            .store
+            .message_by_queue_offset(TRANS_HALF_TOPIC, 0, 1)
+            .unwrap()
+            .unwrap();
+        let rollback = Command::request(37)
+            .with_ext("commitLogOffset", physical_offset_from_msg_id(&second.ext_fields["msgId"]))
+            .with_ext("commitOrRollback", 1)
+            .with_ext("producerGroup", "g");
+        broker.process(&rollback, peer()).await.unwrap();
+        assert_eq!(broker.store.queue_max_offset("orders", 0), 1);
+        assert_eq!(broker.store.queue_max_offset(TRANS_OP_TOPIC, 0), 2);
+        let _ = second_half;
+        // The gRPC proxy sends END_TRANSACTION without a producer group.
+        let third_send =
+            send_request("orders", b"payload3", &encode_props(&[("TRAN_MSG", "true")]), 0);
+        let third = broker.process(&third_send, peer()).await.unwrap();
+        let commit = Command::request(37)
+            .with_ext("commitLogOffset", physical_offset_from_msg_id(&third.ext_fields["msgId"]))
+            .with_ext("commitOrRollback", 0);
+        broker.process(&commit, peer()).await.unwrap();
+        assert_eq!(broker.store.queue_max_offset("orders", 0), 2);
+        // A bogus physical offset is refused outright.
+        let wrong = Command::request(37)
+            .with_ext("commitLogOffset", 999_999_999u64)
+            .with_ext("commitOrRollback", 0)
+            .with_ext("producerGroup", "g");
+        assert!(broker.process(&wrong, peer()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn send_back_resolves_queue_offsets_through_the_origin_topic() {
+        let (_dir, broker) = test_broker().await;
+        for index in 0..2 {
+            let send = send_request("orders", format!("m{index}").as_bytes(), "", 0);
+            broker.process(&send, peer()).await.unwrap();
+        }
+        let group_config = crate::schedule::GroupConfig::new("back-group");
+        broker.store().put_group(group_config).unwrap();
+        // delayLevel < 0 routes the record straight into the dead-letter topic; the offset is
+        // the origin queue offset the proxy's receipt handle carries.
+        let send_back = Command::request(36)
+            .with_ext("group", "back-group")
+            .with_ext("offset", 1u64)
+            .with_ext("delayLevel", -1)
+            .with_ext("originTopic", "orders")
+            .with_ext("queueId", 0);
+        broker.process(&send_back, peer()).await.unwrap();
+        assert_eq!(broker.store.queue_max_offset("%DLQ%back-group", 0), 1);
+        let dlq_record = broker
+            .store
+            .message_by_queue_offset("%DLQ%back-group", 0, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(dlq_record.body, b"m1");
+        assert_eq!(dlq_record.properties.get(schedule::REAL_TOPIC), None);
+        assert_eq!(
+            dlq_record
+                .properties
+                .get(schedule::RETRY_TOPIC)
+                .map(String::as_str),
+            Some("orders")
+        );
+        // An origin topic the broker does not host falls back to the physical lookup.
+        let legacy = Command::request(36)
+            .with_ext("group", "back-group")
+            .with_ext("offset", 0u64)
+            .with_ext("delayLevel", -1)
+            .with_ext("originTopic", "unused");
+        broker.process(&legacy, peer()).await.unwrap();
+        assert_eq!(broker.store.queue_max_offset("%DLQ%back-group", 0), 2);
+    }
+
+    #[tokio::test]
+    async fn pop_acks_persist_the_consumer_offset() {
+        let (_dir, broker) = test_broker().await;
+        for index in 0..2 {
+            let send = send_request("orders", format!("m{index}").as_bytes(), "", 0);
+            broker.process(&send, peer()).await.unwrap();
+        }
+        let pop = Command::request(200050)
+            .with_ext("consumerGroup", "cg")
+            .with_ext("topic", "orders")
+            .with_ext("queueId", 0)
+            .with_ext("maxMsgNums", 1)
+            .with_ext("invisibleTime", 100);
+        let first = broker.process(&pop, peer()).await.unwrap();
+        let delivered = decode_records(&first.body);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].body, b"m0");
+        // Nothing is committed before the ack.
+        assert_eq!(
+            broker
+                .store
+                .consumer_offset("cg", "orders", 0)
+                .unwrap()
+                .unwrap_or(0),
+            0
+        );
+        let ack = Command::request(200051)
+            .with_ext("extraInfo", delivered[0].properties[POP_CK].as_str());
+        broker.process(&ack, peer()).await.unwrap();
+        assert_eq!(
+            broker
+                .store
+                .consumer_offset("cg", "orders", 0)
+                .unwrap()
+                .unwrap_or(0),
+            1
+        );
+        // A stale ack never moves the offset backwards.
+        let stale = Command::request(200051)
+            .with_ext("extraInfo", delivered[0].properties[POP_CK].as_str());
+        broker.process(&stale, peer()).await.unwrap();
+        assert_eq!(
+            broker
+                .store
+                .consumer_offset("cg", "orders", 0)
+                .unwrap()
+                .unwrap_or(0),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn pop_delivers_stamps_receipts_and_revives_expired_entries() {
+        let (_dir, broker) = test_broker().await;
+        for index in 0..3 {
+            let send = send_request("orders", format!("m{index}").as_bytes(), "", 0);
+            broker.process(&send, peer()).await.unwrap();
+        }
+        let pop = || {
+            Command::request(200050)
+                .with_ext("consumerGroup", "cg")
+                .with_ext("topic", "orders")
+                .with_ext("queueId", 0)
+                .with_ext("maxMsgNums", 2)
+                .with_ext("invisibleTime", 100)
+        };
+        let first = broker.process(&pop(), peer()).await.unwrap();
+        let first_batch = decode_records(&first.body);
+        assert_eq!(first_batch.len(), 2);
+        for message in &first_batch {
+            assert!(message.body == b"m0" || message.body == b"m1");
+        }
+        assert!(first_batch[0].properties.contains_key(POP_CK));
+        assert!(first.ext_fields.contains_key("popCk"));
+        assert!(first.ext_fields.contains_key("restNum"));
+        // The cursor advanced past both delivered offsets, so the third is next.
+        let second = broker.process(&pop(), peer()).await.unwrap();
+        let second_batch = decode_records(&second.body);
+        assert_eq!(second_batch.len(), 1);
+        assert_eq!(second_batch[0].body, b"m2");
+        // Everything outstanding sits inside its invisible span.
+        let third = broker.process(&pop(), peer()).await.unwrap();
+        assert!(decode_records(&third.body).is_empty());
+        // An ack clears one entry, a longer invisible span defers another.
+        let ack = Command::request(200051)
+            .with_ext("extraInfo", first_batch[0].properties[POP_CK].as_str());
+        broker.process(&ack, peer()).await.unwrap();
+        let change = Command::request(200053)
+            .with_ext("extraInfo", second_batch[0].properties[POP_CK].as_str())
+            .with_ext("invisibleTime", 3_600_000);
+        broker.process(&change, peer()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let fourth = broker.process(&pop(), peer()).await.unwrap();
+        let revived = decode_records(&fourth.body);
+        // The acked offset stays consumed, the deferred one stays invisible, only the
+        // middle offset comes back.
+        assert_eq!(revived.len(), 1);
+        assert_eq!(revived[0].body, b"m1");
+    }
+
+    #[tokio::test]
+    async fn inner_batch_records_split_into_queue_entries() {
+        let (_dir, broker) = test_broker().await;
+        let sub = |body: &[u8]| Message {
+            topic: "orders".into(),
+            queue_id: 0,
+            body: body.to_vec(),
+            born_host: peer(),
+            store_host: peer(),
+            ..Message::default()
+        };
+        let mut body = sub(b"first").encode().unwrap();
+        body.extend(sub(b"second").encode().unwrap());
+        let send = send_request("orders", &body, "", INNER_BATCH_FLAG);
+        broker.process(&send, peer()).await.unwrap();
+        assert_eq!(broker.store.queue_max_offset("orders", 0), 2);
+        let first = broker
+            .store
+            .message_by_queue_offset("orders", 0, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.body, b"first");
+        assert_eq!(first.sys_flag & INNER_BATCH_FLAG, INNER_BATCH_FLAG);
+        let second = broker
+            .store
+            .message_by_queue_offset("orders", 0, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.body, b"second");
     }
 }

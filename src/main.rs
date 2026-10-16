@@ -8,7 +8,10 @@ use std::time::Duration;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use rocketmq_rs::broker::{Broker, BrokerConfig};
 use rocketmq_rs::common::{Error, Result};
+use rocketmq_rs::container::{BrokerContainer, BrokerContainerConfig};
+use rocketmq_rs::controller::{ControllerConfig, ControllerManager};
 use rocketmq_rs::namesrv::Namesrv;
+use rocketmq_rs::proxy::{ProxyConfig, ProxyContext};
 use rocketmq_rs::remoting::{Command, Handler, invoke, serve};
 use rocketmq_rs::store::Store;
 use tokio::net::TcpListener;
@@ -38,6 +41,12 @@ enum Commands {
     Broker(BrokerArgs),
     /// Run a NameServer and broker in one process for development/testing, not Java broker-container dynamic management.
     Standalone(StandaloneArgs),
+    /// Run the HA controller (master election, sync-state management).
+    Controller(ControllerArgs),
+    /// Run the v2 gRPC proxy in front of namesrv/brokers.
+    Proxy(ProxyArgs),
+    /// Host several statically-configured brokers in one process.
+    Container(ContainerArgs),
     /// Inspect clusters/routes/runtime or create a topic.
     Admin(AdminArgs),
 }
@@ -115,6 +124,31 @@ struct StandaloneArgs {
     /// BrokerConfig.recallMessageEnable
     #[arg(long, default_value_t = false, action = ArgAction::Set)]
     recall_message_enable: bool,
+}
+
+#[derive(Debug, Args)]
+struct ControllerArgs {
+    #[arg(long, default_value = "127.0.0.1:9878")]
+    listen: SocketAddr,
+}
+
+#[derive(Debug, Args)]
+struct ProxyArgs {
+    #[arg(long, default_value = "127.0.0.1:8081")]
+    listen: SocketAddr,
+    /// Optional JSON ProxyConfig file; CLI flags override its values.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// NameServer host:port addresses; repeat this flag or separate with ';'.
+    #[arg(long, value_delimiter = ';', action = ArgAction::Append, value_parser = parse_endpoint)]
+    namesrv: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct ContainerArgs {
+    /// JSON BrokerContainerConfig file describing the hosted inner brokers.
+    #[arg(long)]
+    config: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -245,13 +279,82 @@ async fn run(cli: Cli) -> Result<()> {
 
     let signals = ShutdownSignals::new()?;
     warn!("{SECURITY_NOTICE}");
-    let services = match cli.command {
-        Commands::Namesrv(args) => prepare_namesrv(args).await?,
-        Commands::Broker(args) => prepare_broker(args).await?,
-        Commands::Standalone(args) => prepare_standalone(args).await?,
+    match cli.command {
+        Commands::Namesrv(args) => supervise(prepare_namesrv(args).await?, signals).await,
+        Commands::Broker(args) => supervise(prepare_broker(args).await?, signals).await,
+        Commands::Standalone(args) => supervise(prepare_standalone(args).await?, signals).await,
+        Commands::Controller(args) => run_controller(args, signals).await,
+        Commands::Proxy(args) => run_proxy(args, signals).await,
+        Commands::Container(args) => run_container(args, signals).await,
         Commands::Admin(_) => return Err(Error::Invalid("unexpected admin command".into())),
+    }
+}
+
+/// Java `ControllerManager.startup`: serve the controller and run its re-election loop.
+async fn run_controller(args: ControllerArgs, mut signals: ShutdownSignals) -> Result<()> {
+    let (listener, actual) = bind_listener("controller", args.listen).await?;
+    info!(listen = %actual, "controller starting");
+    let manager = ControllerManager::new(ControllerConfig::default());
+    let (stop, shutdown) = watch::channel(false);
+    let mut task = tokio::spawn(manager.clone().run(listener, shutdown.clone()));
+    tokio::select! {
+        joined = &mut task => {
+            joined.map_err(|error| Error::Io(io::Error::other(error)))?
+        }
+        _ = signals.wait() => {
+            let _ = stop.send(true);
+            task.await.map_err(|error| Error::Io(io::Error::other(error)))?
+        }
+    }
+}
+
+/// Java `ProxyStartup`: host the v2 gRPC proxy (MessagingService + Admin).
+async fn run_proxy(args: ProxyArgs, mut signals: ShutdownSignals) -> Result<()> {
+    let (listener, actual) = bind_listener("proxy-grpc", args.listen).await?;
+    let mut config = match &args.config {
+        Some(path) => ProxyConfig::load(path.to_str().unwrap_or_default())?,
+        None => ProxyConfig::default(),
     };
-    supervise(services, signals).await
+    if !args.namesrv.is_empty() {
+        config.name_server_address = args.namesrv.clone();
+    }
+    config.validate()?;
+    if config.name_server_address.is_empty() {
+        warn!("proxy has no nameserver address; route queries will fail until one is configured");
+    }
+    info!(listen = %actual, nameservers = ?config.name_server_address, "gRPC proxy starting");
+    let context = ProxyContext::new(config);
+    let (stop, shutdown) = watch::channel(false);
+    let mut task = tokio::spawn(rocketmq_rs::proxy::serve_proxy(listener, context, shutdown.clone()));
+    tokio::select! {
+        joined = &mut task => {
+            joined.map_err(|error| Error::Io(io::Error::other(error)))?
+        }
+        _ = signals.wait() => {
+            let _ = stop.send(true);
+            task.await.map_err(|error| Error::Io(io::Error::other(error)))?
+        }
+    }
+}
+
+/// Java `BrokerContainerStartup`: host statically configured inner brokers.
+async fn run_container(args: ContainerArgs, mut signals: ShutdownSignals) -> Result<()> {
+    let config = BrokerContainerConfig::load(&args.config)?;
+    let mut container = BrokerContainer::from_config(config)?;
+    let (stop, shutdown) = watch::channel(false);
+    let mut task = tokio::spawn(async move {
+        container.start(shutdown).await?;
+        container.wait().await
+    });
+    tokio::select! {
+        joined = &mut task => {
+            joined.map_err(|error| Error::Io(io::Error::other(error)))?
+        }
+        _ = signals.wait() => {
+            let _ = stop.send(true);
+            task.await.map_err(|error| Error::Io(io::Error::other(error)))?
+        }
+    }
 }
 
 struct Server {
@@ -492,6 +595,15 @@ async fn supervise(services: Services, mut signals: ShutdownSignals) -> Result<(
             (
                 "delay delivery",
                 broker.run_scheduler(scheduler_shutdown).await,
+            )
+        });
+    }
+    if let Some(broker) = services.broker.clone() {
+        let trans_shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            (
+                "transaction check",
+                broker.run_transaction_check(trans_shutdown).await,
             )
         });
     }
