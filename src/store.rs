@@ -56,6 +56,17 @@ struct Location {
     timestamp_ceiling: i64,
 }
 
+/// One commitlog record's position in the message-key index: where the record sits in
+/// its consume queue and when it was stored (Java `IndexFile`'s `(topic@key) -> idx`).
+#[derive(Clone, Copy)]
+struct KeyLocation {
+    physical: u64,
+    timestamp: i64,
+}
+
+/// `(topic, message key) -> commitlog positions`, appended in commitlog order.
+type Keys = BTreeMap<(String, String), Vec<KeyLocation>>;
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Offsets {
@@ -66,6 +77,7 @@ struct Inner {
     directory: PathBuf,
     log: File,
     queues: Queues,
+    key_index: Keys,
     physical: BTreeMap<u64, u32>,
     committed_len: u64,
     topics: BTreeMap<String, TopicConfig>,
@@ -224,7 +236,7 @@ impl Store {
             .append(true)
             .create(true)
             .open(&log_path)?;
-        let (queues, physical, committed_len) = recover(&mut log, &mut topics)?;
+        let (queues, physical, key_index, committed_len) = recover(&mut log, &mut topics)?;
         log.sync_all()?;
         sync_directory(&directory)?;
         Ok(Self {
@@ -232,6 +244,7 @@ impl Store {
                 directory,
                 log,
                 queues,
+                key_index,
                 physical,
                 committed_len,
                 topics,
@@ -351,6 +364,7 @@ impl Store {
         let mut result = Vec::with_capacity(prepared.len());
         for (message, length) in prepared {
             add_index(&mut inner.queues, &message, length);
+            add_key_index(&mut inner.key_index, &message);
             inner.physical.insert(message.physical_offset, length);
             inner
                 .topics
@@ -465,8 +479,102 @@ impl Store {
         )?))
     }
 
-    pub fn search_offset(&self, topic: &str, queue_id: i32, timestamp: i64) -> Result<u64> {
+    /// `QueryMessageProcessor` key lookup: every record on `topic` carrying `key`
+    /// (via the commitlog key index), within the inclusive store-time window.
+    pub fn query_messages(
+        &self,
+        topic: &str,
+        key: &str,
+        begin: i64,
+        end: i64,
+        max_nums: usize,
+    ) -> Result<Vec<Message>> {
         validate_name(topic, "topic")?;
+        let mut inner = self.lock()?;
+        // Cloned so record reads can take the log mutably while iterating.
+        let Some(entries) = inner
+            .key_index
+            .get(&(topic.to_owned(), key.to_owned()))
+            .cloned()
+        else {
+            return Ok(Vec::new());
+        };
+        let mut messages = Vec::new();
+        for (scanned, entry) in entries.iter().enumerate() {
+            if messages.len() >= max_nums || scanned >= MAX_SCAN_RECORDS {
+                break;
+            }
+            if entry.timestamp < begin || entry.timestamp > end {
+                continue;
+            }
+            let Some(&length) = inner.physical.get(&entry.physical) else {
+                continue;
+            };
+            let message = read_record(&mut inner.log, entry.physical, length)?;
+            if message.topic == topic {
+                messages.push(message);
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Time-range scan across every stored queue of `topic` (`AdminBrokerProcessor
+    /// queryMessage` fallback when no key narrows the search). `filter` applies the
+    /// caller's subscription expression, enabling subscription/lite-topic searches.
+    pub fn scan_messages(
+        &self,
+        topic: &str,
+        begin: i64,
+        end: i64,
+        max_nums: usize,
+        filter: Option<&Subscription>,
+    ) -> Result<Vec<Message>> {
+        validate_name(topic, "topic")?;
+        if begin > end {
+            return Ok(Vec::new());
+        }
+        let mut inner = self.lock()?;
+        let queue_ids: Vec<i32> = inner
+            .queues
+            .keys()
+            .filter(|(name, _)| name == topic)
+            .map(|(_, queue_id)| *queue_id)
+            .collect();
+        let mut messages = Vec::new();
+        let mut scanned = 0usize;
+        for queue_id in queue_ids {
+            if messages.len() >= max_nums || scanned >= MAX_SCAN_RECORDS {
+                break;
+            }
+            let key = (topic.to_owned(), queue_id);
+            // Skip the prefix that provably predates the window (running-max ceilings).
+            let mut offset = inner.queues[&key]
+                .partition_point(|entry| entry.timestamp_ceiling < begin) as u64;
+            let max_offset = inner.queues[&key].len() as u64;
+            while offset < max_offset && messages.len() < max_nums && scanned < MAX_SCAN_RECORDS {
+                let location = inner.queues[&key][offset as usize];
+                let message =
+                    read_record(&mut inner.log, location.physical, location.length)?;
+                scanned += 1;
+                offset += 1;
+                if message.store_timestamp < begin || message.store_timestamp > end {
+                    if message.store_timestamp > end {
+                        // Records per queue are appended in (wall-clock) store order; past the
+                        // window only clock regressions could still match, which the scan cap
+                        // bounds anyway.
+                        break;
+                    }
+                    continue;
+                }
+                if filter.is_none_or(|filter| filter.matches(&message)) {
+                    messages.push(message);
+                }
+            }
+        }
+        Ok(messages)
+    }
+
+    pub fn search_offset(&self, topic: &str, queue_id: i32, timestamp: i64) -> Result<u64> {        validate_name(topic, "topic")?;
         validate_queue(queue_id)?;
         let inner = self.lock()?;
         Ok(inner
@@ -850,14 +958,33 @@ fn add_index(queues: &mut Queues, message: &Message, length: u32) {
     });
 }
 
+/// `CommitLogDispatcherBuildIndex`: one entry per space-separated `KEYS` property value.
+fn add_key_index(keys: &mut Keys, message: &Message) {
+    let Some(raw) = message.properties.get("KEYS") else {
+        return;
+    };
+    for key in raw.split(' ') {
+        if key.is_empty() {
+            continue;
+        }
+        keys.entry((message.topic.clone(), key.to_owned()))
+            .or_default()
+            .push(KeyLocation {
+                physical: message.physical_offset,
+                timestamp: message.store_timestamp,
+            });
+    }
+}
+
 fn recover(
     log: &mut File,
     topics: &mut BTreeMap<String, TopicConfig>,
-) -> Result<(Queues, BTreeMap<u64, u32>, u64)> {
+) -> Result<(Queues, BTreeMap<u64, u32>, Keys, u64)> {
     let file_len = log.metadata()?.len();
     let mut position = 0u64;
     let mut queues = Queues::new();
     let mut physical = BTreeMap::new();
+    let mut key_index = Keys::new();
     while position < file_len {
         let remaining = file_len - position;
         if remaining < 4 {
@@ -892,6 +1019,7 @@ fn recover(
             )));
         }
         add_index(&mut queues, &message, length);
+        add_key_index(&mut key_index, &message);
         physical.insert(position, length);
         position += u64::from(length);
     }
@@ -900,7 +1028,7 @@ fn recover(
         log.set_len(position)?;
         log.sync_data()?;
     }
-    Ok((queues, physical, position))
+    Ok((queues, physical, key_index, position))
 }
 
 fn validate_partial_prefix(log: &mut File, physical: u64, remaining: u64) -> Result<()> {
@@ -1673,5 +1801,95 @@ mod tests {
         )
         .unwrap();
         assert!(Store::open(directory.path()).is_err());
+    }
+
+    fn keyed(topic: &str, queue_id: i32, body: &[u8], keys: &str, tag: &str) -> Message {
+        let mut message = message(topic, queue_id, body, tag);
+        message.properties.insert("KEYS".to_owned(), keys.to_owned());
+        message
+    }
+
+    #[test]
+    fn key_index_answers_key_queries_and_survives_reopen() {
+        let directory = TempDir::new().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let first = store
+            .append(keyed("orders", 0, b"one", "order-1 order-2", "A"))
+            .unwrap();
+        let second = store
+            .append(keyed("orders", 1, b"two", "order-1", "B"))
+            .unwrap();
+        store.append(message("orders", 0, b"no-keys", "C")).unwrap();
+
+        let hits = store
+            .query_messages("orders", "order-1", 0, i64::MAX, 32)
+            .unwrap();
+        assert_eq!(hits, vec![first.clone(), second.clone()]);
+        assert!(store
+            .query_messages("orders", "order-missing", 0, i64::MAX, 32)
+            .unwrap()
+            .is_empty());
+        // Time windows are inclusive bounds on the store timestamp.
+        let window = store
+            .query_messages("orders", "order-1", first.store_timestamp, i64::MAX, 32)
+            .unwrap();
+        assert!(window
+            .iter()
+            .all(|message| message.store_timestamp >= first.store_timestamp));
+
+        drop(store);
+        // Recovery rebuilds the key index from the commitlog.
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(
+            store
+                .query_messages("orders", "order-1", 0, i64::MAX, 32)
+                .unwrap(),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn scan_messages_filters_by_window_and_subscription() {
+        let directory = TempDir::new().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let first = store.append(message("topic", 0, b"one", "A")).unwrap();
+        let _second = store.append(message("topic", 1, b"two", "B")).unwrap();
+        let _third = store.append(message("topic", 0, b"three", "C")).unwrap();
+
+        // Unfiltered: every record inside the full window, across queues.
+        assert_eq!(
+            store
+                .scan_messages("topic", 0, i64::MAX, 32, None)
+                .unwrap()
+                .len(),
+            3
+        );
+        // Subscription filter narrows to tag A.
+        let tagged = store
+            .scan_messages("topic", 0, i64::MAX, 32, Some(&tags("A")))
+            .unwrap();
+        assert_eq!(tagged, vec![first]);
+        // max_nums caps results.
+        assert_eq!(
+            store
+                .scan_messages("topic", 0, i64::MAX, 1, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        // A begin past every store time and an inverted window are empty, not errors.
+        assert!(store
+            .scan_messages("topic", i64::MAX, i64::MAX, 32, None)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .scan_messages("topic", i64::MAX, 0, 32, None)
+            .unwrap()
+            .is_empty());
+        // Empty topics scan to nothing.
+        assert!(store
+            .scan_messages("absent", 0, i64::MAX, 32, None)
+            .unwrap()
+            .is_empty());
     }
 }

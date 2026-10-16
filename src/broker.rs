@@ -2255,6 +2255,48 @@ impl Broker {
     }
 
     /// `AbstractSendMessageProcessor.consumerSendMsgBack`.
+    /// `QueryMessageProcessor.processRequest` (request code 12): a key-index lookup
+    /// with an optional store-time window, or — when no key narrows the search — a
+    /// time-range scan with an optional subscription filter. The body frames the hits
+    /// as `u32 BE count`, then per message `u32 BE length + record`.
+    async fn query_message(&self, request: &Command) -> BrokerResult<Command> {
+        let topic = request.required("topic")?.to_owned();
+        validate_name(&topic)?;
+        let key = request.ext_fields.get("key").cloned().unwrap_or_default();
+        let max_num = optional_field(request, "maxNum", 32usize)?.clamp(1, 64);
+        let begin: i64 = optional_field(request, "beginTimestamp", 0i64)?;
+        let end: i64 = optional_field(request, "endTimestamp", i64::MAX)?;
+        let filter = match (
+            request.ext_fields.get("expressionType"),
+            request.ext_fields.get("expression"),
+        ) {
+            (Some(expression_type), Some(expression)) if !expression.is_empty() => Some(
+                Subscription::build(Some(expression_type), expression)
+                    .map_err(|error| Failure::new(23, error.to_string()))?,
+            ),
+            _ => None,
+        };
+        let messages = if key.is_empty() {
+            self.storage(move |store| {
+                store.scan_messages(&topic, begin, end, max_num, filter.as_ref())
+            })
+            .await?
+        } else {
+            self.storage(move |store| {
+                store.query_messages(&topic, &key, begin, end, max_num)
+            })
+            .await?
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&(messages.len() as u32).to_be_bytes());
+        for message in &messages {
+            let bytes = message.encode()?;
+            body.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            body.extend_from_slice(&bytes);
+        }
+        Ok(Command::response(request, 0).with_body(body))
+    }
+
     async fn send_back(&self, request: &Command) -> BrokerResult<Command> {
         let group = request.required("group")?.to_owned();
         let offset: u64 = request.field("offset")?;
@@ -2461,6 +2503,7 @@ impl Broker {
         match request.code {
             10 | 310 | 320 => self.send(request, peer).await,
             11 | 361 => self.pull(request).await,
+            12 => self.query_message(request).await,
             36 => self.send_back(request).await,
             370 => self.recall(request, peer).await,
             37 => self.end_transaction(request).await,

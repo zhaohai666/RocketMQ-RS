@@ -36,9 +36,9 @@
 //!   name modulo a *locally configured* group count — Java negotiates the group
 //!   distribution across the proxy cluster at runtime, which a single process cannot
 //!   observe; ACL signature content is the empty byte string (see [`AclGuard`]).
-//! - **Stubs**: RPCs that need broker features this port does not implement (POP
-//!   receipts, transactions, DLQ forwarding, lite topics, client introspection) answer
-//!   with typed `NOT_IMPLEMENTED` statuses so the service surface stays complete.
+//! - **Stubs**: no service RPC answers `NOT_IMPLEMENTED` any more; admin diagnostics
+//!   that cannot reach a live client (thread dumps, verify-consumption) return typed
+//!   empty/failed statuses instead of erroring the surface.
 
 #[allow(clippy::all)]
 pub mod pb {
@@ -1348,6 +1348,41 @@ fn to_pb_message(message: &common::Message, receipt_handle: Option<String>) -> p
         system_properties: Some(system),
         body: message.body.clone(),
     }
+}
+
+/// Decode a QUERY_MESSAGE body: `u32 BE count`, then per message `u32 BE length + record`.
+fn decode_query_frame(body: &[u8]) -> Result<Vec<common::Message>> {
+    let mut cursor = 0usize;
+    let take_u32 = |cursor: &mut usize| -> Result<u32> {
+        if body.len() < *cursor + 4 {
+            return Err(Error::Invalid("truncated query frame".into()));
+        }
+        let value = u32::from_be_bytes(body[*cursor..*cursor + 4].try_into().unwrap());
+        *cursor += 4;
+        Ok(value)
+    };
+    let count = take_u32(&mut cursor)?;
+    let mut messages = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let length = take_u32(&mut cursor)? as usize;
+        if body.len() < cursor + length {
+            return Err(Error::Invalid("truncated query record".into()));
+        }
+        let (message, consumed) = common::Message::decode(&body[cursor..cursor + length])?;
+        if consumed != length {
+            return Err(Error::Invalid(
+                "trailing bytes inside a query record".into(),
+            ));
+        }
+        cursor += length;
+        messages.push(message);
+    }
+    if cursor != body.len() {
+        return Err(Error::Invalid(
+            "trailing bytes after the query frame".into(),
+        ));
+    }
+    Ok(messages)
 }
 
 /// Receipt handle for the pop-lite flow: opaque to clients, parseable here.
@@ -3207,52 +3242,98 @@ impl pb::admin_server::Admin for AdminProcessor {
         if topic.is_empty() {
             return Err(Status::invalid_argument("topic is required"));
         }
-        // Only the by-id branch maps onto this broker's store today: a msg id carries the
-        // physical offset the `VIEW_MESSAGE_BY_ID` admin code resolves it by. Key/time-range
-        // scans need the broker index store.
-        let Some(message_id) = request.search_key.as_ref().and_then(|key| match key {
-            pb::list_message_request::SearchKey::MessageId(value) => Some(value.clone()),
-            _ => None,
-        }) else {
-            return Ok(Response::new(pb::ListMessageResponse {
-                status: Some(pb_status(
-                    pb::Code::NotImplemented,
-                    "only message-id queries are supported; key and time-range scans need the index store",
-                )),
-                ..Default::default()
-            }));
+        let Some(search_key) = request.search_key.clone() else {
+            return Err(Status::invalid_argument("search_key is required"));
         };
-        let Some(offset) = physical_offset_from_msg_id(&message_id) else {
-            return Ok(Response::new(pb::ListMessageResponse {
-                status: Some(pb_status(
-                    pb::Code::BadRequest,
-                    "unparseable message id",
-                )),
-                ..Default::default()
-            }));
+        let begin = request
+            .begin_timestamp
+            .as_ref()
+            .map(|ts| ts.seconds * 1000 + (ts.nanos / 1_000_000) as i64)
+            .unwrap_or(0);
+        let end = request
+            .end_timestamp
+            .as_ref()
+            .map(|ts| ts.seconds * 1000 + (ts.nanos / 1_000_000) as i64)
+            .unwrap_or_else(now_millis);
+        let max_nums = if request.max_message_nums <= 0 {
+            32
+        } else {
+            request.max_message_nums.min(64) as usize
+        };
+        // By id: the msg id carries the physical offset `VIEW_MESSAGE_BY_ID` resolves.
+        // Everything else rides the broker's QUERY_MESSAGE (code 12): key -> commitlog
+        // key index; subscription / lite topic -> filtered time-range scan.
+        let (scan_topic, exts): (String, Vec<(&str, String)>) = match &search_key {
+            pb::list_message_request::SearchKey::MessageId(_) => (topic.clone(), Vec::new()),
+            pb::list_message_request::SearchKey::MessageKey(key) => (
+                topic.clone(),
+                vec![
+                    ("key", key.clone()),
+                    ("maxNum", max_nums.to_string()),
+                    ("beginTimestamp", begin.to_string()),
+                    ("endTimestamp", end.to_string()),
+                ],
+            ),
+            pb::list_message_request::SearchKey::Subscription(expression) => (
+                topic.clone(),
+                vec![
+                    ("maxNum", max_nums.to_string()),
+                    ("beginTimestamp", begin.to_string()),
+                    ("endTimestamp", end.to_string()),
+                    ("expressionType", "TAG".to_string()),
+                    ("expression", expression.clone()),
+                ],
+            ),
+            // A lite topic is a real topic in this store, so scanning it directly
+            // answers "every message belonging to the lite topic".
+            pb::list_message_request::SearchKey::LiteTopic(lite) => (
+                lite.clone(),
+                vec![
+                    ("maxNum", max_nums.to_string()),
+                    ("beginTimestamp", begin.to_string()),
+                    ("endTimestamp", end.to_string()),
+                ],
+            ),
+        };
+        let code = if matches!(
+            search_key,
+            pb::list_message_request::SearchKey::MessageId(_)
+        ) {
+            33
+        } else {
+            12
         };
         let response = self
             .backend
-            .invoke_broker(&topic, 33, &[("offset", offset.to_string())], Vec::new())
+            .invoke_broker(&scan_topic, code, &exts, Vec::new())
             .await
             .map_err(|error| Status::internal(error.to_string()))?;
         if response.code != 0 {
             return Ok(Response::new(pb::ListMessageResponse {
                 status: Some(pb_status(
                     map_response_code(response.code),
-                    response.remark.as_deref().unwrap_or("message view failed"),
+                    response.remark.as_deref().unwrap_or("message query failed"),
                 )),
                 ..Default::default()
             }));
         }
-        let (message, consumed) = common::Message::decode(&response.body)
-            .map_err(|error| Status::internal(error.to_string()))?;
-        if consumed != response.body.len() {
-            return Err(Status::internal("trailing bytes after the viewed record"));
-        }
+        let messages = if code == 33 {
+            let (message, consumed) = common::Message::decode(&response.body)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            if consumed != response.body.len() {
+                return Err(Status::internal("trailing bytes after the viewed record"));
+            }
+            vec![message]
+        } else {
+            decode_query_frame(&response.body)
+                .map_err(|error| Status::internal(error.to_string()))?
+        };
         Ok(Response::new(pb::ListMessageResponse {
             status: Some(pb_status(pb::Code::Ok, "")),
-            messages: vec![to_pb_message(&message, None)],
+            messages: messages
+                .iter()
+                .map(|message| to_pb_message(message, None))
+                .collect(),
             scroll_id: String::new(),
         }))
     }
