@@ -400,6 +400,44 @@ impl ClientRegistry {
             }
         }
     }
+
+    /// Union of every lite topic a single client subscribed to via
+    /// `SyncLiteSubscription`. LITE push consumers receive from this set instead
+    /// of a single `MessageQueue`.
+    fn lite_topics_for(&self, client_id: &str) -> Vec<String> {
+        let by_id = self.by_id.lock().unwrap();
+        let mut out = Vec::new();
+        if let Some(state) = by_id.get(client_id) {
+            for set in state.lite_topics.values() {
+                for topic in set {
+                    if !out.contains(topic) {
+                        out.push(topic.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Union of lite topics across every client currently registered under `group`.
+    /// Fallback used when `receive_message` carries a group but no resolvable client
+    /// id, so lite consumers still get fanned out across their topics.
+    fn lite_topics_for_group(&self, group: &str) -> Vec<String> {
+        let by_id = self.by_id.lock().unwrap();
+        let mut out = Vec::new();
+        for state in by_id.values() {
+            if state.group == group {
+                for set in state.lite_topics.values() {
+                    for topic in set {
+                        if !out.contains(topic) {
+                            out.push(topic.clone());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Extract the `x-mq-client-id` metadata the 5.x clients attach to every RPC.
@@ -944,6 +982,30 @@ impl ProxyBackend {
         let addr = self.master_addr(topic).await?;
         self.client.invoke(&addr, request, self.timeout).await
     }
+
+    /// Resolve the topic's declared message types from the broker's
+    /// `GET_TOPIC_CONFIG_BY_TOPIC` (remoting code 351), which returns the
+    /// `TopicConfig` JSON (its `topicSysFlag` low bits encode the type). Falls
+    /// back to `[Normal]` whenever the broker is unreachable or the topic is new.
+    pub async fn topic_message_types(&self, topic: &str) -> Vec<i32> {
+        match self
+            .invoke_broker(topic, 351, &[("topic", topic.to_string())], Vec::new())
+            .await
+        {
+            Ok(response) if response.code == 0 => {
+                let value: serde_json::Value = match serde_json::from_slice(&response.body) {
+                    Ok(v) => v,
+                    Err(_) => return vec![pb::MessageType::Normal as i32],
+                };
+                let sys_flag = value
+                    .get("topicSysFlag")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32;
+                message_types_from_sys_flag(sys_flag)
+            }
+            _ => vec![pb::MessageType::Normal as i32],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -983,6 +1045,26 @@ fn map_response_code(code: i32) -> pb::Code {
         3 => pb::Code::NotImplemented,
         29 | 13 | 10 | 11 => pb::Code::BadRequest,
         _ => pb::Code::InternalError,
+    }
+}
+
+/// Decode the declared message types of a topic from its `topicSysFlag` low bits,
+/// matching Java `TopicSysFlag.getTopicMessageType` (mask `0x0F`):
+/// `0`=NORMAL, `1`=FIFO, `2`=DELAY, `4`=TRANSACTION, `8`=MIXED (all four).
+/// `QueryRoute`/`QueryAssignment` advertise these on every `MessageQueue` so 5.x
+/// clients reject messages of an unsupported type up front.
+fn message_types_from_sys_flag(sys_flag: i32) -> Vec<i32> {
+    match sys_flag & 0x0F {
+        1 => vec![pb::MessageType::Fifo as i32],
+        2 => vec![pb::MessageType::Delay as i32],
+        4 => vec![pb::MessageType::Transaction as i32],
+        8 => vec![
+            pb::MessageType::Normal as i32,
+            pb::MessageType::Fifo as i32,
+            pb::MessageType::Delay as i32,
+            pb::MessageType::Transaction as i32,
+        ],
+        _ => vec![pb::MessageType::Normal as i32],
     }
 }
 
@@ -1511,6 +1593,9 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .topic_route(&topic)
             .await
             .map_err(|e| self.error_status(&e))?;
+        // Advertise the topic's real message types (FIFO/Delay/Transaction/Mixed)
+        // instead of the previous always-NORMAL placeholder.
+        let accept_message_types = self.backend.topic_message_types(&topic).await;
         let mut message_queues = Vec::new();
         for queue in &queues {
             let master = brokers
@@ -1529,7 +1614,7 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                         id: 0,
                         endpoints: endpoints.clone(),
                     }),
-                    accept_message_types: vec![pb::MessageType::Normal as i32],
+                    accept_message_types: accept_message_types.clone(),
                 });
             }
         }
@@ -1758,6 +1843,8 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                 .collect()
         };
 
+        // Same type fidelity as QueryRoute: advertise the topic's real message types.
+        let accept_message_types = self.backend.topic_message_types(&topic).await;
         let mut assignments = Vec::new();
         for (queue, id) in owned {
             let master = brokers
@@ -1776,7 +1863,7 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                         id: 0,
                         endpoints: endpoints.clone(),
                     }),
-                    accept_message_types: vec![pb::MessageType::Normal as i32],
+                    accept_message_types: accept_message_types.clone(),
                 }),
             });
         }
@@ -1794,6 +1881,7 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         request: Request<pb::ReceiveMessageRequest>,
     ) -> PbResult<Self::ReceiveMessageStream> {
         self.acl.check_access(&request, "ReceiveMessage").await?;
+        let client_id = client_id_of(&request).unwrap_or_default();
         let request = request.into_inner();
         self.context.record_op(&self.context.receive_ops);
         let group = request
@@ -1811,13 +1899,80 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                 )
             })
             .unwrap_or_default();
-        if topic.is_empty() || group.is_empty() {
+        // LITE push consumers fan out across their registered lite topic set, which may
+        // leave the explicit `messageQueue` empty, so only the group is strictly required.
+        if group.is_empty() {
             return Err(Status::invalid_argument("group and messageQueue are required"));
         }
         let batch = request.batch_size.max(1);
         let (tx, rx) = mpsc::channel::<std::result::Result<pb::ReceiveMessageResponse, Status>>(16);
         let this = Arc::new(self.clone_for_stream());
         tokio::spawn(async move {
+            // Lite routing: a LITE push consumer receives from the union of topics it
+            // registered via `SyncLiteSubscription`, not a single `MessageQueue`. We fan
+            // out across every lite topic's readable queues, reusing the normal pull path
+            // (the broker's lite guard only trips on `sysFlag & 16`/`liteTopic`, which we
+            // never send) and per-topic receipt handles so `ack_message` still commits.
+            let mut lite_topics = if !client_id.is_empty() {
+                this.context.clients.lite_topics_for(&client_id)
+            } else {
+                Vec::new()
+            };
+            if lite_topics.is_empty() {
+                lite_topics = this.context.clients.lite_topics_for_group(&group);
+            }
+            if !lite_topics.is_empty() {
+                for lt in &lite_topics {
+                    let queues = match this.backend.topic_route(lt).await {
+                        Ok((_, queues)) => queues,
+                        Err(_) => continue,
+                    };
+                    for queue in &queues {
+                        for qid in 0..queue.read_queues.max(0) {
+                            let offset = match this.committed_offset(lt, &group, qid).await {
+                                Ok(offset) => offset,
+                                Err(_) => continue,
+                            };
+                            match this.pull_once(lt, &group, qid, offset, batch).await {
+                                Ok((messages, _, _)) => {
+                                    for message in &messages {
+                                        let handle = encode_receipt_handle(
+                                            lt,
+                                            &group,
+                                            qid,
+                                            message.queue_offset as i64,
+                                        );
+                                        let pb_message = to_pb_message(message, Some(handle));
+                                        if tx
+                                            .send(Ok(pb::ReceiveMessageResponse {
+                                                content: Some(
+                                                    pb::receive_message_response::Content::Message(
+                                                        pb_message,
+                                                    ),
+                                                ),
+                                            }))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+                    }
+                }
+                let _ = tx
+                    .send(Ok(pb::ReceiveMessageResponse {
+                        content: Some(pb::receive_message_response::Content::Status(
+                            pb_status(pb::Code::Ok, ""),
+                        )),
+                    }))
+                    .await;
+                return;
+            }
+
             // Pop-lite: pull from the committed offset, hand each message a receipt
             // handle; `ack_message` commits the offset it encodes.
             let offset = match this.committed_offset(&topic, &group, queue_id).await {
