@@ -55,6 +55,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
@@ -206,6 +207,26 @@ impl ProxyContext {
 /// the gRPC handler returns.
 type TelemetrySender = mpsc::Sender<std::result::Result<pb::TelemetryCommand, Status>>;
 
+/// Monotonic nonce source for server→client telemetry request/reply correlation
+/// (thread-stack-trace / verify-message). Pushed commands carry a nonce the client
+/// echoes back; the waiting Admin RPC matches it here.
+static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_nonce() -> String {
+    format!("rmq-{}-{}", std::process::id(), NONCE_COUNTER.fetch_add(1, Ordering::SeqCst))
+}
+
+/// Outcome a waiting Admin RPC expects back from a client telemetry reply.
+enum PendingOutcome {
+    StackTrace(Option<String>),
+    Verify(bool),
+}
+
+/// One in-flight server→client telemetry request awaiting its client reply.
+struct PendingReply {
+    tx: oneshot::Sender<PendingOutcome>,
+}
+
 /// Live state for one connected client (producer or consumer), keyed by the
 /// `x-mq-client-id` metadata header that the 5.x SDKs attach to every RPC.
 #[derive(Clone)]
@@ -251,6 +272,8 @@ pub(crate) struct ClientRegistry {
     by_id: Mutex<HashMap<String, ClientState>>,
     /// group -> client ids currently connected (registered via heartbeat/telemetry).
     group_members: Mutex<HashMap<String, Vec<String>>>,
+    /// nonce -> waiting Admin RPC awaiting a client telemetry reply (thread dump / verify).
+    pending: Mutex<HashMap<String, PendingReply>>,
 }
 
 impl ClientRegistry {
@@ -437,6 +460,161 @@ impl ClientRegistry {
             }
         }
         out
+    }
+
+    /// Apply a `SyncLiteSubscription` action to a client's lite topic sets and return
+    /// the topics that were *removed* (so the proxy can broadcast
+    /// `NotifyUnsubscribeLiteCommand` to the rest of the group). Action codes follow
+    /// `LiteSubscriptionAction`: 0=PARTIAL_ADD, 1=PARTIAL_REMOVE, 2=COMPLETE_ADD, 3=COMPLETE_REMOVE.
+    fn apply_lite_subscription(
+        &self,
+        client_id: &str,
+        group: &str,
+        bind_topic: &str,
+        action: i32,
+        topics: &[String],
+    ) -> Vec<String> {
+        let removed = {
+            let mut by_id = self.by_id.lock().unwrap();
+            match by_id.get_mut(client_id) {
+                Some(state) => {
+                    state.group = group.to_string();
+                    match action {
+                        // COMPLETE_REMOVE: drop the entire bind topic.
+                        3 => state.lite_topics.remove(bind_topic).unwrap_or_default(),
+                        // PARTIAL_REMOVE: drop the named topics from the bind topic's set.
+                        1 => {
+                            let mut removed = Vec::new();
+                            if let Some(set) = state.lite_topics.get_mut(bind_topic) {
+                                for t in topics {
+                                    if let Some(pos) = set.iter().position(|x| x == t) {
+                                        set.remove(pos);
+                                        removed.push(t.clone());
+                                    }
+                                }
+                                if set.is_empty() {
+                                    state.lite_topics.remove(bind_topic);
+                                }
+                            }
+                            removed
+                        }
+                        // COMPLETE_ADD: replace the bind topic's set wholesale.
+                        2 => {
+                            state.lite_topics.insert(bind_topic.to_string(), topics.to_vec());
+                            Vec::new()
+                        }
+                        // PARTIAL_ADD (default): union with the existing set.
+                        _ => {
+                            let entry = state.lite_topics.entry(bind_topic.to_string()).or_default();
+                            for t in topics {
+                                if !entry.contains(t) {
+                                    entry.push(t.clone());
+                                }
+                            }
+                            Vec::new()
+                        }
+                    }
+                }
+                None => {
+                    let mut state = ClientState::default();
+                    state.client_id = client_id.to_string();
+                    state.group = group.to_string();
+                    state.last_heartbeat = Instant::now();
+                    // Nothing to remove from a brand-new client; seed the set on add.
+                    if action == 2 || action == 0 {
+                        state.lite_topics.insert(bind_topic.to_string(), topics.to_vec());
+                    }
+                    by_id.insert(client_id.to_string(), state);
+                    Vec::new()
+                }
+            }
+        };
+        // Keep group membership bookkeeping consistent so load balancing / counts see
+        // this client even before a heartbeat arrives.
+        if !group.is_empty() {
+            let mut groups = self.group_members.lock().unwrap();
+            let entry = groups.entry(group.to_string()).or_default();
+            if !entry.contains(&client_id.to_string()) {
+                entry.push(client_id.to_string());
+            }
+        }
+        removed
+    }
+
+    /// Broadcast a lite-topic unsubscribe to every *other* client in `group`, so peer
+    /// lite consumers stop pulling the removed topic (Java `LiteSubscriptionManager`).
+    fn notify_unsubscribe_lite(&self, group: &str, except: &str, topic: &str) {
+        let members = self.group_members.lock().unwrap();
+        if let Some(ids) = members.get(group) {
+            for id in ids {
+                if id == except {
+                    continue;
+                }
+                let command = pb::TelemetryCommand {
+                    command: Some(pb::telemetry_command::Command::NotifyUnsubscribeLiteCommand(
+                        pb::NotifyUnsubscribeLiteCommand {
+                            lite_topic: topic.to_string(),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                };
+                self.push_command(id, command);
+            }
+        }
+    }
+
+    /// Snapshot of every connected client registered under `group`.
+    fn clients_for_group(&self, group: &str) -> Vec<ClientState> {
+        let by_id = self.by_id.lock().unwrap();
+        by_id
+            .values()
+            .filter(|s| s.group == group)
+            .cloned()
+            .collect()
+    }
+
+    /// Lookup a single client by id (for `GetConsumerRunningInfo`).
+    fn client_by_id(&self, client_id: &str) -> Option<ClientState> {
+        self.by_id.lock().unwrap().get(client_id).cloned()
+    }
+
+    /// Whether the client currently has an open telemetry (server→client) stream.
+    fn has_telemetry(&self, client_id: &str) -> bool {
+        self.by_id
+            .lock()
+            .unwrap()
+            .get(client_id)
+            .map(|s| s.telemetry.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Register a server→client telemetry request awaiting a reply keyed by `nonce`.
+    /// Returns the receiver the Admin RPC awaits on.
+    fn register_pending(&self, nonce: &str) -> oneshot::Receiver<PendingOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(nonce.to_string(), PendingReply { tx });
+        rx
+    }
+
+    /// Resolve a waiting request when its client reply arrives. Returns false if no
+    /// matching request was registered (e.g. already timed out and cancelled).
+    fn resolve_pending(&self, nonce: &str, outcome: PendingOutcome) -> bool {
+        if let Some(reply) = self.pending.lock().unwrap().remove(nonce) {
+            let _ = reply.tx.send(outcome);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop a pending request without resolving it (e.g. the client stream vanished
+    /// before the command could be sent). Returns false if already gone.
+    fn cancel_pending(&self, nonce: &str) -> bool {
+        self.pending.lock().unwrap().remove(nonce).is_some()
     }
 }
 
@@ -2434,13 +2612,25 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                 match item {
                     Ok(cmd) => {
                         if let Some(pb::telemetry_command::Command::Settings(settings)) =
-                            cmd.command
+                            cmd.command.clone()
                         {
                             apply_settings(&recv_clients, &cid, &settings);
                         }
-                        // Other client-side reports (thread stack trace, verify result)
-                        // are acknowledged simply by being received; the protocol defines
-                        // no server->client reply for them.
+                        // Client-side reports the server actively requested: resolve the
+                        // waiting Admin RPC (thread stack trace / verify message) by nonce.
+                        match cmd.command {
+                            Some(pb::telemetry_command::Command::ThreadStackTrace(ts)) => {
+                                recv_clients.resolve_pending(
+                                    &ts.nonce,
+                                    PendingOutcome::StackTrace(ts.thread_stack_trace),
+                                );
+                            }
+                            Some(pb::telemetry_command::Command::VerifyMessageResult(r)) => {
+                                recv_clients
+                                    .resolve_pending(&r.nonce, PendingOutcome::Verify(true));
+                            }
+                            _ => {}
+                        }
                     }
                     Err(_) => break,
                 }
@@ -2602,22 +2792,21 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .map(|t| t.name.clone())
             .unwrap_or_default();
         if !topic.is_empty() {
-            // Persist the lite subscription set so the group's lite consumers can be
-            // served and later unsubscribed via NotifyUnsubscribeLiteCommand.
-            let mut state = {
-                let by_id = self.context.clients.by_id.lock().unwrap();
-                by_id.get(&client_id).cloned().unwrap_or_else(|| {
-                    let mut s = ClientState::default();
-                    s.client_id = client_id.clone();
-                    s.last_heartbeat = Instant::now();
-                    s
-                })
-            };
-            state.group = group.clone();
-            state
-                .lite_topics
-                .insert(topic, request.lite_topic_set.clone());
-            self.context.clients.register(state);
+            // Honor the action (PARTIAL_ADD / PARTIAL_REMOVE / COMPLETE_ADD /
+            // COMPLETE_REMOVE) instead of always overwriting, and broadcast an
+            // unsubscribe to the rest of the group when topics are removed.
+            let removed = self.context.clients.apply_lite_subscription(
+                &client_id,
+                &group,
+                &topic,
+                request.action,
+                &request.lite_topic_set,
+            );
+            for removed_topic in &removed {
+                self.context
+                    .clients
+                    .notify_unsubscribe_lite(&group, &client_id, removed_topic);
+            }
         }
         Ok(Response::new(pb::SyncLiteSubscriptionResponse {
             status: Some(pb_status(pb::Code::Ok, "")),
@@ -2672,9 +2861,14 @@ impl pb::admin_server::Admin for AdminProcessor {
         if queues.is_empty() {
             return Err(Status::not_found(format!("topic does not exist: {topic}")));
         }
+        let types = self.backend.topic_message_types(&topic).await;
+        let topic_message_type = types
+            .into_iter()
+            .next()
+            .unwrap_or(pb::MessageType::Normal as i32);
         Ok(Response::new(pb::DescribeTopicStatusResponse {
             status: Some(pb_status(pb::Code::Ok, "")),
-            topic_message_type: pb::MessageType::Normal as i32,
+            topic_message_type,
             ..Default::default()
         }))
     }
@@ -2877,14 +3071,29 @@ impl pb::admin_server::Admin for AdminProcessor {
 
     async fn list_consumer_connection(
         &self,
-        _request: Request<pb::ListConsumerConnectionRequest>,
+        request: Request<pb::ListConsumerConnectionRequest>,
     ) -> PbResult<pb::ListConsumerConnectionResponse> {
+        let request = request.into_inner();
+        let group = request
+            .group
+            .as_ref()
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+        let clients = self.context.clients.clients_for_group(&group);
+        let client_info = clients
+            .into_iter()
+            .map(|c| pb::ClientInfo {
+                client_id: c.client_id,
+                version: c.version,
+                language: c.language,
+                hostname: c.hostname,
+                egress_ip: String::new(),
+                message_model: c.message_model,
+            })
+            .collect();
         Ok(Response::new(pb::ListConsumerConnectionResponse {
-            status: Some(pb_status(
-                pb::Code::NotImplemented,
-                "consumer connection tracking is proxy-local in Java",
-            )),
-            ..Default::default()
+            status: Some(pb_status(pb::Code::Ok, "")),
+            client_info,
         }))
     }
 
@@ -3050,53 +3259,266 @@ impl pb::admin_server::Admin for AdminProcessor {
 
     async fn print_thread_stack_trace(
         &self,
-        _request: Request<pb::PrintThreadStackTraceRequest>,
+        request: Request<pb::PrintThreadStackTraceRequest>,
     ) -> PbResult<pb::PrintThreadStackTraceResponse> {
-        Ok(Response::new(pb::PrintThreadStackTraceResponse {
-            status: Some(pb_status(
-                pb::Code::NotImplemented,
-                "remote thread dumps are not available",
+        let request = request.into_inner();
+        let group = request
+            .group
+            .as_ref()
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+        // Resolve a target consumer: the explicit client id, else any online member of the group.
+        let target = if !request.client_id.is_empty() {
+            request.client_id.clone()
+        } else {
+            self.context
+                .clients
+                .clients_for_group(&group)
+                .into_iter()
+                .next()
+                .map(|c| c.client_id)
+                .unwrap_or_default()
+        };
+        // No connected client (or no open telemetry stream) -> nothing to dump.
+        if target.is_empty() || !self.context.clients.has_telemetry(&target) {
+            return Ok(Response::new(pb::PrintThreadStackTraceResponse {
+                status: Some(pb_status(pb::Code::Ok, "")),
+                thread_stack_trace: Some(String::new()),
+            }));
+        }
+        let nonce = next_nonce();
+        let mut rx = self.context.clients.register_pending(&nonce);
+        let command = pb::TelemetryCommand {
+            command: Some(pb::telemetry_command::Command::PrintThreadStackTraceCommand(
+                pb::PrintThreadStackTraceCommand {
+                    nonce: nonce.clone(),
+                },
             )),
             ..Default::default()
+        };
+        if !self.context.clients.push_command(&target, command) {
+            self.context.clients.cancel_pending(&nonce);
+            return Ok(Response::new(pb::PrintThreadStackTraceResponse {
+                status: Some(pb_status(pb::Code::Ok, "")),
+                thread_stack_trace: Some(String::new()),
+            }));
+        }
+        let trace = match tokio::time::timeout(Duration::from_secs(3), &mut rx).await {
+            Ok(Ok(PendingOutcome::StackTrace(trace))) => trace.unwrap_or_default(),
+            _ => String::new(),
+        };
+        Ok(Response::new(pb::PrintThreadStackTraceResponse {
+            status: Some(pb_status(pb::Code::Ok, "")),
+            thread_stack_trace: Some(trace),
         }))
     }
 
     async fn verify_message(
         &self,
-        _request: Request<pb::VerifyMessageRequest>,
+        request: Request<pb::VerifyMessageRequest>,
     ) -> PbResult<pb::VerifyMessageResponse> {
-        Ok(Response::new(pb::VerifyMessageResponse {
-            status: Some(pb_status(
-                pb::Code::NotImplemented,
-                "verify-consumption requires a live consumer probe",
+        let request = request.into_inner();
+        let group = request
+            .group
+            .as_ref()
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+        let target = if !request.client_id.is_empty() {
+            request.client_id.clone()
+        } else {
+            self.context
+                .clients
+                .clients_for_group(&group)
+                .into_iter()
+                .next()
+                .map(|c| c.client_id)
+                .unwrap_or_default()
+        };
+        if target.is_empty() || !self.context.clients.has_telemetry(&target) {
+            return Ok(Response::new(pb::VerifyMessageResponse {
+                status: Some(pb_status(
+                    pb::Code::FailedToConsumeMessage,
+                    "no connected consumer to verify consumption against",
+                )),
+            }));
+        }
+        let nonce = next_nonce();
+        let mut rx = self.context.clients.register_pending(&nonce);
+        let message = pb::Message {
+            topic: request.topic.clone(),
+            system_properties: Some(pb::SystemProperties {
+                message_id: request.message_id.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let command = pb::TelemetryCommand {
+            command: Some(pb::telemetry_command::Command::VerifyMessageCommand(
+                pb::VerifyMessageCommand {
+                    nonce: nonce.clone(),
+                    message: Some(message),
+                },
             )),
             ..Default::default()
+        };
+        if !self.context.clients.push_command(&target, command) {
+            self.context.clients.cancel_pending(&nonce);
+            return Ok(Response::new(pb::VerifyMessageResponse {
+                status: Some(pb_status(
+                    pb::Code::FailedToConsumeMessage,
+                    "consumer stream unavailable",
+                )),
+            }));
+        }
+        let verified = match tokio::time::timeout(Duration::from_secs(3), &mut rx).await {
+            Ok(Ok(PendingOutcome::Verify(ok))) => ok,
+            _ => false,
+        };
+        let status = if verified {
+            pb_status(pb::Code::Ok, "")
+        } else {
+            pb_status(
+                pb::Code::FailedToConsumeMessage,
+                "consumer did not confirm consumption",
+            )
+        };
+        Ok(Response::new(pb::VerifyMessageResponse {
+            status: Some(status),
         }))
     }
 
     async fn admin_send_message(
         &self,
-        _request: Request<pb::AdminSendMessageRequest>,
+        request: Request<pb::AdminSendMessageRequest>,
     ) -> PbResult<pb::AdminSendMessageResponse> {
-        Ok(Response::new(pb::AdminSendMessageResponse {
-            status: Some(pb_status(
-                pb::Code::NotImplemented,
-                "use MessagingService.send_message",
-            )),
-            ..Default::default()
-        }))
+        let request = request.into_inner();
+        let topic = request
+            .topic
+            .as_ref()
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        if topic.is_empty() {
+            return Err(Status::invalid_argument("topic is required"));
+        }
+        if request.body.is_empty() {
+            return Err(Status::invalid_argument("body is required"));
+        }
+        // Reconstruct a v2 Message and forward to the broker exactly like send_message.
+        let mut system = request.system_properties.unwrap_or_default();
+        if system.tag.is_none() {
+            system.tag = request.tag.clone();
+        }
+        if let Some(key) = &request.key {
+            if system.keys.is_empty() && !key.is_empty() {
+                system.keys = vec![key.clone()];
+            }
+        }
+        let message = pb::Message {
+            topic: request.topic.clone(),
+            user_properties: request.user_properties,
+            system_properties: Some(system),
+            body: request.body.clone(),
+        };
+        let properties = match encode_send_properties(&message) {
+            Ok(properties) => properties,
+            Err(error) => {
+                return Ok(Response::new(pb::AdminSendMessageResponse {
+                    status: Some(pb_status(pb::Code::BadRequest, error.to_string())),
+                    ..Default::default()
+                }))
+            }
+        };
+        let born = now_millis();
+        let response = self
+            .backend
+            .invoke_broker(
+                &topic,
+                10,
+                &[
+                    ("topic", topic.clone()),
+                    (
+                        "producerGroup",
+                        self.context.config.default_producer_group.clone(),
+                    ),
+                    ("queueId", "-1".to_string()),
+                    ("sysFlag", "0".to_string()),
+                    ("flag", "0".to_string()),
+                    ("bornTimestamp", born.to_string()),
+                    ("properties", properties),
+                ],
+                message.body.clone(),
+            )
+            .await;
+        match response {
+            Ok(response) if response.code == 0 => {
+                Ok(Response::new(pb::AdminSendMessageResponse {
+                    status: Some(pb_status(pb::Code::Ok, "")),
+                    message_id: response
+                        .ext_fields
+                        .get("msgId")
+                        .cloned()
+                        .unwrap_or_default(),
+                }))
+            }
+            Ok(response) => Ok(Response::new(pb::AdminSendMessageResponse {
+                status: Some(pb_status(
+                    map_response_code(response.code),
+                    response.remark.as_deref().unwrap_or("send failed"),
+                )),
+                ..Default::default()
+            })),
+            Err(error) => Ok(Response::new(pb::AdminSendMessageResponse {
+                status: Some(pb_status(pb::Code::InternalError, error.to_string())),
+                ..Default::default()
+            })),
+        }
     }
 
     async fn get_consumer_running_info(
         &self,
-        _request: Request<pb::GetConsumerRunningInfoRequest>,
+        request: Request<pb::GetConsumerRunningInfoRequest>,
     ) -> PbResult<pb::GetConsumerRunningInfoResponse> {
+        let request = request.into_inner();
+        let group = request
+            .group
+            .as_ref()
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+        // Prefer the explicit client id, else the first connected member of the group.
+        let state = if !request.client_id.is_empty() {
+            self.context.clients.client_by_id(&request.client_id)
+        } else {
+            self.context
+                .clients
+                .clients_for_group(&group)
+                .into_iter()
+                .next()
+        };
+        let Some(state) = state else {
+            return Ok(Response::new(pb::GetConsumerRunningInfoResponse {
+                status: Some(pb_status(pb::Code::Ok, "")),
+                consumer_running_info: None,
+            }));
+        };
+        let mut properties = std::collections::HashMap::new();
+        properties.insert("clientId".to_string(), state.client_id.clone());
+        properties.insert("version".to_string(), state.version.clone());
+        properties.insert("language".to_string(), state.language.clone());
+        properties.insert("hostname".to_string(), state.hostname.clone());
+        properties.insert("group".to_string(), state.group.clone());
+        properties.insert("messageModel".to_string(), state.message_model.to_string());
+        // Per-queue process-queue snapshots live on the consumer, not the proxy, so the
+        // queue table and consume-status table are empty here (same as list_subscription:
+        // the proxy tracks subscriptions/online state, not client-side caches).
+        let info = pb::ConsumerRunningInfo {
+            properties,
+            subscriptions: state.subscriptions,
+            message_queue_table: Vec::new(),
+            consume_status_table: std::collections::HashMap::new(),
+        };
         Ok(Response::new(pb::GetConsumerRunningInfoResponse {
-            status: Some(pb_status(
-                pb::Code::NotImplemented,
-                "running-info probes live on clients in Java too",
-            )),
-            ..Default::default()
+            status: Some(pb_status(pb::Code::Ok, "")),
+            consumer_running_info: Some(info),
         }))
     }
 
@@ -3132,14 +3554,168 @@ impl pb::admin_server::Admin for AdminProcessor {
 
     async fn query_time_span(
         &self,
-        _request: Request<pb::QueryTimeSpanRequest>,
+        request: Request<pb::QueryTimeSpanRequest>,
     ) -> PbResult<pb::QueryTimeSpanResponse> {
+        let request = request.into_inner();
+        let group = request
+            .group
+            .as_ref()
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+        // Topics to span: explicit list, else every topic the group subscribes to.
+        let mut topics: Vec<String> = request
+            .topics
+            .iter()
+            .map(|t| t.name.clone())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if topics.is_empty() {
+            topics = self
+                .context
+                .clients
+                .clients_for_group(&group)
+                .into_iter()
+                .flat_map(|c| c.subscriptions.into_keys())
+                .collect();
+        }
+        let mut spans = Vec::new();
+        for topic in topics {
+            let (brokers, queues) = match self.backend.topic_route(&topic).await {
+                Ok(route) => route,
+                Err(_) => continue,
+            };
+            // Resolve once per topic (avoids a broker round-trip per queue).
+            let accept_types = self.backend.topic_message_types(&topic).await;
+            for queue in &queues {
+                let master = brokers
+                    .iter()
+                    .find(|b| b.name == queue.broker_name)
+                    .and_then(|b| b.addrs.get(&0))
+                    .cloned();
+                let Some(addr) = master else {
+                    continue;
+                };
+                for id in 0..queue.read_queues.max(0) {
+                    // Earliest (code 31) / latest (code 32) store timestamps per queue.
+                    let min_ts = self
+                        .backend
+                        .client
+                        .invoke(
+                            &addr,
+                            Command::request(31)
+                                .with_ext("topic", topic.clone())
+                                .with_ext("queueId", id.to_string()),
+                            self.backend.timeout,
+                        )
+                        .await
+                        .ok()
+                        .filter(|r| r.code == 0)
+                        .and_then(|r| {
+                            r.ext_fields
+                                .get("timestamp")
+                                .and_then(|v| v.parse::<i64>().ok())
+                        })
+                        .unwrap_or(0);
+                    let max_ts = self
+                        .backend
+                        .client
+                        .invoke(
+                            &addr,
+                            Command::request(32)
+                                .with_ext("topic", topic.clone())
+                                .with_ext("queueId", id.to_string()),
+                            self.backend.timeout,
+                        )
+                        .await
+                        .ok()
+                        .filter(|r| r.code == 0)
+                        .and_then(|r| {
+                            r.ext_fields
+                                .get("timestamp")
+                                .and_then(|v| v.parse::<i64>().ok())
+                        })
+                        .unwrap_or(0);
+                    // Committed offset (code 14) and max offset (code 30) bound the consume watermark.
+                    let committed = self
+                        .backend
+                        .client
+                        .invoke(
+                            &addr,
+                            Command::request(14)
+                                .with_ext("consumerGroup", group.clone())
+                                .with_ext("topic", topic.clone())
+                                .with_ext("queueId", id.to_string()),
+                            self.backend.timeout,
+                        )
+                        .await
+                        .ok()
+                        .filter(|r| r.code == 0)
+                        .and_then(|r| {
+                            r.ext_fields
+                                .get("offset")
+                                .and_then(|v| v.parse::<i64>().ok())
+                        })
+                        .unwrap_or(0);
+                    let max_off = self
+                        .backend
+                        .client
+                        .invoke(
+                            &addr,
+                            Command::request(30)
+                                .with_ext("topic", topic.clone())
+                                .with_ext("queueId", id.to_string()),
+                            self.backend.timeout,
+                        )
+                        .await
+                        .ok()
+                        .filter(|r| r.code == 0)
+                        .and_then(|r| {
+                            r.ext_fields
+                                .get("offset")
+                                .and_then(|v| v.parse::<i64>().ok())
+                        })
+                        .unwrap_or(0);
+                    // The broker does not expose a queue-offset->timestamp mapping here, so the
+                    // consume timestamp is approximated: caught-up (committed at the tail) means
+                    // the latest store time; otherwise it is bounded below by the earliest.
+                    let consume_ts = if max_off > 0 && committed >= max_off - 1 {
+                        max_ts
+                    } else if min_ts > 0 {
+                        min_ts
+                    } else {
+                        0
+                    };
+                    let delay_time_ms = if max_ts > consume_ts {
+                        max_ts - consume_ts
+                    } else {
+                        0
+                    };
+                    spans.push(pb::query_time_span_response::QueueTimeSpan {
+                        message_queue: Some(pb::MessageQueue {
+                            topic: Some(pb::Resource {
+                                resource_namespace: String::new(),
+                                name: topic.clone(),
+                            }),
+                            id,
+                            permission: perm_to_permission(queue.perm) as i32,
+                            broker: Some(pb::Broker {
+                                name: queue.broker_name.clone(),
+                                id: 0,
+                                endpoints: endpoints_from_addr(&addr),
+                            }),
+                            accept_message_types: accept_types.clone(),
+                        }),
+                        min_timestamp: min_ts,
+                        max_timestamp: max_ts,
+                        consume_timestamp: consume_ts,
+                        delay_time_ms,
+                    });
+                }
+            }
+        }
         Ok(Response::new(pb::QueryTimeSpanResponse {
-            status: Some(pb_status(
-                pb::Code::NotImplemented,
-                "time-span queries need broker timestamp search per queue",
-            )),
-            ..Default::default()
+            status: Some(pb_status(pb::Code::Ok, "")),
+            queue_time_span_list: spans,
         }))
     }
 
