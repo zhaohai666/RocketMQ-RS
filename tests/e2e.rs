@@ -406,13 +406,21 @@ async fn heartbeat_subscriptions_and_disconnect_cleanup() {
     let members: Value = serde_json::from_slice(&members.body).unwrap();
     assert_eq!(members["consumerIdList"], json!(["test-client"]));
     broker.disconnected(stream.local_addr().unwrap());
+    // Subscriptions are keyed by group, not by TCP channel (Java `ConsumerGroupInfo`
+    // parity), so a pull on a fresh connection still resolves it; only the channel marker
+    // is dropped from the group's client set.
     assert_eq!(
         server
             .request(pull("Subscriptions", 0).with_ext("sysFlag", 0))
             .await
             .code,
-        24
+        0
     );
+    let members = server
+        .request(Command::request(38).with_ext("consumerGroup", "test-consumer"))
+        .await;
+    let members: Value = serde_json::from_slice(&members.body).unwrap();
+    assert_eq!(members["consumerIdList"], json!([]));
     drop(stream);
     server.stop().await;
 }

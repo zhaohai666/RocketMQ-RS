@@ -382,6 +382,17 @@ impl ClientRegistry {
         })
     }
 
+    /// Consumer's filter expression for `(client_id, topic)`, if the client registered one.
+    /// Used to attach the subscription to the forwarded broker pull so the broker can
+    /// compensate proxy-managed group state (Java `compensateSubscribeData`).
+    fn subscription_for(&self, client_id: &str, topic: &str) -> Option<pb::FilterExpression> {
+        self.by_id
+            .lock()
+            .unwrap()
+            .get(client_id)
+            .and_then(|state| state.subscriptions.get(topic).cloned())
+    }
+
     /// Consumer subscription relationships: (group, topic, expression, online, model).
     fn list_subscriptions(&self) -> Vec<(String, String, pb::FilterExpression, bool, i32)> {
         let by_id = self.by_id.lock().unwrap();
@@ -1733,7 +1744,19 @@ impl MessagingProcessor {
         queue_id: i32,
         offset: i64,
         batch: i32,
+        filter: Option<pb::FilterExpression>,
     ) -> Result<(Vec<common::Message>, i64, i64)> {
+        // The broker learns a proxy-managed consumer group's subscription through the pull
+        // request itself (Java `compensateSubscribeData`); forward the real filter expression
+        // so the broker can register it and stop returning `code 24`.
+        let sub_expr = match &filter {
+            Some(f) if !f.expression.is_empty() => f.expression.clone(),
+            _ => "*".to_string(),
+        };
+        let sub_type = match filter.as_ref().map(|f| f.r#type) {
+            Some(2) => "SQL92".to_string(),
+            _ => "TAG".to_string(),
+        };
         let response = self
             .backend
             .invoke_broker(
@@ -1746,8 +1769,10 @@ impl MessagingProcessor {
                     ("queueOffset", offset.to_string()),
                     ("maxMsgNums", batch.max(1).to_string()),
                     ("sysFlag", "0".to_string()),
-                    ("expressionType", "TAG".to_string()),
+                    ("expressionType", sub_type),
                     ("subExpression", "*".to_string()),
+                    ("subscription", sub_expr),
+                    ("subVersion", "0".to_string()),
                 ],
                 Vec::new(),
             )
@@ -2145,7 +2170,8 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                                 Ok(offset) => offset,
                                 Err(_) => continue,
                             };
-                            match this.pull_once(lt, &group, qid, offset, batch).await {
+                            let filter = this.context.clients.subscription_for(&client_id, lt);
+                            match this.pull_once(lt, &group, qid, offset, batch, filter).await {
                                 Ok((messages, _, _)) => {
                                     for message in &messages {
                                         let handle = encode_receipt_handle(
@@ -2194,7 +2220,8 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                     return;
                 }
             };
-            match this.pull_once(&topic, &group, queue_id, offset, batch).await {
+            let filter = this.context.clients.subscription_for(&client_id, &topic);
+            match this.pull_once(&topic, &group, queue_id, offset, batch, filter).await {
                 Ok((messages, _next, _max)) => {
                     for message in &messages {
                         let handle =
@@ -2379,7 +2406,7 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         let (tx, rx) = mpsc::channel::<std::result::Result<pb::PullMessageResponse, Status>>(16);
         let this = Arc::new(self.clone_for_stream());
         tokio::spawn(async move {
-            match this.pull_once(&topic, &group, queue_id, offset, batch).await {
+            match this.pull_once(&topic, &group, queue_id, offset, batch, None).await {
                 Ok((messages, next, max)) => {
                     for message in &messages {
                         if tx

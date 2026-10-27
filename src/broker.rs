@@ -167,11 +167,27 @@ struct Heartbeat {
     fingerprint: i32,
 }
 
-struct Client {
-    client_id: String,
-    producers: BTreeSet<String>,
-    consumers: Vec<Consumer>,
+/// Mirrors Java's `ConsumerGroupInfo.subscriptionTable` + `channelInfoTable`: subscription
+/// state is keyed by consumer group and decoupled from any single TCP channel. A proxy that
+/// multiplexes many logical consumers over shared (and recycled) broker connections keeps
+/// working because the subscription survives a channel close and self-heals via pull-time
+/// compensation.
+struct GroupInfo {
+    /// topic -> subscription, mirroring `ConsumerGroupInfo.subscriptionTable`.
+    subscriptions: BTreeMap<String, HeartbeatSubscription>,
+    /// client ids (channel markers) currently associated with the group.
+    clients: BTreeSet<String>,
     last_seen: Instant,
+}
+
+impl GroupInfo {
+    fn new() -> Self {
+        GroupInfo {
+            subscriptions: BTreeMap::new(),
+            clients: BTreeSet::new(),
+            last_seen: Instant::now(),
+        }
+    }
 }
 
 /// `ConsumerFilterData`, minus the bloom bitmap the default configuration never calculates.
@@ -402,7 +418,10 @@ struct WheelEntry {
 pub struct Broker {
     store: Arc<Store>,
     config: BrokerConfig,
-    clients: Mutex<BTreeMap<SocketAddr, Client>>,
+    /// `consumerTable`: group -> subscription/connection state (Java `ConsumerManager`).
+    groups: Mutex<BTreeMap<String, GroupInfo>>,
+    /// peer (TCP) -> client id, so `disconnected` can drop the channel marker.
+    peer_channels: Mutex<BTreeMap<SocketAddr, String>>,
     filters: Mutex<FilterRegistry>,
     group_heartbeats: Mutex<BTreeMap<String, i32>>,
     queue_counter: AtomicU64,
@@ -575,7 +594,8 @@ impl Broker {
         Ok(Self {
             store,
             config,
-            clients: Mutex::new(BTreeMap::new()),
+            groups: Mutex::new(BTreeMap::new()),
+            peer_channels: Mutex::new(BTreeMap::new()),
             filters: Mutex::new(filters),
             group_heartbeats: Mutex::new(BTreeMap::new()),
             queue_counter: AtomicU64::new(0),
@@ -630,17 +650,12 @@ impl Broker {
     }
 
     pub fn expire_clients(&self) {
-        let before: BTreeSet<String> = self
-            .clients
-            .lock()
-            .unwrap()
-            .values()
-            .flat_map(|client| client.consumers.iter().map(|c| c.group_name.clone()))
-            .collect();
-        self.clients
-            .lock()
-            .unwrap()
-            .retain(|_, c| c.last_seen.elapsed() < Duration::from_secs(120));
+        let before: BTreeSet<String> = self.groups.lock().unwrap().keys().cloned().collect();
+        // Keep a group's subscription while it still has a live channel, or was touched
+        // recently. A proxy re-pull re-creates it via compensate-on-pull anyway.
+        self.groups.lock().unwrap().retain(|_, g| {
+            !g.clients.is_empty() || g.last_seen.elapsed() < Duration::from_secs(120)
+        });
         self.expire_groups(&before);
     }
 
@@ -1048,17 +1063,34 @@ impl Broker {
         }
 
         let stored = {
-            let clients = self.clients.lock().unwrap();
-            clients
-                .values()
-                .flat_map(|c| &c.consumers)
-                .filter(|c| c.group_name == group)
-                .flat_map(|c| &c.subscription_data_set)
-                .filter(|s| s.topic == topic)
-                .max_by_key(|s| s.sub_version)
-                .cloned()
-                .ok_or_else(|| Failure::new(24, "the consumer's subscription does not exist"))?
-        };
+            let mut groups = self.groups.lock().unwrap();
+            let info = groups.entry(group.to_owned()).or_insert_with(GroupInfo::new);
+            info.last_seen = Instant::now();
+            if let Some(sub) = info.subscriptions.get(topic) {
+                Some(sub.clone())
+            } else {
+                // Java `compensateSubscribeData`: a proxy-fronted consumer carries its
+                // subscription in the pull request; register it on the fly and retry. This
+                // is how the broker learns proxy-managed group subscriptions without a
+                // separate heartbeat, and keeps the lookup independent of the TCP channel.
+                match request.ext_fields.get("subscription") {
+                    Some(sub_string) if !sub_string.is_empty() => {
+                        let expression_type = request.ext_fields.get("expressionType").cloned();
+                        let sub_version = optional_field(request, "subVersion", 0i64).unwrap_or(0);
+                        let sub = HeartbeatSubscription {
+                            topic: topic.to_owned(),
+                            sub_string: sub_string.clone(),
+                            expression_type,
+                            sub_version,
+                        };
+                        info.subscriptions.insert(topic.to_owned(), sub.clone());
+                        Some(sub)
+                    }
+                    _ => None,
+                }
+            }
+        }
+        .ok_or_else(|| Failure::new(24, "the consumer's subscription does not exist"))?;
         if stored.sub_version < client_version {
             return Err(Failure::new(
                 25,
@@ -1249,18 +1281,18 @@ impl Broker {
                 .await?;
             consumers.push(consumer);
         }
-        let mut clients = self.clients.lock().unwrap();
         if heartbeat.without_sub {
-            let existing = clients
-                .get(&peer)
-                .ok_or_else(|| Failure::new(24, "full heartbeat is required"))?;
+            // `registerConsumerWithoutSub`: copy the prior subscription list from the group.
+            let groups = self.groups.lock().unwrap();
             for consumer in &mut consumers {
-                let old = existing
-                    .consumers
-                    .iter()
-                    .find(|c| c.group_name == consumer.group_name)
-                    .ok_or_else(|| Failure::new(24, "full heartbeat is required for new group"))?;
-                consumer.subscription_data_set = old.subscription_data_set.clone();
+                let Some(info) = groups.get(&consumer.group_name) else {
+                    return Err(Failure::new(24, "full heartbeat is required for new group"));
+                };
+                let mut set = Vec::with_capacity(info.subscriptions.len());
+                for sub in info.subscriptions.values() {
+                    set.push(sub.clone());
+                }
+                consumer.subscription_data_set = set;
             }
         }
         // `ConsumerManager.registerConsumerWithoutSub` never reaches the filter manager.
@@ -1269,20 +1301,33 @@ impl Broker {
         } else {
             consumers.clone()
         };
-        clients.insert(
-            peer,
-            Client {
-                client_id: heartbeat.client_id,
-                producers: heartbeat
-                    .producer_data_set
-                    .into_iter()
-                    .map(|p| p.group_name)
-                    .collect(),
-                consumers,
-                last_seen: Instant::now(),
-            },
-        );
-        drop(clients);
+        // Register per group: keyed by group, independent of the TCP peer (Java parity).
+        {
+            let mut groups = self.groups.lock().unwrap();
+            for consumer in &consumers {
+                let info = groups
+                    .entry(consumer.group_name.clone())
+                    .or_insert_with(GroupInfo::new);
+                info.last_seen = Instant::now();
+                info.clients.insert(heartbeat.client_id.clone());
+                if !heartbeat.without_sub {
+                    for sub in &consumer.subscription_data_set {
+                        info.subscriptions
+                            .entry(sub.topic.clone())
+                            .and_modify(|existing| {
+                                if sub.sub_version >= existing.sub_version {
+                                    *existing = sub.clone();
+                                }
+                            })
+                            .or_insert_with(|| sub.clone());
+                    }
+                }
+            }
+        }
+        self.peer_channels
+            .lock()
+            .unwrap()
+            .insert(peer, heartbeat.client_id.clone());
 
         let mut sub_change = true;
         if heartbeat.fingerprint != 0 {
@@ -1339,12 +1384,7 @@ impl Broker {
 
     /// Marks filters of groups that lost their last channel dead, like the UNREGISTER event.
     fn expire_groups(&self, alive_before: &BTreeSet<String>) {
-        let clients = self.clients.lock().unwrap();
-        let alive: BTreeSet<String> = clients
-            .values()
-            .flat_map(|client| client.consumers.iter().map(|c| c.group_name.clone()))
-            .collect();
-        drop(clients);
+        let alive: BTreeSet<String> = self.groups.lock().unwrap().keys().cloned().collect();
         let mut filters = self.filters.lock().unwrap();
         for group in alive_before.difference(&alive) {
             filters.mark_group_dead(group);
@@ -2513,38 +2553,35 @@ impl Broker {
             34 => self.heartbeat(request, peer).await,
             35 => {
                 let client_id = request.required("clientID")?;
-                let before: BTreeSet<String> = self
-                    .clients
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .flat_map(|client| client.consumers.iter().map(|c| c.group_name.clone()))
-                    .collect();
+                let before: BTreeSet<String> = self.groups.lock().unwrap().keys().cloned().collect();
                 {
-                    let mut clients = self.clients.lock().unwrap();
-                    if let Some(client) = clients.get_mut(&peer).filter(|c| c.client_id == client_id)
-                    {
-                        if let Some(group) = request.ext_fields.get("producerGroup") {
-                            client.producers.remove(group);
-                        }
-                        if let Some(group) = request.ext_fields.get("consumerGroup") {
-                            client.consumers.retain(|c| &c.group_name != group);
-                        }
-                        if client.producers.is_empty() && client.consumers.is_empty() {
-                            clients.remove(&peer);
-                        }
+                    let mut groups = self.groups.lock().unwrap();
+                    for info in groups.values_mut() {
+                        info.clients.remove(client_id);
                     }
+                }
+                let mut peer_channels = self.peer_channels.lock().unwrap();
+                if peer_channels
+                    .get(&peer)
+                    .map(|id| id.as_str() == client_id)
+                    .unwrap_or(false)
+                {
+                    peer_channels.remove(&peer);
                 }
                 self.expire_groups(&before);
                 Ok(Command::response(request, 0))
             }
             38 => {
                 let group = request.required("consumerGroup")?;
-                let clients = self.clients.lock().unwrap();
-                let ids: BTreeSet<_> = clients.values().filter(|c| c.consumers.iter().any(|c| c.group_name == group))
-                    .map(|c| &c.client_id).collect();
-                if ids.is_empty() { return Err(Failure::new(1, "the consumer's group info does not exist")); }
-                json_response(request, json!({"consumerIdList":ids}))
+                let groups = self.groups.lock().unwrap();
+                match groups.get(group) {
+                    Some(info) => {
+                        let ids: BTreeSet<String> =
+                            info.clients.iter().cloned().collect();
+                        json_response(request, json!({"consumerIdList": ids}))
+                    }
+                    None => Err(Failure::new(1, "the consumer's group info does not exist")),
+                }
             }
             14 | 15 => {
                 let topic = request.required("topic")?.to_owned();
@@ -2666,7 +2703,7 @@ impl Broker {
                 "bootTimestamp":self.started_at.to_string(),
                 "commitLogMaxOffset":self.store.physical_len()?.to_string(),
                 "topicCount":self.store.topics()?.len().to_string(),
-                "clientCount":self.clients.lock().unwrap().len().to_string()
+                "clientCount":self.groups.lock().unwrap().len().to_string()
             }})),
             46 => {
                 if request.body.is_empty() {
@@ -2736,14 +2773,15 @@ impl Handler for Broker {
     }
 
     fn disconnected(&self, peer: SocketAddr) {
-        let before: BTreeSet<String> = self
-            .clients
-            .lock()
-            .unwrap()
-            .values()
-            .flat_map(|client| client.consumers.iter().map(|c| c.group_name.clone()))
-            .collect();
-        self.clients.lock().unwrap().remove(&peer);
+        let before: BTreeSet<String> = self.groups.lock().unwrap().keys().cloned().collect();
+        // Only drop the channel marker; keep the group's subscription so a proxy that
+        // recycles its broker connection self-heals via compensate-on-pull (Java parity).
+        if let Some(client_id) = self.peer_channels.lock().unwrap().remove(&peer) {
+            let mut groups = self.groups.lock().unwrap();
+            for info in groups.values_mut() {
+                info.clients.remove(&client_id);
+            }
+        }
         self.expire_groups(&before);
     }
 }
