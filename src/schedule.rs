@@ -724,6 +724,23 @@ impl GroupConfig {
             ..Default::default()
         }
     }
+
+    /// Java `SubscriptionGroupConfig.getLiteSubClientQuota`: the `lite.sub.client.quota`
+    /// attribute, or the reference's default of 2000 when the group declares none.
+    pub fn lite_sub_client_quota(&self) -> i32 {
+        self.attributes
+            .get("lite.sub.client.quota")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(2000) as i32
+    }
+
+    /// Java `SubscriptionGroupConfig.getLiteBindTopic`: the `lite.bind.topic` attribute.
+    pub fn lite_bind_topic(&self) -> Option<&str> {
+        self.attributes
+            .get("lite.bind.topic")
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    }
 }
 
 /// `DelayOffsetSerializeWrapper`, the on-disk shape of `delayOffset.json`.

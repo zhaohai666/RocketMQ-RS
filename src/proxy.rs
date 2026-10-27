@@ -98,6 +98,28 @@ pub struct ProxyConfig {
     /// group index is `hash(group) % consumer_group_count`). `None` falls back to 1,
     /// i.e. this proxy owns every queue — the pre-balancing behavior.
     pub consumer_group_count: Option<u32>,
+    /// Java `ProxyConfig.maxMessageSize`: the body size a producer may send.
+    pub max_message_size: i32,
+    /// Java `ProxyConfig.enableTopicMessageTypeCheck`: whether the broker validates a
+    /// message's type against the topic's declared `accept_message_types`.
+    pub enable_topic_message_type_check: bool,
+    /// Java `ProxyConfig.maxLiteTopicSize`: the maximum length of one lite topic.
+    pub max_lite_topic_size: i32,
+    /// Java `ProxyConfig.grpcClientProducerMaxAttempts`: producer-side retry attempts
+    /// the merged `Settings` advertises.
+    pub grpc_client_producer_max_attempts: i32,
+    /// Java `ProxyConfig.grpcClientProducerBackoffInitialMillis`.
+    pub grpc_client_producer_backoff_initial_millis: i64,
+    /// Java `ProxyConfig.grpcClientProducerBackoffMaxMillis`.
+    pub grpc_client_producer_backoff_max_millis: i64,
+    /// Java `ProxyConfig.grpcClientProducerBackoffMultiplier`.
+    pub grpc_client_producer_backoff_multiplier: f32,
+    /// Java `ProxyConfig.grpcClientConsumerMinLongPollingTimeoutMillis`.
+    pub grpc_client_consumer_min_long_polling_timeout_millis: i64,
+    /// Java `ProxyConfig.grpcClientConsumerMaxLongPollingTimeoutMillis`.
+    pub grpc_client_consumer_max_long_polling_timeout_millis: i64,
+    /// Java `ProxyConfig.grpcClientConsumerLongPollingBatchSize`.
+    pub grpc_client_consumer_long_polling_batch_size: i32,
 }
 
 impl Default for ProxyConfig {
@@ -118,6 +140,16 @@ impl Default for ProxyConfig {
             default_producer_group: "PID_DEFAULT".into(),
             forward_timeout_millis: 3_000,
             consumer_group_count: None,
+            max_message_size: 4 * 1024 * 1024,
+            enable_topic_message_type_check: true,
+            max_lite_topic_size: 64,
+            grpc_client_producer_max_attempts: 3,
+            grpc_client_producer_backoff_initial_millis: 10,
+            grpc_client_producer_backoff_max_millis: 1_000,
+            grpc_client_producer_backoff_multiplier: 2.0,
+            grpc_client_consumer_min_long_polling_timeout_millis: 5_000,
+            grpc_client_consumer_max_long_polling_timeout_millis: 20_000,
+            grpc_client_consumer_long_polling_batch_size: 32,
         }
     }
 }
@@ -478,6 +510,23 @@ impl ClientRegistry {
         out
     }
 
+    /// The bind (parent) topic a client's lite subscriptions hang below. A lite
+    /// consumer is assigned the bind topic's queues, and its messages are stored
+    /// there, so the proxy needs the name to pull from.
+    fn lite_bind_topic(&self, client_id: &str) -> Option<String> {
+        let by_id = self.by_id.lock().unwrap();
+        by_id.get(client_id)
+            .and_then(|state| state.lite_topics.keys().next().cloned())
+    }
+
+    /// The bind (parent) topic of any client registered under `group`.
+    fn lite_bind_topic_of_group(&self, group: &str) -> Option<String> {
+        let by_id = self.by_id.lock().unwrap();
+        by_id.values()
+            .filter(|state| state.group == group)
+            .find_map(|state| state.lite_topics.keys().next().cloned())
+    }
+
     /// Apply a `SyncLiteSubscription` action to a client's lite topic sets and return
     /// the topics that were *removed* (so the proxy can broadcast
     /// `NotifyUnsubscribeLiteCommand` to the rest of the group). Action codes follow
@@ -685,6 +734,137 @@ fn apply_settings(registry: &ClientRegistry, client_id: &str, settings: &pb::Set
         }
     }
     registry.register(state);
+}
+
+// ---------------------------------------------------------------------------
+// GrpcClientSettingsManager (Java `proxy/.../grpc/v2/common/GrpcClientSettingsManager.java`)
+// ---------------------------------------------------------------------------
+
+/// A protobuf duration built from a millisecond count.
+fn duration_millis(millis: i64) -> prost_types::Duration {
+    prost_types::Duration {
+        seconds: millis.div_euclid(1_000),
+        nanos: (millis.rem_euclid(1_000) * 1_000_000) as i32,
+    }
+}
+
+/// Java `GrpcClientSettingsManager.mergeProducerData`: the server tells the producer how
+/// many attempts it may make and with which back-off, plus the body-size limit and
+/// whether the broker validates message types.
+fn merge_producer_settings(settings: &pb::Settings, config: &ProxyConfig) -> pb::Settings {
+    let mut merged = settings.clone();
+    let mut backoff = merged.backoff_policy.clone().unwrap_or_default();
+    backoff.max_attempts = config.grpc_client_producer_max_attempts;
+    backoff.strategy = Some(pb::retry_policy::Strategy::ExponentialBackoff(
+        pb::ExponentialBackoff {
+            initial: Some(duration_millis(config.grpc_client_producer_backoff_initial_millis)),
+            max: Some(duration_millis(config.grpc_client_producer_backoff_max_millis)),
+            multiplier: config.grpc_client_producer_backoff_multiplier,
+        },
+    ));
+    merged.backoff_policy = Some(backoff);
+    if let Some(pb::settings::PubSub::Publishing(publishing)) = merged.pub_sub.as_mut() {
+        publishing.validate_message_type = config.enable_topic_message_type_check;
+        publishing.max_body_size = config.max_message_size;
+    }
+    merged
+}
+
+/// Java `GrpcClientSettingsManager.mergeSubscriptionData`: the server tells the consumer
+/// whether its group is FIFO, how many messages a long poll may return, how long a long
+/// poll may wait, the lite-subscription quota, and — crucially — the group's retry
+/// policy. A 5.x client refuses to start scanning without that back-off policy, so this
+/// merge is what makes the push-consumer path work at all.
+fn merge_subscription_settings(
+    settings: &pb::Settings,
+    group: &crate::schedule::GroupConfig,
+    config: &ProxyConfig,
+) -> pb::Settings {
+    let mut merged = settings.clone();
+    if let Some(pb::settings::PubSub::Subscription(subscription)) = merged.pub_sub.as_mut() {
+        subscription.fifo = Some(group.consume_message_orderly);
+        subscription.receive_batch_size = Some(config.grpc_client_consumer_long_polling_batch_size);
+        subscription.long_polling_timeout =
+            Some(duration_millis(config.grpc_client_consumer_max_long_polling_timeout_millis));
+        subscription.lite_subscription_quota = Some(group.lite_sub_client_quota());
+        subscription.max_lite_topic_size = Some(config.max_lite_topic_size);
+    }
+    let mut backoff = merged.backoff_policy.clone().unwrap_or_default();
+    // Java: `setMaxAttempts(groupConfig.getRetryMaxTimes() + 1)` — the extra attempt
+    // is the first delivery, the configured maximum counts the retries.
+    backoff.max_attempts = group.retry_max_times + 1;
+    backoff.strategy = Some(match group.group_retry_policy.policy_type {
+        crate::schedule::GroupRetryPolicyType::EXPONENTIAL => {
+            let policy = group
+                .group_retry_policy
+                .exponential_retry_policy
+                .clone()
+                .unwrap_or_default();
+            pb::retry_policy::Strategy::ExponentialBackoff(pb::ExponentialBackoff {
+                initial: Some(duration_millis(policy.initial as i64)),
+                max: Some(duration_millis(policy.max as i64)),
+                multiplier: policy.multiplier as f32,
+            })
+        }
+        crate::schedule::GroupRetryPolicyType::CUSTOMIZED => {
+            let policy = group
+                .group_retry_policy
+                .customized_retry_policy
+                .clone()
+                .unwrap_or_default();
+            pb::retry_policy::Strategy::CustomizedBackoff(pb::CustomizedBackoff {
+                next: policy
+                    .next
+                    .iter()
+                    .map(|millis| duration_millis(*millis as i64))
+                    .collect(),
+            })
+        }
+    });
+    merged.backoff_policy = Some(backoff);
+    merged
+}
+
+/// Java `GrpcClientSettingsManager.getClientSettings`: merge the client-reported
+/// `Settings` with the server's own data and return what the client should see.
+async fn merge_client_settings(
+    backend: &ProxyBackend,
+    config: &ProxyConfig,
+    settings: &pb::Settings,
+) -> pb::Settings {
+    match &settings.pub_sub {
+        Some(pb::settings::PubSub::Publishing(_)) => merge_producer_settings(settings, config),
+        Some(pb::settings::PubSub::Subscription(subscription)) => {
+            let group = subscription
+                .group
+                .as_ref()
+                .map(|g| g.name.clone())
+                .unwrap_or_default();
+            match backend
+                .subscription_group_config(&config.rocketmq_cluster_name, &group)
+                .await
+            {
+                Some(group_config) => merge_subscription_settings(settings, &group_config, config),
+                // Java returns the untouched settings when the group is unknown.
+                None => settings.clone(),
+            }
+        }
+        None => settings.clone(),
+    }
+}
+
+/// The bind (parent) topic of a lite consumer: the topic its lite subscriptions
+/// were registered under. Falls back to the group's bind topic when the caller
+/// carries no resolvable client id.
+fn bind_topic_of(registry: &ClientRegistry, client_id: &str, group: &str) -> String {
+    if !client_id.is_empty() {
+        if let Some(bind_topic) = registry.lite_bind_topic(client_id) {
+            return bind_topic;
+        }
+    }
+    registry
+        .lite_bind_topic_of_group(group)
+        .unwrap_or_default()
 }
 
 /// Periodic orphaned-transaction recovery (Java `TransactionalMessageCheckService`).
@@ -988,6 +1168,10 @@ pub struct ProxyBackend {
     nameservers: Vec<String>,
     timeout: Duration,
     cursor: AtomicUsize,
+    /// Cached consumer-group configs, keyed by group name. Java keeps the same
+    /// data in a Guava cache (`ClusterMetadataService.subscriptionGroupConfigCache`)
+    /// so a client that re-reports its `Settings` does not re-query the broker.
+    group_configs: Arc<Mutex<HashMap<String, (crate::schedule::GroupConfig, Instant)>>>,
 }
 
 impl Clone for ProxyBackend {
@@ -997,6 +1181,7 @@ impl Clone for ProxyBackend {
             nameservers: self.nameservers.clone(),
             timeout: self.timeout,
             cursor: AtomicUsize::new(self.cursor.load(Ordering::Relaxed)),
+            group_configs: Arc::clone(&self.group_configs),
         }
     }
 }
@@ -1009,6 +1194,7 @@ impl ProxyBackend {
             nameservers,
             timeout,
             cursor: AtomicUsize::new(0),
+            group_configs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1154,6 +1340,92 @@ impl ProxyBackend {
         Err(Error::NotFound(format!("no master broker for topic {topic}")))
     }
 
+    /// Java `ClusterMetadataService.findOneBroker`: pick one broker of the cluster.
+    /// The namesrv's `GET_BROKER_CLUSTER_INFO` (code 106) returns the whole
+    /// `brokerAddrTable`, from which any broker of the cluster can be selected.
+    pub async fn one_broker_addr(&self, cluster: &str) -> Result<String> {
+        let response = self.invoke_namesrv(106, &[], Vec::new()).await?;
+        if response.code != 0 {
+            return Err(Error::NotFound(format!(
+                "broker cluster info query failed (code {}): {}",
+                response.code,
+                response.remark.as_deref().unwrap_or("")
+            )));
+        }
+        let value: serde_json::Value = serde_json::from_slice(&response.body)?;
+        let table = value
+            .get("brokerAddrTable")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| Error::NotFound("broker cluster info is empty".into()))?;
+        let mut fallback: Option<String> = None;
+        for broker in table.values() {
+            if !cluster.is_empty()
+                && broker
+                    .get("cluster")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| name != cluster)
+            {
+                continue;
+            }
+            let Some(addrs) = broker
+                .get("brokerAddrs")
+                .and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            // Prefer the master (broker id 0), like Java's `BrokerData.selectBrokerAddr`.
+            if let Some(addr) = addrs.get("0").and_then(serde_json::Value::as_str) {
+                return Ok(addr.to_string());
+            }
+            if fallback.is_none() {
+                fallback = addrs.values().find_map(|value| value.as_str()).map(str::to_owned);
+            }
+        }
+        fallback.ok_or_else(|| Error::NotFound("no broker registered in the cluster".into()))
+    }
+
+    /// Java `MQClientAPIImpl.getSubscriptionGroupConfig`: fetch one consumer group's
+    /// config from a broker (remoting code 352). The broker auto-creates an unknown
+    /// group, mirroring `SubscriptionGroupManager.findSubscriptionGroupConfig`.
+    ///
+    /// The answer is cached for `GROUP_CONFIG_CACHE_TTL`, like Java's
+    /// `subscriptionGroupConfigCache` (`expireAfterAccess`).
+    pub async fn subscription_group_config(
+        &self,
+        cluster: &str,
+        group: &str,
+    ) -> Option<crate::schedule::GroupConfig> {
+        const GROUP_CONFIG_CACHE_TTL: Duration = Duration::from_secs(60);
+        if group.is_empty() {
+            return None;
+        }
+        {
+            let cache = self.group_configs.lock().unwrap();
+            if let Some((config, fetched_at)) = cache.get(group) {
+                if fetched_at.elapsed() < GROUP_CONFIG_CACHE_TTL {
+                    return Some(config.clone());
+                }
+            }
+        }
+        let addr = self.one_broker_addr(cluster).await.ok()?;
+        let request = Command::request(352).with_ext("group", group.to_string());
+        let response = self.client.invoke(&addr, request, self.timeout).await.ok()?;
+        if response.code != 0 {
+            warn!(
+                group,
+                code = response.code,
+                "subscription group config query failed"
+            );
+            return None;
+        }
+        let config: crate::schedule::GroupConfig = serde_json::from_slice(&response.body).ok()?;
+        self.group_configs
+            .lock()
+            .unwrap()
+            .insert(group.to_string(), (config.clone(), Instant::now()));
+        Some(config)
+    }
+
     /// Resolve the topic's master, then invoke a broker command there.
     pub async fn invoke_broker(
         &self,
@@ -1179,8 +1451,16 @@ impl ProxyBackend {
 
     /// Resolve the topic's declared message types from the broker's
     /// `GET_TOPIC_CONFIG_BY_TOPIC` (remoting code 351), which returns the
-    /// `TopicConfig` JSON (its `topicSysFlag` low bits encode the type). Falls
-    /// back to `[Normal]` whenever the broker is unreachable or the topic is new.
+    /// `TopicConfig` JSON. Java declares a topic's message type through the
+    /// `+message.type` attribute (`TopicAttributes.TOPIC_MESSAGE_TYPE_ATTRIBUTE`,
+    /// stored with `AttributeParser.ATTR_ADD_PLUS_SIGN`); the legacy `topicSysFlag`
+    /// low bits are honoured when set.
+    ///
+    /// A topic without an explicit declaration accepts every type the server
+    /// supports, matching the Java proxy, which leaves `accept_message_types`
+    /// unset. Advertising `[Normal]` instead would make a 5.x client reject
+    /// FIFO / delay / priority / transaction messages before they ever reach the
+    /// broker.
     pub async fn topic_message_types(&self, topic: &str) -> Vec<i32> {
         match self
             .invoke_broker(topic, 351, &[("topic", topic.to_string())], Vec::new())
@@ -1189,15 +1469,25 @@ impl ProxyBackend {
             Ok(response) if response.code == 0 => {
                 let value: serde_json::Value = match serde_json::from_slice(&response.body) {
                     Ok(v) => v,
-                    Err(_) => return vec![pb::MessageType::Normal as i32],
+                    Err(_) => return all_message_types(),
                 };
+                if let Some(declared) = value
+                    .get("attributes")
+                    .and_then(|attributes| attributes.get(MESSAGE_TYPE_ATTRIBUTE))
+                    .and_then(|v| v.as_str())
+                {
+                    return message_types_from_attribute(declared);
+                }
                 let sys_flag = value
                     .get("topicSysFlag")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0) as i32;
-                message_types_from_sys_flag(sys_flag)
+                if sys_flag != 0 {
+                    return message_types_from_sys_flag(sys_flag);
+                }
+                all_message_types()
             }
-            _ => vec![pb::MessageType::Normal as i32],
+            _ => all_message_types(),
         }
     }
 }
@@ -1262,6 +1552,36 @@ fn message_types_from_sys_flag(sys_flag: i32) -> Vec<i32> {
     }
 }
 
+/// Java `TopicAttributes.TOPIC_MESSAGE_TYPE_ATTRIBUTE`, stored under the
+/// `AttributeParser.ATTR_ADD_PLUS_SIGN` ("+") prefixed key.
+pub const MESSAGE_TYPE_ATTRIBUTE: &str = "+message.type";
+
+/// Every message type the broker can store, i.e. Java's `TopicMessageType.MIXED`.
+fn all_message_types() -> Vec<i32> {
+    vec![
+        pb::MessageType::Normal as i32,
+        pb::MessageType::Fifo as i32,
+        pb::MessageType::Delay as i32,
+        pb::MessageType::Transaction as i32,
+        pb::MessageType::Lite as i32,
+        pb::MessageType::Priority as i32,
+    ]
+}
+
+/// Java `TopicMessageType` -> the v2 `MessageType` values a topic accepts.
+fn message_types_from_attribute(declared: &str) -> Vec<i32> {
+    match declared.to_ascii_uppercase().as_str() {
+        "NORMAL" => vec![pb::MessageType::Normal as i32],
+        "FIFO" => vec![pb::MessageType::Fifo as i32],
+        "DELAY" => vec![pb::MessageType::Delay as i32],
+        "TRANSACTION" => vec![pb::MessageType::Transaction as i32],
+        "LITE" => vec![pb::MessageType::Lite as i32],
+        "PRIORITY" => vec![pb::MessageType::Priority as i32],
+        // `MIXED`, and anything unknown, accepts every type.
+        _ => all_message_types(),
+    }
+}
+
 /// RocketMQ perm bits -> v2 `Permission`.
 fn perm_to_permission(perm: i32) -> pb::Permission {
     match (perm & 4, perm & 2) {
@@ -1287,9 +1607,35 @@ fn endpoints_from_addr(addr: &str) -> Option<pb::Endpoints> {
 
 const PROPERTIES: [&str; 5] = ["TAGS", "KEYS", "UNIQ_KEY", "SHARDING_KEY", "RECONSUME_TIMES"];
 
+/// Java `MessageConst.PROPERTY_LITE_TOPIC`: the lite topic a message belongs to.
+/// A lite message is stored in its bind (parent) topic and carries the lite
+/// topic name in this property, which is how a lite consumer tells the
+/// messages of the lite topics it subscribed to apart.
+const LITE_TOPIC_PROPERTY: &str = "__LITE_TOPIC";
+
 /// Build the remoting `properties` header string from a v2 message.
+/// Java `MessageSysFlag.TRANSACTION_PREPARED_TYPE`: a transactional message is stored as a
+/// half message until the producer resolves it with `END_TRANSACTION`.
+const TRANS_PREPARED_FLAG: i32 = 0x4;
+/// Java `MessageConst.PROPERTY_TRANSACTION_PREPARED`.
+const TRAN_MSG_PROPERTY: &str = "TRAN_MSG";
+
+/// Whether the v2 message asks for a transactional (half) send.
+fn is_transactional(message: &pb::Message) -> bool {
+    message
+        .system_properties
+        .as_ref()
+        .map(|system| system.message_type == pb::MessageType::Transaction as i32)
+        .unwrap_or(false)
+}
+
 fn encode_send_properties(message: &pb::Message) -> Result<String> {
     let mut properties: BTreeMap<String, String> = BTreeMap::new();
+    if is_transactional(message) {
+        // `MessageConst.PROPERTY_TRANSACTION_PREPARED`: the broker keeps the message in
+        // `RMQ_SYS_TRANS_HALF_TOPIC` until the producer commits or rolls it back.
+        properties.insert(TRAN_MSG_PROPERTY.into(), "true".into());
+    }
     if let Some(system) = &message.system_properties {
         if let Some(tag) = &system.tag {
             properties.insert("TAGS".into(), tag.clone());
@@ -1306,9 +1652,28 @@ fn encode_send_properties(message: &pb::Message) -> Result<String> {
         if let Some(attempt) = system.delivery_attempt {
             properties.insert("RECONSUME_TIMES".into(), attempt.to_string());
         }
+        if let Some(lite_topic) = &system.lite_topic {
+            if !lite_topic.is_empty() {
+                properties.insert(LITE_TOPIC_PROPERTY.into(), lite_topic.clone());
+            }
+        }
     }
     for (key, value) in &message.user_properties {
         properties.insert(key.clone(), value.clone());
+    }
+    // A v2 message carries its delivery deadline in `system_properties`; the broker's
+    // timer wheel only recognises the `TIMER_*` properties, so the deadline has to be
+    // translated here or the message would be delivered immediately.
+    if let Some(delivery) = message
+        .system_properties
+        .as_ref()
+        .and_then(|system| system.delivery_timestamp.as_ref())
+    {
+        let deliver_ms = delivery.seconds * 1000 + i64::from(delivery.nanos) / 1_000_000;
+        properties.insert(
+            crate::schedule::TIMER_DELIVER_MS.into(),
+            deliver_ms.to_string(),
+        );
     }
     common::encode_properties(&properties)
 }
@@ -1346,7 +1711,7 @@ fn to_pb_message(message: &common::Message, receipt_handle: Option<String>) -> p
         trace_context: None,
         orphaned_transaction_recovery_duration: None,
         dead_letter_queue: None,
-        lite_topic: None,
+        lite_topic: message.properties.get(LITE_TOPIC_PROPERTY).cloned(),
         priority: None,
     };
     let user_properties: std::collections::HashMap<String, String> = message
@@ -1777,12 +2142,37 @@ impl MessagingProcessor {
                 Vec::new(),
             )
             .await?;
-        if response.code != 0 {
-            return Err(Error::NotFound(format!(
-                "pull failed (code {}): {}",
-                response.code,
-                response.remark.as_deref().unwrap_or("")
-            )));
+        let next_begin = response
+            .ext_fields
+            .get("nextBeginOffset")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(offset);
+        let max = response
+            .ext_fields
+            .get("maxOffset")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(offset);
+        let min = response
+            .ext_fields
+            .get("minOffset")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(offset);
+        // The broker reports "nothing to read yet" as a normal outcome of the long
+        // poll: 19 = no message at the offset, 20 = the offset moved forward,
+        // 21 = the offset is out of range. Java's proxy turns these into an empty
+        // pull result plus the offset to retry from, not into a failure.
+        match response.code {
+            0 => {}
+            19 => return Ok((Vec::new(), offset, max)),
+            20 => return Ok((Vec::new(), next_begin, max)),
+            21 => return Ok((Vec::new(), min, max)),
+            code => {
+                return Err(Error::NotFound(format!(
+                    "pull failed (code {}): {}",
+                    code,
+                    response.remark.as_deref().unwrap_or("")
+                )))
+            }
         }
         // The pull body is a sequence of RocketMQ message records (broker's
         // `Message::encode`); decode them with the shared `common::Message` codec.
@@ -1801,17 +2191,8 @@ impl MessagingProcessor {
                 }
             }
         }
-        let next = response
-            .ext_fields
-            .get("nextBeginOffset")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(offset + messages.len() as i64);
-        let max = response
-            .ext_fields
-            .get("maxOffset")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(next);
-        Ok((messages, next, max))
+        let next = next_begin.max(offset + messages.len() as i64);
+        Ok((messages, next, max.max(next)))
     }
 }
 
@@ -1952,7 +2333,17 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                         ),
                         // -1 lets the broker round-robin the write queues.
                         ("queueId", "-1".to_string()),
-                        ("sysFlag", "0".to_string()),
+                        // A transactional message must carry the prepared flag, so the
+                        // broker stores it as a half message (`MessageSysFlag`
+                        // `TRANSACTION_PREPARED_TYPE`).
+                        (
+                            "sysFlag",
+                            if is_transactional(message) {
+                                TRANS_PREPARED_FLAG.to_string()
+                            } else {
+                                "0".to_string()
+                            },
+                        ),
                         ("flag", "0".to_string()),
                         ("bornTimestamp", born.to_string()),
                         ("properties", properties),
@@ -1979,7 +2370,11 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                             .get("queueOffset")
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(0),
-                        recall_handle: String::new(),
+                        recall_handle: response
+                            .ext_fields
+                            .get("recallHandle")
+                            .cloned()
+                            .unwrap_or_default(),
                     });
                 }
                 Ok(response) => entries.push(pb::SendResultEntry {
@@ -2146,10 +2541,13 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         let this = Arc::new(self.clone_for_stream());
         tokio::spawn(async move {
             // Lite routing: a LITE push consumer receives from the union of topics it
-            // registered via `SyncLiteSubscription`, not a single `MessageQueue`. We fan
-            // out across every lite topic's readable queues, reusing the normal pull path
-            // (the broker's lite guard only trips on `sysFlag & 16`/`liteTopic`, which we
-            // never send) and per-topic receipt handles so `ack_message` still commits.
+            // registered via `SyncLiteSubscription`. A lite message is stored in its
+            // bind (parent) topic and carries the lite topic name in the
+            // `__LITE_TOPIC` property, so the bind topic's queues are pulled and the
+            // messages of the subscribed lite topics are picked out of them. (Java
+            // keeps the lite messages in a `%LMQ%$parent$lite` light queue instead;
+            // this port filters in the proxy, which gives the same observable result
+            // for a single consumer group.)
             let mut lite_topics = if !client_id.is_empty() {
                 this.context.clients.lite_topics_for(&client_id)
             } else {
@@ -2159,45 +2557,58 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                 lite_topics = this.context.clients.lite_topics_for_group(&group);
             }
             if !lite_topics.is_empty() {
-                for lt in &lite_topics {
-                    let queues = match this.backend.topic_route(lt).await {
-                        Ok((_, queues)) => queues,
-                        Err(_) => continue,
-                    };
-                    for queue in &queues {
-                        for qid in 0..queue.read_queues.max(0) {
-                            let offset = match this.committed_offset(lt, &group, qid).await {
-                                Ok(offset) => offset,
-                                Err(_) => continue,
-                            };
-                            let filter = this.context.clients.subscription_for(&client_id, lt);
-                            match this.pull_once(lt, &group, qid, offset, batch, filter).await {
-                                Ok((messages, _, _)) => {
-                                    for message in &messages {
-                                        let handle = encode_receipt_handle(
-                                            lt,
-                                            &group,
-                                            qid,
-                                            message.queue_offset as i64,
-                                        );
-                                        let pb_message = to_pb_message(message, Some(handle));
-                                        if tx
-                                            .send(Ok(pb::ReceiveMessageResponse {
-                                                content: Some(
-                                                    pb::receive_message_response::Content::Message(
-                                                        pb_message,
-                                                    ),
+                // The bind topic is the topic the client was assigned; the lite topics
+                // it subscribed to hang below it.
+                let bind_topic = if topic.is_empty() {
+                    bind_topic_of(&this.context.clients, &client_id, &group)
+                } else {
+                    topic.clone()
+                };
+                let queues = match this.backend.topic_route(&bind_topic).await {
+                    Ok((_, queues)) => queues,
+                    Err(_) => Vec::new(),
+                };
+                for queue in &queues {
+                    for qid in 0..queue.read_queues.max(0) {
+                        let offset = match this.committed_offset(&bind_topic, &group, qid).await {
+                            Ok(offset) => offset,
+                            Err(_) => continue,
+                        };
+                        let filter = this.context.clients.subscription_for(&client_id, &bind_topic);
+                        match this.pull_once(&bind_topic, &group, qid, offset, batch, filter).await
+                        {
+                            Ok((messages, _, _)) => {
+                                for message in &messages {
+                                    let message_lite_topic =
+                                        message.properties.get(LITE_TOPIC_PROPERTY);
+                                    if !message_lite_topic
+                                        .is_some_and(|lite| lite_topics.iter().any(|t| t == lite))
+                                    {
+                                        continue;
+                                    }
+                                    let handle = encode_receipt_handle(
+                                        &bind_topic,
+                                        &group,
+                                        qid,
+                                        message.queue_offset as i64,
+                                    );
+                                    let pb_message = to_pb_message(message, Some(handle));
+                                    if tx
+                                        .send(Ok(pb::ReceiveMessageResponse {
+                                            content: Some(
+                                                pb::receive_message_response::Content::Message(
+                                                    pb_message,
                                                 ),
-                                            }))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
+                                            ),
+                                        }))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
                                     }
                                 }
-                                Err(_) => continue,
                             }
+                            Err(_) => continue,
                         }
                     }
                 }
@@ -2668,6 +3079,8 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .await;
         // Client -> server: drain reports; refresh the registry from client Settings.
         let recv_clients = Arc::clone(&self.context.clients);
+        let backend = self.backend.clone();
+        let proxy_config = self.context.config.clone();
         tokio::spawn(async move {
             while let Some(item) = inbound.next().await {
                 match item {
@@ -2676,6 +3089,26 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                             cmd.command.clone()
                         {
                             apply_settings(&recv_clients, &cid, &settings);
+                            // Java `ClientActivity.processAndWriteClientSettings`: the
+                            // client reports its `Settings`, the server merges its own
+                            // data into them and writes the result back on the same
+                            // telemetry stream. The merged `Settings` is what carries
+                            // the consumer group's retry policy — without it a 5.x
+                            // push consumer never starts scanning for assignments.
+                            let merged = merge_client_settings(
+                                &backend,
+                                &proxy_config,
+                                &settings,
+                            )
+                            .await;
+                            let _ = tx
+                                .send(Ok(pb::TelemetryCommand {
+                                    command: Some(pb::telemetry_command::Command::Settings(
+                                        merged,
+                                    )),
+                                    ..Default::default()
+                                }))
+                                .await;
                         }
                         // Client-side reports the server actively requested: resolve the
                         // waiting Admin RPC (thread stack trace / verify message) by nonce.
@@ -4008,6 +4441,131 @@ pub async fn serve_remoting_front(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A consumer's `Settings` must carry the group's retry policy, or a 5.x
+    /// push consumer never starts scanning for assignments.
+    #[test]
+    fn subscription_settings_carry_the_group_retry_policy() {
+        let group = crate::schedule::GroupConfig::new("test");
+        let config = ProxyConfig::default();
+        let settings = pb::Settings {
+            pub_sub: Some(pb::settings::PubSub::Subscription(pb::Subscription {
+                group: Some(pb::Resource {
+                    name: "test".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let merged = merge_subscription_settings(&settings, &group, &config);
+        let backoff = merged.backoff_policy.expect("backoff policy");
+        // Java: `retryMaxTimes + 1` (16 + 1).
+        assert_eq!(backoff.max_attempts, 17);
+        match backoff.strategy.expect("strategy") {
+            pb::retry_policy::Strategy::CustomizedBackoff(strategy) => {
+                // The reference's ladder: 1s 5s 10s 30s 1m ... 2h.
+                assert_eq!(strategy.next.len(), 18);
+                assert_eq!(strategy.next[0], duration_millis(1_000));
+                assert_eq!(strategy.next[17], duration_millis(7_200_000));
+            }
+            other => panic!("unexpected strategy {other:?}"),
+        }
+        match merged.pub_sub.expect("pub_sub") {
+            pb::settings::PubSub::Subscription(subscription) => {
+                assert_eq!(subscription.receive_batch_size, Some(32));
+                assert_eq!(
+                    subscription.long_polling_timeout,
+                    Some(duration_millis(20_000))
+                );
+                assert_eq!(subscription.fifo, Some(false));
+                assert_eq!(subscription.lite_subscription_quota, Some(2000));
+                assert_eq!(subscription.max_lite_topic_size, Some(64));
+            }
+            other => panic!("unexpected pub_sub {other:?}"),
+        }
+    }
+
+    /// An exponential group policy must reach the client as an exponential back-off.
+    #[test]
+    fn exponential_group_policy_becomes_an_exponential_backoff() {
+        let mut group = crate::schedule::GroupConfig::new("fifo-group");
+        group.group_retry_policy.policy_type = crate::schedule::GroupRetryPolicyType::EXPONENTIAL;
+        group.group_retry_policy.exponential_retry_policy = Some(
+            crate::schedule::ExponentialRetryPolicy {
+                initial: 5_000,
+                max: 7_200_000,
+                multiplier: 2,
+            },
+        );
+        let settings = pb::Settings {
+            pub_sub: Some(pb::settings::PubSub::Subscription(pb::Subscription {
+                group: Some(pb::Resource {
+                    name: "fifo-group".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let merged = merge_subscription_settings(&settings, &group, &ProxyConfig::default());
+        match merged.backoff_policy.expect("backoff").strategy.expect("strategy") {
+            pb::retry_policy::Strategy::ExponentialBackoff(strategy) => {
+                assert_eq!(strategy.initial, Some(duration_millis(5_000)));
+                assert_eq!(strategy.max, Some(duration_millis(7_200_000)));
+                assert_eq!(strategy.multiplier, 2.0);
+            }
+            other => panic!("unexpected strategy {other:?}"),
+        }
+    }
+
+    /// The producer side of the merge mirrors `mergeProducerData`.
+    #[test]
+    fn producer_settings_carry_the_producer_backoff() {
+        let settings = pb::Settings {
+            pub_sub: Some(pb::settings::PubSub::Publishing(pb::Publishing::default())),
+            ..Default::default()
+        };
+        let merged = merge_producer_settings(&settings, &ProxyConfig::default());
+        let backoff = merged.backoff_policy.expect("backoff policy");
+        assert_eq!(backoff.max_attempts, 3);
+        match backoff.strategy.expect("strategy") {
+            pb::retry_policy::Strategy::ExponentialBackoff(strategy) => {
+                assert_eq!(strategy.initial, Some(duration_millis(10)));
+                assert_eq!(strategy.max, Some(duration_millis(1_000)));
+                assert_eq!(strategy.multiplier, 2.0);
+            }
+            other => panic!("unexpected strategy {other:?}"),
+        }
+        match merged.pub_sub.expect("pub_sub") {
+            pb::settings::PubSub::Publishing(publishing) => {
+                assert!(publishing.validate_message_type);
+                assert_eq!(publishing.max_body_size, 4 * 1024 * 1024);
+            }
+            other => panic!("unexpected pub_sub {other:?}"),
+        }
+    }
+
+    /// A lite message carries its lite topic in `__LITE_TOPIC`, which is how a
+    /// lite consumer tells the messages of the lite topics it subscribed to apart.
+    #[test]
+    fn a_lite_message_carries_its_lite_topic() {
+        let message = pb::Message {
+            topic: Some(pb::Resource {
+                name: "parent_topic".into(),
+                ..Default::default()
+            }),
+            system_properties: Some(pb::SystemProperties {
+                lite_topic: Some("lite-topic-1".into()),
+                message_type: pb::MessageType::Lite as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let properties = encode_send_properties(&message).unwrap();
+        assert!(properties.contains(LITE_TOPIC_PROPERTY));
+        assert!(properties.contains("lite-topic-1"));
+    }
 
     #[test]
     fn config_defaults_and_json_roundtrip() {

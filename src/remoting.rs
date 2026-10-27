@@ -114,6 +114,12 @@ impl Command {
         self
     }
 
+    /// Attach a human-readable remark, like Java's `RemotingCommand.setRemark`.
+    pub fn with_remark(mut self, remark: impl Into<String>) -> Self {
+        self.remark = Some(remark.into());
+        self
+    }
+
     pub fn required(&self, key: &str) -> Result<&str> {
         self.ext_fields
             .get(key)

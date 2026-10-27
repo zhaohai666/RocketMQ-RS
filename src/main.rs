@@ -176,6 +176,11 @@ enum AdminCommand {
         topic: String,
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(i32).range(1..=1024))]
         queues: i32,
+        /// Topic message type (Java `TopicConfig.attributes["+message.type"]`):
+        /// NORMAL, FIFO, DELAY, TRANSACTION, PRIORITY, LITE or MIXED. Without it the
+        /// topic accepts every message type.
+        #[arg(long, value_parser = parse_message_type)]
+        message_type: Option<String>,
     },
     Runtime {
         #[arg(long, default_value = "127.0.0.1:10911", value_parser = parse_endpoint)]
@@ -193,6 +198,28 @@ fn parse_name(value: &str) -> std::result::Result<String, String> {
         return Err("expected 1..127 ASCII letters, digits, %, _, - or |".into());
     }
     Ok(value.to_owned())
+}
+
+/// Java `TopicMessageType`: the values a topic's `+message.type` attribute accepts.
+fn parse_message_type(value: &str) -> std::result::Result<String, String> {
+    let upper = value.to_ascii_uppercase();
+    const KNOWN: [&str; 7] = [
+        "NORMAL",
+        "FIFO",
+        "DELAY",
+        "TRANSACTION",
+        "PRIORITY",
+        "LITE",
+        "MIXED",
+    ];
+    if KNOWN.contains(&upper.as_str()) {
+        Ok(upper)
+    } else {
+        Err(format!(
+            "expected one of {}",
+            KNOWN.join(", ")
+        ))
+    }
 }
 
 fn parse_concrete_listener(value: &str) -> std::result::Result<SocketAddr, String> {
@@ -823,17 +850,23 @@ fn admin_request(command: AdminCommand) -> (String, Command) {
             broker,
             topic,
             queues,
-        } => (
-            broker,
-            Command::request(17)
+            message_type,
+        } => {
+            let mut command = Command::request(17)
                 .with_ext("topic", topic)
                 .with_ext("readQueueNums", queues)
                 .with_ext("writeQueueNums", queues)
                 .with_ext("perm", 6)
                 .with_ext("topicFilterType", "SINGLE_TAG")
                 .with_ext("topicSysFlag", 0)
-                .with_ext("order", false),
-        ),
+                .with_ext("order", false);
+            if let Some(message_type) = message_type {
+                // Java `TopicConfig.attributes`, keyed by `AttributeParser.ATTR_ADD_PLUS_SIGN`.
+                let attributes = serde_json::json!({ "+message.type": message_type });
+                command = command.with_ext("attributes", attributes.to_string());
+            }
+            (broker, command)
+        }
         AdminCommand::Runtime { broker } => (broker, Command::request(28)),
     }
 }

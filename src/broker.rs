@@ -2609,10 +2609,26 @@ impl Broker {
                 config.perm = request.field("perm")?;
                 config.topic_sys_flag = optional_field(request, "topicSysFlag", 0i32)?;
                 config.order = optional_field(request, "order", false)?;
-                if request.ext_fields.get("topicFilterType").is_some_and(|v| v != "SINGLE_TAG")
-                    || request.ext_fields.get("attributes").is_some_and(|v| !v.is_empty())
-                {
-                    return Err(Failure::new(3, "custom topic filter types and attributes are not implemented"));
+                if request.ext_fields.get("topicFilterType").is_some_and(|v| v != "SINGLE_TAG") {
+                    return Err(Failure::new(3, "custom topic filter types are not implemented"));
+                }
+                // Java `TopicConfig.attributes`: a free-form map such as
+                // `{"+message.type": "FIFO"}` (`AttributeParser.ATTR_ADD_PLUS_SIGN`
+                // marks an attribute as user-settable). The proxy reads it to decide
+                // which message types the topic accepts.
+                if let Some(raw) = request.ext_fields.get("attributes").filter(|v| !v.is_empty()) {
+                    let attributes: BTreeMap<String, String> = serde_json::from_str(raw).map_err(
+                        |_| Failure::new(29, "attributes must be a JSON object of string values"),
+                    )?;
+                    for key in attributes.keys() {
+                        if !key.starts_with('+') && !key.starts_with('-') {
+                            return Err(Failure::new(
+                                29,
+                                "attribute keys must start with '+' or '-'",
+                            ));
+                        }
+                    }
+                    config.attributes = attributes;
                 }
                 if !(1..=1024).contains(&config.read_queue_nums) || !(1..=1024).contains(&config.write_queue_nums)
                     || !(0..=7).contains(&config.perm) || config.topic_sys_flag != 0
@@ -2692,6 +2708,19 @@ impl Broker {
                 self.storage(move |store| store.delete_group(&group, clean_offset))
                     .await?;
                 Ok(Command::response(request, 0))
+            }
+            // `AdminBrokerProcessor.getSubscriptionGroup`: one group's config by name.
+            // The Java proxy reads it through this code to learn the consumer group's
+            // retry policy before it merges the client's `Settings`; a group the
+            // broker does not know answers `ResponseCode.SUBSCRIPTION_GROUP_NOT_EXIST`.
+            352 => {
+                let group = request.required("group")?.to_owned();
+                match self.group_config(&group).await? {
+                    Some(config) => Ok(Command::response(request, 0)
+                        .with_body(serde_json::to_vec(&config).map_err(Error::from)?)),
+                    None => Ok(Command::response(request, 26)
+                        .with_remark("No group in this broker")),
+                }
             }
             26 => Ok(Command::response(request, 0).with_body(format!(
                 "brokerName={}\nbrokerClusterName={}\nbrokerId=0\nbrokerIP1={}\nlistenPort={}\nautoCreateTopicEnable={}\nflushDiskType=SYNC_FLUSH\nbrokerRole=ASYNC_MASTER\n",
