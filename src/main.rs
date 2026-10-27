@@ -323,7 +323,7 @@ async fn run_proxy(args: ProxyArgs, mut signals: ShutdownSignals) -> Result<()> 
         warn!("proxy has no nameserver address; route queries will fail until one is configured");
     }
     info!(listen = %actual, nameservers = ?config.name_server_address, "gRPC proxy starting");
-    let context = ProxyContext::new(config);
+    let context = ProxyContext::new(config, actual);
     let (stop, shutdown) = watch::channel(false);
     let mut task = tokio::spawn(rocketmq_rs::proxy::serve_proxy(listener, context, shutdown.clone()));
     tokio::select! {

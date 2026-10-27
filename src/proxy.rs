@@ -149,6 +149,10 @@ impl ProxyConfig {
 /// Shared proxy runtime state: config plus per-operation counters.
 pub struct ProxyContext {
     pub config: ProxyConfig,
+    /// The gRPC listen address advertised to clients in `QueryRoute` endpoints.
+    /// Clients talk gRPC only to the proxy, never to a broker remoting port, so
+    /// every route response must point here rather than at `broker.addrs`.
+    pub(crate) grpc_listen_addr: String,
     /// Registry of connected 5.x clients (keyed by the `x-mq-client-id` metadata
     /// header), powering heartbeat/termination lifecycle, real consumer-group load
     /// balancing, server→client telemetry command dispatch and admin subscription
@@ -162,9 +166,10 @@ pub struct ProxyContext {
 }
 
 impl ProxyContext {
-    pub fn new(config: ProxyConfig) -> Arc<Self> {
+    pub fn new(config: ProxyConfig, grpc_listen_addr: std::net::SocketAddr) -> Arc<Self> {
         Arc::new(Self {
             config,
+            grpc_listen_addr: grpc_listen_addr.to_string(),
             clients: Arc::new(ClientRegistry::default()),
             started_at: Instant::now(),
             send_ops: AtomicU64::new(0),
@@ -1801,7 +1806,7 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         if topic.is_empty() {
             return Err(Status::invalid_argument("topic is required"));
         }
-        let (brokers, queues) = self
+        let (_brokers, queues) = self
             .backend
             .topic_route(&topic)
             .await
@@ -1810,13 +1815,11 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         // instead of the previous always-NORMAL placeholder.
         let accept_message_types = self.backend.topic_message_types(&topic).await;
         let mut message_queues = Vec::new();
+        // Clients reach the cluster exclusively through this proxy's gRPC endpoint,
+        // so every queue advertises the proxy address rather than the broker's
+        // remoting port (which would reset a gRPC connection attempt).
+        let endpoints = endpoints_from_addr(&self.context.grpc_listen_addr);
         for queue in &queues {
-            let master = brokers
-                .iter()
-                .find(|b| b.name == queue.broker_name)
-                .and_then(|b| b.addrs.get(&0))
-                .cloned();
-            let endpoints = master.as_deref().and_then(endpoints_from_addr);
             for id in 0..queue.read_queues.max(0) {
                 message_queues.push(pb::MessageQueue {
                     topic: request.topic.clone(),
@@ -2001,7 +2004,7 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .as_ref()
             .map(|g| g.name.clone())
             .unwrap_or_default();
-        let (brokers, queues) = self
+        let (_brokers, queues) = self
             .backend
             .topic_route(&topic)
             .await
@@ -2059,13 +2062,9 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         // Same type fidelity as QueryRoute: advertise the topic's real message types.
         let accept_message_types = self.backend.topic_message_types(&topic).await;
         let mut assignments = Vec::new();
+        // As in `query_route`, the proxy's gRPC endpoint is what clients connect to.
+        let endpoints = endpoints_from_addr(&self.context.grpc_listen_addr);
         for (queue, id) in owned {
-            let master = brokers
-                .iter()
-                .find(|b| b.name == queue.broker_name)
-                .and_then(|b| b.addrs.get(&0))
-                .cloned();
-            let endpoints = master.as_deref().and_then(endpoints_from_addr);
             assignments.push(pb::Assignment {
                 message_queue: Some(pb::MessageQueue {
                     topic: request.topic.clone(),
