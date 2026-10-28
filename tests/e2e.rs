@@ -653,3 +653,125 @@ async fn registered_sql92_subscription_filters_and_reports_filter_data_state() {
     drop(broken);
     server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lite_message_is_read_from_the_light_queue_of_its_lite_topic() {
+    let dir = TempDir::new().unwrap();
+    let (broker, server) = start_broker(&dir).await;
+
+    // A lite message names its lite topic; the broker turns that into the light
+    // queue `%LMQ%$bind$child`.
+    let response = server
+        .request(send_with(
+            "bind-topic",
+            b"lite-body",
+            "__LITE_TOPIC\x01child\x02",
+        ))
+        .await;
+    assert_eq!(response.code, 0, "{:?}", response.remark);
+
+    // The client registers the lite topic it subscribed to.
+    let response = server
+        .request(
+            Command::request(200071)
+                .with_ext("clientId", "lite-client")
+                .with_ext("consumerGroup", "lite-group")
+                .with_ext("topic", "bind-topic")
+                .with_ext("action", 2)
+                .with_ext("liteTopicSet", "child"),
+        )
+        .await;
+    assert_eq!(response.code, 0, "{:?}", response.remark);
+
+    // The lite consumer reads the light queue of its lite topic.
+    let response = server
+        .request(
+            Command::request(200070)
+                .with_ext("clientId", "lite-client")
+                .with_ext("consumerGroup", "lite-group")
+                .with_ext("topic", "bind-topic")
+                .with_ext("maxMsgNum", 8)
+                .with_ext("invisibleTime", 15000),
+        )
+        .await;
+    assert_eq!(response.code, 0, "{:?}", response.remark);
+    let popped = messages(&response.body);
+    assert_eq!(popped.len(), 1);
+    assert_eq!(popped[0].body, b"lite-body");
+    // The light queue carries its own offset, not the bind topic's.
+    assert_eq!(popped[0].queue_offset, 0);
+    assert_eq!(popped[0].queue_id, 0);
+    assert_eq!(
+        popped[0].properties.get("__LITE_TOPIC").map(String::as_str),
+        Some("child")
+    );
+
+    // The ack commits the offset of the light queue.
+    let receipt = response.ext_fields.get("popCk").cloned().unwrap_or_default();
+    assert!(!receipt.is_empty());
+    let parts: Vec<&str> = receipt.split(',').collect();
+    assert_eq!(parts[0], "%LMQ%$bind-topic$child");
+    assert_eq!(parts[1], "lite-group");
+    assert_eq!(parts[2], "0");
+    assert_eq!(parts[3], "0");
+
+    // A normal consumer of the bind topic still sees the lite message.
+    let response = server.request(pull("bind-topic", 0)).await;
+    assert_eq!(response.code, 0, "{:?}", response.remark);
+    assert_eq!(messages(&response.body).len(), 1);
+
+    // Another lite topic of the same bind topic has a light queue of its own.
+    assert_eq!(
+        server
+            .request(send_with(
+                "bind-topic",
+                b"second-body",
+                "__LITE_TOPIC\x01second\x02",
+            ))
+            .await
+            .code,
+        0
+    );
+    let response = server
+        .request(
+            Command::request(200070)
+                .with_ext("clientId", "lite-client")
+                .with_ext("consumerGroup", "lite-group")
+                .with_ext("topic", "bind-topic")
+                .with_ext("maxMsgNum", 8)
+                .with_ext("invisibleTime", 15000),
+        )
+        .await;
+    assert_eq!(response.code, 0, "{:?}", response.remark);
+    // Only the lite topic the client subscribed to is read.
+    assert_eq!(messages(&response.body).len(), 0);
+
+    let response = server
+        .request(
+            Command::request(200071)
+                .with_ext("clientId", "lite-client")
+                .with_ext("consumerGroup", "lite-group")
+                .with_ext("topic", "bind-topic")
+                .with_ext("action", 0)
+                .with_ext("liteTopicSet", "second"),
+        )
+        .await;
+    assert_eq!(response.code, 0);
+    let response = server
+        .request(
+            Command::request(200070)
+                .with_ext("clientId", "lite-client")
+                .with_ext("consumerGroup", "lite-group")
+                .with_ext("topic", "bind-topic")
+                .with_ext("maxMsgNum", 8)
+                .with_ext("invisibleTime", 15000),
+        )
+        .await;
+    assert_eq!(response.code, 0, "{:?}", response.remark);
+    let popped = messages(&response.body);
+    assert_eq!(popped.len(), 1);
+    assert_eq!(popped[0].body, b"second-body");
+
+    drop(broker);
+    server.stop().await;
+}

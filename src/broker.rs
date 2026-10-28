@@ -12,7 +12,9 @@ use tokio::sync::{Notify, watch};
 use tracing::warn;
 
 use crate::common::{
-    Error, Message, Result, TopicConfig, decode_batch, decode_properties, now_millis,
+    Error, LMQ_QUEUE_ID, Message, PROPERTY_INNER_MULTI_DISPATCH, PROPERTY_LITE_TOPIC, Result,
+    TopicConfig, decode_batch, decode_properties, get_parent_topic, is_lite_topic_queue, now_millis,
+    to_lmq_name,
 };
 use crate::filter::{self, Subscription};
 use crate::remoting::{Command, Handler};
@@ -441,6 +443,24 @@ pub struct Broker {
     pop_invisible: Mutex<BTreeMap<(String, String, i32), BTreeMap<u64, u64>>>,
     /// `ConsumerOffsetManager`'s pop side: the next offset each (group, topic, queue) scans from.
     pop_offsets: Mutex<BTreeMap<(String, String, i32), u64>>,
+    /// `LiteSubscriptionRegistry`: the lite topics each client subscribed to, so the
+    /// lite pop path knows which light queues to read.
+    lite_subscriptions: Mutex<BTreeMap<String, LiteSubscription>>,
+    /// `PopConsumerLockService`: one lock per (group, light queue). Java takes it
+    /// around the whole read of a light queue, so two pops of the same lite topic
+    /// never hand out the same record.
+    lite_locks: Mutex<BTreeMap<(String, String), Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// `LiteSubscriptionRegistry`'s entry for one client.
+#[derive(Clone, Debug, Default)]
+struct LiteSubscription {
+    /// The consumer group the client belongs to.
+    group: String,
+    /// The bind (parent) topic the lite topics hang below.
+    bind_topic: String,
+    /// The lite topics the client subscribed to.
+    lite_topics: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -488,6 +508,11 @@ impl From<Error> for Failure {
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
+    // A light message queue is named `%LMQ%$parent$lite`; the `$` separator is
+    // reserved for it and stays out of ordinary topic and group names.
+    if is_lite_topic_queue(name) {
+        return Ok(());
+    }
     if name.is_empty()
         || name.len() > 127
         || !name
@@ -612,6 +637,8 @@ impl Broker {
             reject_roll: AtomicU64::new(0),
             pop_invisible: Mutex::new(BTreeMap::new()),
             pop_offsets: Mutex::new(BTreeMap::new()),
+            lite_subscriptions: Mutex::new(BTreeMap::new()),
+            lite_locks: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -746,6 +773,7 @@ impl Broker {
             message.flag = entry_flag;
             message.body = body;
             message.properties.extend(entry_properties);
+            apply_lite_dispatch(&mut message);
             message.encode()?;
             messages.push(message);
         }
@@ -1129,6 +1157,21 @@ impl Broker {
         })
     }
 
+    /// The topic configuration a request addresses. A light message queue is not a
+    /// topic of its own: it borrows the permissions of the topic it hangs below and
+    /// has exactly one queue.
+    fn topic_config_for(&self, topic: &str) -> Option<TopicConfig> {
+        let configs = self.store.topics().ok()?;
+        if let Some(config) = configs.get(topic) {
+            return Some(config.clone());
+        }
+        let parent = get_parent_topic(topic)?;
+        let mut config = configs.get(parent)?.clone();
+        config.read_queue_nums = 1;
+        config.write_queue_nums = 1;
+        Some(config)
+    }
+
     async fn pull(&self, request: &Command) -> BrokerResult<Command> {
         let group = request.required("consumerGroup")?.to_owned();
         let topic = request.required("topic")?.to_owned();
@@ -1155,10 +1198,7 @@ impl Broker {
             );
         }
         let config = self
-            .store
-            .topics()?
-            .get(&topic)
-            .cloned()
+            .topic_config_for(&topic)
             .ok_or_else(|| Failure::new(17, "topic does not exist"))?;
         if config.perm & 4 == 0 {
             return Err(Failure::new(
@@ -1545,10 +1585,7 @@ impl Broker {
             );
         }
         let config = self
-            .store
-            .topics()?
-            .get(&topic)
-            .cloned()
+            .topic_config_for(&topic)
             .ok_or_else(|| Failure::new(17, "topic does not exist"))?;
         if config.perm & 4 == 0 {
             return Err(Failure::new(
@@ -1588,108 +1625,17 @@ impl Broker {
         };
         let now = now_millis();
         let invisible_until = now + invisible_time;
-        // Phase one, under the locks: expired offsets and scan starts per queue. The guards are
-        // dropped before any I/O, exactly like the pull path keeps its lock scope tight.
-        struct Plan {
-            expired: Vec<u64>,
-            start: u64,
-        }
-        let mut plans: BTreeMap<i32, Plan> = BTreeMap::new();
-        {
-            let invisible = self.pop_invisible.lock().unwrap();
-            let offsets = self.pop_offsets.lock().unwrap();
-            for queue in &queues {
-                let key = (group.clone(), topic.clone(), *queue);
-                let expired = invisible
-                    .get(&key)
-                    .map(|seen| {
-                        seen.iter()
-                            .filter(|(_, until)| **until <= now as u64)
-                            .map(|(offset, _)| *offset)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let start = offsets.get(&key).copied().unwrap_or_else(|| {
-                    self.store
-                        .consumer_offset(&group, &topic, *queue)
-                        .ok()
-                        .flatten()
-                        .unwrap_or(0)
-                });
-                plans.insert(*queue, Plan { expired, start });
-            }
-        }
-        // Phase two: the reads. Expired entries are offered before a fresh page of the queue,
-        // in queue order, until the caller's count is reached.
-        let mut delivered: Vec<Message> = Vec::new();
-        for queue_id in &queues {
-            let queue = *queue_id;
-            let Some(plan) = plans.get(&queue) else { continue };
-            for offset in &plan.expired {
-                if delivered.len() >= max_nums {
-                    break;
-                }
-                let topic = topic.clone();
-                let offset = *offset;
-                if let Some(message) = self
-                    .storage(move |store| store.message_by_queue_offset(&topic, queue, offset))
-                    .await?
-                {
-                    if subscription.as_ref().is_none_or(|s| s.matches(&message)) {
-                        delivered.push(message);
-                    }
-                }
-            }
-            if delivered.len() >= max_nums {
-                continue;
-            }
-            let topic = topic.clone();
-            let start = plan.start;
-            let read = self
-                .storage(move |store| {
-                    store.read(&topic, queue, start, POP_SCAN_BATCH, MAX_PULL_BYTES, None)
-                })
-                .await?;
-            for message in read.messages {
-                if delivered.len() >= max_nums {
-                    break;
-                }
-                if !subscription.as_ref().is_none_or(|s| s.matches(&message)) {
-                    continue;
-                }
-                delivered.push(message);
-            }
-        }
-        // Phase three: register what was handed out and advance the cursors. A racing pop that
-        // already claimed an offset loses it here, which mirrors the buffer's atomic claim.
-        let mut new_offsets: BTreeMap<i32, u64> = BTreeMap::new();
-        {
-            let mut invisible = self.pop_invisible.lock().unwrap();
-            let mut offsets = self.pop_offsets.lock().unwrap();
-            for message in &delivered {
-                let key = (group.clone(), topic.clone(), message.queue_id);
-                let seen = invisible.entry(key).or_default();
-                seen.insert(message.queue_offset, invisible_until as u64);
-                let next = new_offsets
-                    .entry(message.queue_id)
-                    .or_insert_with(|| {
-                        offsets
-                            .get(&(group.clone(), topic.clone(), message.queue_id))
-                            .copied()
-                            .unwrap_or_else(|| {
-                                self.store
-                                    .consumer_offset(&group, &topic, message.queue_id)
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or(0)
-                            })
-                    });
-                *next = (*next).max(message.queue_offset + 1);
-            }
-            for (queue, next) in &new_offsets {
-                offsets.insert((group.clone(), topic.clone(), *queue), *next);
-            }
-        }
+        let delivered = self
+            .pop_queues(
+                &group,
+                &topic,
+                &queues,
+                max_nums,
+                now,
+                invisible_until,
+                subscription.as_ref(),
+            )
+            .await?;
         if delivered.is_empty() {
             return Ok(Command::response(request, 0));
         }
@@ -1726,6 +1672,314 @@ impl Broker {
             .with_ext("reviveQid", 0)
             .with_ext("restNum", rest_num as i64)
             .with_body(body))
+    }
+
+    /// The delivery core shared by the pop paths: hand out the records of `queues`
+    /// that are still invisible or newly readable, and register what was handed out
+    /// so a later pop does not offer the same record again.
+    async fn pop_queues(
+        &self,
+        group: &str,
+        topic: &str,
+        queues: &[i32],
+        max_nums: usize,
+        now: i64,
+        invisible_until: i64,
+        subscription: Option<&Subscription>,
+    ) -> BrokerResult<Vec<Message>> {
+        // Phase one, under the locks: expired offsets and scan starts per queue. The guards are
+        // dropped before any I/O, exactly like the pull path keeps its lock scope tight.
+        struct Plan {
+            expired: Vec<u64>,
+            start: u64,
+            committed: u64,
+        }
+        let mut plans: BTreeMap<i32, Plan> = BTreeMap::new();
+        {
+            let invisible = self.pop_invisible.lock().unwrap();
+            let offsets = self.pop_offsets.lock().unwrap();
+            for queue in queues {
+                let key = (group.to_owned(), topic.to_owned(), *queue);
+                let expired = invisible
+                    .get(&key)
+                    .map(|seen| {
+                        seen.iter()
+                            .filter(|(_, until)| **until <= now as u64)
+                            .map(|(offset, _)| *offset)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let committed = self
+                    .store
+                    .consumer_offset(group, topic, *queue)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                let start = offsets.get(&key).copied().unwrap_or(committed);
+                plans.insert(
+                    *queue,
+                    Plan {
+                        expired,
+                        start,
+                        committed,
+                    },
+                );
+            }
+        }
+        // Phase two: the reads. Expired entries are offered before a fresh page of the queue,
+        // in queue order, until the caller's count is reached.
+        let mut delivered: Vec<Message> = Vec::new();
+        for queue_id in queues {
+            let queue = *queue_id;
+            let Some(plan) = plans.get(&queue) else { continue };
+            for offset in &plan.expired {
+                if delivered.len() >= max_nums {
+                    break;
+                }
+                // A record the group already committed is not handed out again, even
+                // when its invisible entry outlived the ack that cleared it.
+                if *offset < plan.committed {
+                    continue;
+                }
+                let topic = topic.to_owned();
+                let offset = *offset;
+                if let Some(message) = self
+                    .storage(move |store| store.message_by_queue_offset(&topic, queue, offset))
+                    .await?
+                {
+                    if subscription.is_none_or(|s| s.matches(&message)) {
+                        delivered.push(message);
+                    }
+                }
+            }            if delivered.len() >= max_nums {
+                continue;
+            }
+            let topic = topic.to_owned();
+            let start = plan.start;
+            let read = self
+                .storage(move |store| {
+                    store.read(&topic, queue, start, POP_SCAN_BATCH, MAX_PULL_BYTES, None)
+                })
+                .await?;
+            for message in read.messages {
+                if delivered.len() >= max_nums {
+                    break;
+                }
+                if !subscription.is_none_or(|s| s.matches(&message)) {
+                    continue;
+                }
+                delivered.push(message);
+            }
+        }
+        // Phase three: register what was handed out and advance the cursors. A racing pop that
+        // already claimed an offset loses it here, which mirrors the buffer's atomic claim.
+        let mut new_offsets: BTreeMap<i32, u64> = BTreeMap::new();
+        {
+            let mut invisible = self.pop_invisible.lock().unwrap();
+            let mut offsets = self.pop_offsets.lock().unwrap();
+            for message in &delivered {
+                let key = (group.to_owned(), topic.to_owned(), message.queue_id);
+                let seen = invisible.entry(key).or_default();
+                seen.insert(message.queue_offset, invisible_until as u64);
+                let next = new_offsets
+                    .entry(message.queue_id)
+                    .or_insert_with(|| {
+                        offsets
+                            .get(&(group.to_owned(), topic.to_owned(), message.queue_id))
+                            .copied()
+                            .unwrap_or_else(|| {
+                                self.store
+                                    .consumer_offset(group, topic, message.queue_id)
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(0)
+                            })
+                    });
+                *next = (*next).max(message.queue_offset + 1);
+            }
+            for (queue, next) in &new_offsets {
+                offsets.insert((group.to_owned(), topic.to_owned(), *queue), *next);
+            }
+        }
+        Ok(delivered)
+    }
+
+    /// `PopLiteMessageProcessor.processRequest`: a lite consumer reads the light
+    /// queues of the lite topics it subscribed to, each of which keeps an offset
+    /// of its own instead of sharing the bind topic's.
+    async fn pop_lite(&self, request: &Command) -> BrokerResult<Command> {
+        let group = request.required("consumerGroup")?.to_owned();
+        let parent_topic = request.required("topic")?.to_owned();
+        let client_id = request.required("clientId")?.to_owned();
+        let max_nums = optional_field(request, "maxMsgNum", 1usize)?.clamp(1, POP_MAX_NUMS);
+        let invisible_time = optional_field(request, "invisibleTime", 15_000i64)?.clamp(0, 3_600_000);
+        validate_name(&group)?;
+        validate_topic_name(&parent_topic)?;
+        let group_config = match self.group_config(&group).await? {
+            Some(config) => config,
+            None => {
+                return Err(Failure::new(
+                    26,
+                    format!("subscription group [{group}] does not exist"),
+                ));
+            }
+        };
+        if !group_config.consume_enable {
+            return Err(
+                Failure::new(16, format!("subscription group no permission, {group}"))
+                    .forbidden(2),
+            );
+        }
+        let config = self
+            .topic_config_for(&parent_topic)
+            .ok_or_else(|| Failure::new(17, "topic does not exist"))?;
+        if config.perm & 4 == 0 {
+            return Err(Failure::new(
+                16,
+                format!("the topic[{parent_topic}] pulling message is forbidden"),
+            )
+            .forbidden(3));
+        }
+        let light_queues = self.light_queues_of(&client_id, &group, &parent_topic);
+        let now = now_millis();
+        let invisible_until = now + invisible_time;
+        // Every message keeps the light queue it was read from, so its receipt
+        // handle names the lite topic's own queue.
+        let mut delivered: Vec<(String, Message)> = Vec::new();
+        for lmq in light_queues {
+            if delivered.len() >= max_nums {
+                break;
+            }
+            // Java holds the light queue's lock around the whole read, so a
+            // second pop of the same lite topic waits instead of handing out the
+            // records the first one already took.
+            let lock = self.lite_lock(&group, &lmq);
+            let _guard = lock.lock().await;
+            let messages = self
+                .pop_queues(
+                    &group,
+                    &lmq,
+                    &[LMQ_QUEUE_ID],
+                    max_nums - delivered.len(),
+                    now,
+                    invisible_until,
+                    None,
+                )
+                .await?;
+            for message in messages {
+                delivered.push((lmq.clone(), message));
+            }
+        }
+        if delivered.is_empty() {
+            return Ok(Command::response(request, 0));
+        }
+        let mut body = Vec::new();
+        let mut first_ck = String::new();
+        let mut rest_num: u64 = 0;
+        for (index, (lmq, message)) in delivered.iter().enumerate() {
+            let ck = pop_ck(
+                lmq,
+                &group,
+                message.queue_id,
+                message.queue_offset,
+                now,
+                invisible_until,
+            );
+            if index == 0 {
+                first_ck = ck.clone();
+            }
+            rest_num = rest_num.saturating_add(
+                self.store
+                    .queue_max_offset(lmq, message.queue_id)
+                    .saturating_sub(message.queue_offset + 1),
+            );
+            let mut stamped = message.clone();
+            stamped.properties.insert(POP_CK.to_owned(), ck);
+            body.extend(stamped.encode()?);
+        }
+        Ok(Command::response(request, 0)
+            .with_ext("popCk", first_ck)
+            .with_ext("popTime", now)
+            .with_ext("invisibleTime", invisible_time)
+            .with_ext("reviveQid", 0)
+            .with_ext("restNum", rest_num as i64)
+            .with_body(body))
+    }
+
+    /// The light queues a client reads: the lite topics it subscribed to below
+    /// `parent_topic`, named the way `LiteUtil.toLmqName` names them.
+    fn light_queues_of(&self, client_id: &str, group: &str, parent_topic: &str) -> Vec<String> {
+        let subscriptions = self.lite_subscriptions.lock().unwrap();
+        let Some(subscription) = subscriptions.get(client_id) else {
+            return Vec::new();
+        };
+        if subscription.group != group || subscription.bind_topic != parent_topic {
+            return Vec::new();
+        }
+        subscription
+            .lite_topics
+            .iter()
+            .filter_map(|lite| to_lmq_name(parent_topic, lite))
+            .collect()
+    }
+
+    /// The lock that guards the read of one light queue.
+    fn lite_lock(&self, group: &str, lmq: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.lite_locks.lock().unwrap();
+        locks
+            .entry((group.to_owned(), lmq.to_owned()))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// `LiteSubscriptionCtlProcessor.processRequest`: the proxy forwards the lite
+    /// subscriptions of a client, so the broker knows which light queues to read.
+    async fn lite_subscription_ctl(&self, request: &Command) -> BrokerResult<Command> {
+        let client_id = request.required("clientId")?.to_owned();
+        let group = request.required("consumerGroup")?.to_owned();
+        let bind_topic = request.required("topic")?.to_owned();
+        // The client id is a network identity (`ip@instance#unit`), not a topic
+        // name, so only its shape is checked (Java `LiteSubscriptionCtlProcessor`).
+        if client_id.is_empty() || client_id.len() > 512 {
+            return Err(Failure::new(29, "invalid clientId"));
+        }
+        validate_name(&group)?;
+        validate_topic_name(&bind_topic)?;
+        let action: i32 = request.field("action")?;
+        let lite_topics: Vec<String> = request
+            .ext_fields
+            .get("liteTopicSet")
+            .map(|raw| {
+                raw.split(',')
+                    .filter(|topic| !topic.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut subscriptions = self.lite_subscriptions.lock().unwrap();
+        let subscription = subscriptions
+            .entry(client_id)
+            .or_insert_with(|| LiteSubscription {
+                group: group.clone(),
+                bind_topic: bind_topic.clone(),
+                lite_topics: BTreeSet::new(),
+            });
+        subscription.group = group;
+        subscription.bind_topic = bind_topic;
+        match action {
+            // `LiteSubscriptionAction.PARTIAL_ADD`
+            0 => subscription.lite_topics.extend(lite_topics),
+            // `LiteSubscriptionAction.PARTIAL_REMOVE`
+            1 => subscription
+                .lite_topics
+                .retain(|topic| !lite_topics.contains(topic)),
+            // `LiteSubscriptionAction.COMPLETE_ADD`
+            2 => subscription.lite_topics = lite_topics.into_iter().collect(),
+            // `LiteSubscriptionAction.COMPLETE_REMOVE`
+            3 => subscription.lite_topics.clear(),
+            _ => return Err(Failure::new(29, "unknown lite subscription action")),
+        }
+        Ok(Command::response(request, 0))
     }
 
     /// `AckMessageProcessor.processRequest`: an ack clears the invisible entry, whether it was
@@ -2550,6 +2804,10 @@ impl Broker {
             200050 => self.pop(request).await,
             200051 => self.ack_pop(request).await,
             200053 => self.change_invisible(request).await,
+            // `RequestCode.POP_LITE_MESSAGE`: read the light queues of a lite consumer.
+            200070 => self.pop_lite(request).await,
+            // `RequestCode.LITE_SUBSCRIPTION_CTL`: register the lite subscriptions of a client.
+            200071 => self.lite_subscription_ctl(request).await,
             34 => self.heartbeat(request, peer).await,
             35 => {
                 let client_id = request.required("clientID")?;
@@ -2767,6 +3025,14 @@ impl Broker {
     }
 
     fn check_queue(&self, topic: &str, queue_id: i32) -> BrokerResult<()> {
+        // A light message queue carries one queue of its own; its offsets are
+        // committed against the light queue name, not the topic it hangs below.
+        if is_lite_topic_queue(topic) {
+            if queue_id != 0 {
+                return Err(Failure::new(29, "queueId out of range"));
+            }
+            return Ok(());
+        }
         let config = self
             .store
             .topics()?
@@ -2891,6 +3157,24 @@ fn parse_pop_ck(ck: &str) -> Option<(String, String, i32, u64)> {
 
 fn json_response(request: &Command, value: serde_json::Value) -> BrokerResult<Command> {
     Ok(Command::response(request, 0).with_body(serde_json::to_vec(&value).map_err(Error::from)?))
+}
+
+/// `SendMessageProcessor.sendMessage`: a lite message is dispatched to the light
+/// queue of its bind topic, which gives the lite topic a queue and an offset of
+/// its own instead of sharing the bind topic's.
+fn apply_lite_dispatch(message: &mut Message) {
+    let Some(lite_topic) = message.properties.get(PROPERTY_LITE_TOPIC).cloned() else {
+        return;
+    };
+    if lite_topic.is_empty() {
+        return;
+    }
+    let Some(lmq) = to_lmq_name(&message.topic, &lite_topic) else {
+        return;
+    };
+    message
+        .properties
+        .insert(PROPERTY_INNER_MULTI_DISPATCH.to_owned(), lmq);
 }
 
 fn pull_response(request: &Command, code: i32, read: ReadResult) -> BrokerResult<Command> {

@@ -1,4 +1,8 @@
-use crate::common::{Error, Message, Result, TopicConfig, now_millis};
+use crate::common::{
+    Error, LMQ_DISPATCH_SEPARATOR, LMQ_QUEUE_ID, Message, PROPERTY_INNER_MULTI_DISPATCH,
+    PROPERTY_INNER_MULTI_QUEUE_OFFSET, PROPERTY_LITE_TOPIC, Result, TopicConfig, get_lite_topic,
+    is_lite_topic_queue, is_lmq, now_millis, to_lmq_name,
+};
 use crate::filter::Subscription;
 use crate::schedule::{DelayOffsets, GroupConfig, TimerCheckpoint};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -315,6 +319,51 @@ impl Store {
             *next = next
                 .checked_add(1)
                 .ok_or_else(|| invalid("queue offset overflow"))?;
+            // `LmqDispatch.populateLmqOffsets`: a message dispatched to light queues
+            // carries the offset each of those queues holds for it, so the light
+            // queue keeps an offset sequence of its own.
+            if message
+                .properties
+                .get(PROPERTY_LITE_TOPIC)
+                .is_some_and(|lite| !lite.is_empty())
+                && !message
+                    .properties
+                    .contains_key(PROPERTY_INNER_MULTI_DISPATCH)
+            {
+                // The broker names the light queue of a lite message; when the
+                // property is missing it still follows from the lite topic.
+                if let Some(lmq) = message
+                    .properties
+                    .get(PROPERTY_LITE_TOPIC)
+                    .and_then(|lite| to_lmq_name(&message.topic, lite))
+                {
+                    message
+                        .properties
+                        .insert(PROPERTY_INNER_MULTI_DISPATCH.to_owned(), lmq);
+                }
+            }
+            let targets = lmq_dispatch_targets(&message);
+            if !targets.is_empty() {
+                let mut offsets = Vec::with_capacity(targets.len());
+                for (lmq, queue_id) in &targets {
+                    let lmq_key = (lmq.clone(), *queue_id);
+                    let next = pending.entry(lmq_key.clone()).or_insert_with(|| {
+                        inner.queues.get(&lmq_key).map_or(0, |queue| queue.len() as u64)
+                    });
+                    offsets.push(*next);
+                    *next = next
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("queue offset overflow"))?;
+                }
+                message.properties.insert(
+                    PROPERTY_INNER_MULTI_QUEUE_OFFSET.to_owned(),
+                    offsets
+                        .iter()
+                        .map(|offset| offset.to_string())
+                        .collect::<Vec<_>>()
+                        .join(LMQ_DISPATCH_SEPARATOR),
+                );
+            }
             message.physical_offset = inner
                 .committed_len
                 .checked_add(encoded.len() as u64)
@@ -410,8 +459,10 @@ impl Store {
             if scanned > 0 && scanned_bytes + location.length as usize > MAX_READ_BYTES {
                 break;
             }
-            let message = read_record(&mut inner.log, location.physical, location.length)?;
-            if message.topic != topic
+            let mut message = read_record(&mut inner.log, location.physical, location.length)?;
+            if is_lite_topic_queue(topic) {
+                read_light_queue_record(&mut message, topic, queue_offset)?;
+            } else if message.topic != topic
                 || message.queue_id != queue_id
                 || message.queue_offset != queue_offset
             {
@@ -472,11 +523,11 @@ impl Store {
         let Some(&location) = queue.get(offset as usize) else {
             return Ok(None);
         };
-        Ok(Some(read_record(
-            &mut inner.log,
-            location.physical,
-            location.length,
-        )?))
+        let mut message = read_record(&mut inner.log, location.physical, location.length)?;
+        if is_lite_topic_queue(topic) {
+            read_light_queue_record(&mut message, topic, offset)?;
+        }
+        Ok(Some(message))
     }
 
     /// `QueryMessageProcessor` key lookup: every record on `topic` carrying `key`
@@ -832,6 +883,11 @@ fn invalid(message: impl Into<String>) -> Error {
 }
 
 fn validate_name(name: &str, kind: &str) -> Result<()> {
+    // A light message queue is named `%LMQ%$parent$lite`, so it carries the `$`
+    // separator that a plain topic name may not use.
+    if is_lite_topic_queue(name) {
+        return Ok(());
+    }
     if name.is_empty()
         || name.len() > 255
         || name == "."
@@ -945,9 +1001,23 @@ fn validate_offsets(offsets: &Offsets) -> Result<()> {
 }
 
 fn add_index(queues: &mut Queues, message: &Message, length: u32) {
-    let queue = queues
-        .entry((message.topic.clone(), message.queue_id))
-        .or_default();
+    push_location(queues, &message.topic, message.queue_id, message, length);
+    // `ConsumeQueue.multiDispatchLmqQueue`: a message dispatched to light queues
+    // gets one more consume queue entry per light queue, pointing at the same
+    // commitlog record.
+    for (lmq, queue_id) in lmq_dispatch_targets(message) {
+        push_location(queues, &lmq, queue_id, message, length);
+    }
+}
+
+fn push_location(
+    queues: &mut Queues,
+    topic: &str,
+    queue_id: i32,
+    message: &Message,
+    length: u32,
+) {
+    let queue = queues.entry((topic.to_owned(), queue_id)).or_default();
     let timestamp_ceiling = queue.last().map_or(message.store_timestamp, |previous| {
         previous.timestamp_ceiling.max(message.store_timestamp)
     });
@@ -956,6 +1026,41 @@ fn add_index(queues: &mut Queues, message: &Message, length: u32) {
         length,
         timestamp_ceiling,
     });
+}
+
+/// `LmqDispatch.parseLmqQueueNames`: the light queues a message is dispatched to.
+/// A lite message names its light queue through `PROPERTY_INNER_MULTI_DISPATCH`.
+fn lmq_dispatch_targets(message: &Message) -> Vec<(String, i32)> {
+    let Some(raw) = message.properties.get(PROPERTY_INNER_MULTI_DISPATCH) else {
+        return Vec::new();
+    };
+    raw.split(LMQ_DISPATCH_SEPARATOR)
+        .filter(|name| !name.is_empty())
+        .filter(|name| is_lmq(name))
+        .map(|name| (name.to_owned(), LMQ_QUEUE_ID))
+        .collect()
+}
+
+/// A light queue holds the record of its parent topic, so the record keeps the
+/// parent's topic while the light queue's own queue and offset are what the
+/// consumer sees.
+fn read_light_queue_record(message: &mut Message, topic: &str, queue_offset: u64) -> Result<()> {
+    let Some(lite) = get_lite_topic(topic) else {
+        return Err(invalid("light queue name is malformed"));
+    };
+    if message
+        .properties
+        .get(PROPERTY_LITE_TOPIC)
+        .map(String::as_str)
+        != Some(lite)
+    {
+        return Err(invalid(
+            "commitlog record no longer matches its light queue index",
+        ));
+    }
+    message.queue_id = LMQ_QUEUE_ID;
+    message.queue_offset = queue_offset;
+    Ok(())
 }
 
 /// `CommitLogDispatcherBuildIndex`: one entry per space-separated `KEYS` property value.
@@ -1019,6 +1124,24 @@ fn recover(
             )));
         }
         add_index(&mut queues, &message, length);
+        // The light queue holds the record at its own offset; a mismatch means the
+        // dispatch metadata no longer describes the index.
+        for (index, (lmq, queue_id)) in lmq_dispatch_targets(&message).iter().enumerate() {
+            let assigned = queues
+                .get(&(lmq.clone(), *queue_id))
+                .map_or(0, |queue| queue.len() as u64)
+                .saturating_sub(1);
+            let stored = message
+                .properties
+                .get(PROPERTY_INNER_MULTI_QUEUE_OFFSET)
+                .and_then(|value| value.split(LMQ_DISPATCH_SEPARATOR).nth(index))
+                .and_then(|value| value.parse::<u64>().ok());
+            if stored != Some(assigned) {
+                return Err(invalid(format!(
+                    "light queue offset mismatch at physical {position}"
+                )));
+            }
+        }
         add_key_index(&mut key_index, &message);
         physical.insert(position, length);
         position += u64::from(length);
@@ -1264,6 +1387,74 @@ mod tests {
             store.read("orders", 3, 0, 8, 1024, None).unwrap().messages,
             vec![saved]
         );
+    }
+
+    #[test]
+    fn a_lite_message_gets_a_light_queue_with_an_offset_of_its_own() {
+        let directory = TempDir::new().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store.put_topic(TopicConfig::new("bind", 4)).unwrap();
+        let mut lite = message("bind", 0, b"lite-body", "");
+        lite.properties
+            .insert(PROPERTY_LITE_TOPIC.to_owned(), "child".to_owned());
+        let saved = store.append(lite).unwrap();
+        // The broker names the light queue of a lite message.
+        assert_eq!(
+            saved.properties.get(PROPERTY_INNER_MULTI_DISPATCH).map(String::as_str),
+            Some("%LMQ%$bind$child")
+        );
+        assert_eq!(
+            saved
+                .properties
+                .get(PROPERTY_INNER_MULTI_QUEUE_OFFSET)
+                .map(String::as_str),
+            Some("0")
+        );
+        // The bind topic keeps the message in its own queue.
+        let parent = store.read("bind", 0, 0, 8, 1024, None).unwrap();
+        assert_eq!(parent.messages.len(), 1);
+        assert_eq!(parent.messages[0].body, b"lite-body");
+        // The light queue holds the same record under an offset of its own.
+        let light = store.read("%LMQ%$bind$child", 0, 0, 8, 1024, None).unwrap();
+        assert_eq!(light.messages.len(), 1);
+        assert_eq!(light.messages[0].body, b"lite-body");
+        assert_eq!(light.messages[0].queue_id, 0);
+        assert_eq!(light.messages[0].queue_offset, 0);
+        assert_eq!(store.queue_max_offset("%LMQ%$bind$child", 0), 1);
+        // A second lite topic of the same bind topic has its own light queue.
+        let mut other = message("bind", 1, b"other-body", "");
+        other
+            .properties
+            .insert(PROPERTY_LITE_TOPIC.to_owned(), "second".to_owned());
+        store.append(other).unwrap();
+        assert_eq!(store.queue_max_offset("%LMQ%$bind$second", 0), 1);
+        assert_eq!(store.queue_max_offset("%LMQ%$bind$child", 0), 1);
+        // The offsets of the light queue are committed against its own name.
+        store.commit_offset("group", "%LMQ%$bind$child", 0, 1).unwrap();
+        assert_eq!(
+            store.consumer_offset("group", "%LMQ%$bind$child", 0).unwrap(),
+            Some(1)
+        );
+        assert_eq!(store.consumer_offset("group", "bind", 0).unwrap(), None);
+    }
+
+    #[test]
+    fn a_lite_message_survives_a_restart_with_its_light_queue() {
+        let directory = TempDir::new().unwrap();
+        {
+            let store = Store::open(directory.path()).unwrap();
+            store.put_topic(TopicConfig::new("bind", 4)).unwrap();
+            let mut lite = message("bind", 0, b"lite-body", "");
+            lite.properties
+                .insert(PROPERTY_LITE_TOPIC.to_owned(), "child".to_owned());
+            store.append(lite).unwrap();
+            store.flush().unwrap();
+        }
+        let store = Store::open(directory.path()).unwrap();
+        let light = store.read("%LMQ%$bind$child", 0, 0, 8, 1024, None).unwrap();
+        assert_eq!(light.messages.len(), 1);
+        assert_eq!(light.messages[0].body, b"lite-body");
+        assert_eq!(light.messages[0].queue_offset, 0);
     }
 
     #[test]

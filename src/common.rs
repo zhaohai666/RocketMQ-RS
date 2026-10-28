@@ -43,6 +43,73 @@ pub fn now_millis() -> i64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lite topics and light message queues
+// ---------------------------------------------------------------------------
+
+/// `MixAll.LMQ_PREFIX`: every light message queue starts with it.
+pub const LMQ_PREFIX: &str = "%LMQ%";
+/// `LiteUtil.LITE_TOPIC_PREFIX`: `MixAll.LMQ_PREFIX` plus the separator.
+pub const LITE_TOPIC_PREFIX: &str = "%LMQ%$";
+/// `MixAll.LMQ_QUEUE_ID`: a light message queue always has exactly one queue.
+pub const LMQ_QUEUE_ID: i32 = 0;
+/// `MixAll.LMQ_DISPATCH_SEPARATOR`: separates the light queues of one message.
+pub const LMQ_DISPATCH_SEPARATOR: &str = ",";
+/// `LiteUtil.SEPARATOR`: separates the parent topic from the lite topic.
+const LITE_SEPARATOR: char = '$';
+/// `MessageConst.PROPERTY_LITE_TOPIC`: the lite topic a message belongs to.
+pub const PROPERTY_LITE_TOPIC: &str = "__LITE_TOPIC";
+/// `MessageConst.PROPERTY_INNER_MULTI_DISPATCH`: the light queues a message is
+/// dispatched to, in addition to the queue of its own topic.
+pub const PROPERTY_INNER_MULTI_DISPATCH: &str = "PROPERTY_INNER_MULTI_DISPATCH";
+/// `MessageConst.PROPERTY_INNER_MULTI_QUEUE_OFFSET`: the offset each of those
+/// light queues holds for the message, aligned with `PROPERTY_INNER_MULTI_DISPATCH`.
+pub const PROPERTY_INNER_MULTI_QUEUE_OFFSET: &str = "PROPERTY_INNER_MULTI_QUEUE_OFFSET";
+
+/// `LiteUtil.toLmqName`: the light queue of a lite topic, `%LMQ%$parent$lite`.
+/// The parent topic acts as the namespace and the lite topic is its child.
+pub fn to_lmq_name(parent_topic: &str, lite_topic: &str) -> Option<String> {
+    if parent_topic.is_empty() || lite_topic.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{LITE_TOPIC_PREFIX}{parent_topic}{LITE_SEPARATOR}{lite_topic}"
+    ))
+}
+
+/// `MixAll.isLmq`: whether the name is a light message queue.
+pub fn is_lmq(name: &str) -> bool {
+    name.starts_with(LMQ_PREFIX)
+}
+
+/// `LiteUtil.isLiteTopicQueue`: whether the name is the light queue of a lite topic.
+pub fn is_lite_topic_queue(name: &str) -> bool {
+    name.starts_with(LITE_TOPIC_PREFIX)
+}
+
+/// `LiteUtil.getParentTopic`: the namespace a lite topic hangs below.
+pub fn get_parent_topic(lmq_name: &str) -> Option<&str> {
+    split_lite_topic(lmq_name).map(|(parent, _)| parent)
+}
+
+/// `LiteUtil.getLiteTopic`: the child topic of a light queue.
+pub fn get_lite_topic(lmq_name: &str) -> Option<&str> {
+    split_lite_topic(lmq_name).map(|(_, lite)| lite)
+}
+
+/// `LiteUtil.getParentAndLiteTopic`: a light queue holds exactly one `$`.
+fn split_lite_topic(lmq_name: &str) -> Option<(&str, &str)> {
+    if !is_lite_topic_queue(lmq_name) {
+        return None;
+    }
+    let rest = &lmq_name[LITE_TOPIC_PREFIX.len()..];
+    let (parent, lite) = rest.split_once(LITE_SEPARATOR)?;
+    if parent.is_empty() || lite.is_empty() || lite.contains(LITE_SEPARATOR) {
+        return None;
+    }
+    Some((parent, lite))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TopicConfig {

@@ -1442,6 +1442,63 @@ impl ProxyBackend {
         self.invoke_broker_command(topic, request).await
     }
 
+    /// Invoke a broker command on a broker that was picked beforehand, instead of
+    /// the topic's master. Java's `SendMessageQueueSelector` picks the queue
+    /// first and sends the message to the broker that owns it.
+    pub async fn invoke_broker_at(
+        &self,
+        addr: &str,
+        code: i32,
+        ext: &[(&str, String)],
+        body: Vec<u8>,
+    ) -> Result<Command> {
+        let mut request = Command::request(code);
+        for (key, value) in ext {
+            request = request.with_ext(*key, value.clone());
+        }
+        request = request.with_body(body);
+        self.client.invoke(&addr, request, self.timeout).await
+    }
+
+    /// Java `MessageQueueSelector.buildWrite`: the topic's write queues, sorted
+    /// by broker name and queue id.
+    ///
+    /// Every writable broker contributes `writeQueueNums` queues; the list is
+    /// what a message's sharding key is hashed into, so the same group always
+    /// lands on the same queue of the same broker.
+    pub async fn write_queues(&self, topic: &str) -> Result<Vec<WriteQueue>> {
+        const PERM_WRITE: i32 = 0x1 << 1;
+        let (brokers, queues) = self.topic_route(topic).await?;
+        let mut result: Vec<WriteQueue> = Vec::new();
+        for queue in queues {
+            if queue.perm & PERM_WRITE == 0 {
+                continue;
+            }
+            let Some(broker) = brokers
+                .iter()
+                .find(|broker| broker.name == queue.broker_name)
+            else {
+                continue;
+            };
+            let Some(addr) = broker.addrs.get(&0) else {
+                continue;
+            };
+            for queue_id in 0..queue.write_queues {
+                result.push(WriteQueue {
+                    broker_name: queue.broker_name.clone(),
+                    queue_id,
+                    addr: addr.clone(),
+                });
+            }
+        }
+        result.sort_by(|left, right| {
+            left.broker_name
+                .cmp(&right.broker_name)
+                .then(left.queue_id.cmp(&right.queue_id))
+        });
+        Ok(result)
+    }
+
     /// Resolve the topic's master, then forward a fully built command over the
     /// pooled channel towards it.
     pub async fn invoke_broker_command(&self, topic: &str, request: Command) -> Result<Command> {
@@ -1629,6 +1686,54 @@ fn is_transactional(message: &pb::Message) -> bool {
         .unwrap_or(false)
 }
 
+/// Java `String.hashCode()`: `s[0]*31^(n-1) + s[1]*31^(n-2) + … + s[n-1]`, over
+/// the UTF-16 code units.
+fn java_string_hash(value: &str) -> i32 {
+    let mut hash: i32 = 0;
+    for unit in value.encode_utf16() {
+        hash = hash.wrapping_mul(31).wrapping_add(i32::from(unit));
+    }
+    hash
+}
+
+/// Guava `Hashing.consistentHash(long, int)`: the bucket a hash code falls into.
+///
+/// Guava spreads the code with a linear congruential generator and then walks
+/// up the bucket numbers until one of them is out of range, so the mapping only
+/// depends on the hash code and the bucket count. The proxy uses it to pin every
+/// message of a message group onto the same queue, which is what gives FIFO
+/// messages their order.
+fn consistent_hash(hash: i64, buckets: usize) -> usize {
+    if buckets == 0 {
+        return 0;
+    }
+    let mut state = hash as u64;
+    let mut result: usize = 0;
+    loop {
+        state = state
+            .wrapping_mul(2_862_933_555_777_941_757)
+            .wrapping_add(1);
+        // `((int) (state >>> 33) + 1) / 2.147483648E9`
+        let unit = ((state >> 33) as u32 as f64 + 1.0) / 2_147_483_648.0;
+        // The float-to-int cast saturates, like Java's `d2i`.
+        let candidate = ((result as f64 + 1.0) / unit) as i32;
+        if candidate >= 0 && (candidate as usize) < buckets {
+            result = candidate as usize;
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+/// The write queue a sharded message goes to.
+#[derive(Clone, Debug)]
+pub struct WriteQueue {
+    broker_name: String,
+    queue_id: i32,
+    addr: String,
+}
+
 fn encode_send_properties(message: &pb::Message) -> Result<String> {
     let mut properties: BTreeMap<String, String> = BTreeMap::new();
     if is_transactional(message) {
@@ -1769,6 +1874,16 @@ fn decode_query_frame(body: &[u8]) -> Result<Vec<common::Message>> {
 /// Receipt handle for the pop-lite flow: opaque to clients, parseable here.
 fn encode_receipt_handle(topic: &str, group: &str, queue_id: i32, offset: i64) -> String {
     format!("rh:{topic}:{group}:{queue_id}:{offset}")
+}
+
+/// The light queue a lite message belongs to: `%LMQ%$bind$lite`. A lite message
+/// is dispatched to that queue, which keeps an offset sequence of its own.
+fn lite_queue_of(bind_topic: &str, message: &common::Message) -> String {
+    message
+        .properties
+        .get(LITE_TOPIC_PROPERTY)
+        .and_then(|lite| common::to_lmq_name(bind_topic, lite))
+        .unwrap_or_else(|| bind_topic.to_owned())
 }
 
 fn decode_receipt_handle(handle: &str) -> Option<(String, String, i32, i64)> {
@@ -2102,6 +2217,54 @@ impl MessagingProcessor {
             .unwrap_or(0))
     }
 
+    /// `POP_LITE_MESSAGE`: read the light queues of the lite topics a client
+    /// subscribed to. The broker holds the lite subscriptions of every client, so
+    /// it knows which light queues belong to this consumer.
+    async fn pop_lite_once(
+        &self,
+        bind_topic: &str,
+        group: &str,
+        client_id: &str,
+        batch: i32,
+        invisible_time: i64,
+    ) -> Result<Vec<common::Message>> {
+        let response = self
+            .backend
+            .invoke_broker(
+                bind_topic,
+                200070,
+                &[
+                    ("clientId", client_id.to_string()),
+                    ("consumerGroup", group.to_string()),
+                    ("topic", bind_topic.to_string()),
+                    ("maxMsgNum", batch.max(1).to_string()),
+                    ("invisibleTime", invisible_time.to_string()),
+                ],
+                Vec::new(),
+            )
+            .await?;
+        if response.code != 0 {
+            // A lite consumer that has nothing registered yet simply gets nothing.
+            return Ok(Vec::new());
+        }
+        let mut messages = Vec::new();
+        let mut rest = response.body.as_slice();
+        while !rest.is_empty() {
+            match common::Message::decode(rest) {
+                Ok((message, consumed)) if consumed > 0 => {
+                    messages.push(message);
+                    rest = &rest[consumed..];
+                }
+                Ok(_) => break,
+                Err(error) => {
+                    warn!(%error, "stopping lite pop body decode at undecodable record");
+                    break;
+                }
+            }
+        }
+        Ok(messages)
+    }
+
     async fn pull_once(
         &self,
         topic: &str,
@@ -2193,6 +2356,37 @@ impl MessagingProcessor {
         }
         let next = next_begin.max(offset + messages.len() as i64);
         Ok((messages, next, max.max(next)))
+    }
+
+    /// Java `SendMessageQueueSelector.select`: the write queue a message goes to.
+    ///
+    /// A message that carries a message group (the sharding key) is pinned to
+    /// one queue of the cluster, so all the messages of a group keep their
+    /// order; a lite message falls back to its lite topic as the key. A message
+    /// without either has no queue of its own and is left to the broker's round
+    /// robin.
+    async fn select_write_queue(
+        &self,
+        topic: &str,
+        message: &pb::Message,
+    ) -> Option<WriteQueue> {
+        let system = message.system_properties.as_ref()?;
+        let sharding_key = system
+            .message_group
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+            .or_else(|| {
+                system
+                    .lite_topic
+                    .as_deref()
+                    .filter(|key| !key.trim().is_empty())
+            })?;
+        let queues = self.backend.write_queues(topic).await.ok()?;
+        if queues.is_empty() {
+            return None;
+        }
+        let bucket = consistent_hash(i64::from(java_string_hash(sharding_key)), queues.len());
+        queues.get(bucket).cloned()
     }
 }
 
@@ -2320,10 +2514,30 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                 .and_then(|s| s.born_timestamp.as_ref())
                 .map(|ts| ts.seconds * 1000 + (ts.nanos / 1_000_000) as i64)
                 .unwrap_or_else(now_millis);
+            // Java `SendMessageQueueSelector.select`: a message that carries a
+            // message group (the sharding key) always goes to the same write
+            // queue, which is what keeps FIFO messages in order. A message
+            // without one is spread over the queues by the broker's round
+            // robin.
+            let target = self.select_write_queue(&topic, message).await;
+            let (addr, queue_id) = match target {
+                Some(queue) => (queue.addr, queue.queue_id),
+                None => match self.backend.master_addr(&topic).await {
+                    Ok(addr) => (addr, -1),
+                    Err(error) => {
+                        self.context.record_error();
+                        entries.push(pb::SendResultEntry {
+                            status: Some(pb_status(pb::Code::InternalError, error.to_string())),
+                            ..Default::default()
+                        });
+                        continue;
+                    }
+                },
+            };
             let response = self
                 .backend
-                .invoke_broker(
-                    &topic,
+                .invoke_broker_at(
+                    &addr,
                     10,
                     &[
                         ("topic", topic.clone()),
@@ -2331,8 +2545,7 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                             "producerGroup",
                             self.context.config.default_producer_group.clone(),
                         ),
-                        // -1 lets the broker round-robin the write queues.
-                        ("queueId", "-1".to_string()),
+                        ("queueId", queue_id.to_string()),
                         // A transactional message must carry the prepared flag, so the
                         // broker stores it as a half message (`MessageSysFlag`
                         // `TRANSACTION_PREPARED_TYPE`).
@@ -2537,17 +2750,18 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             return Err(Status::invalid_argument("group and messageQueue are required"));
         }
         let batch = request.batch_size.max(1);
+        let invisible_time = request
+            .invisible_duration
+            .as_ref()
+            .map(|duration| duration.seconds * 1_000 + duration.nanos as i64 / 1_000_000)
+            .unwrap_or(15_000);
         let (tx, rx) = mpsc::channel::<std::result::Result<pb::ReceiveMessageResponse, Status>>(16);
         let this = Arc::new(self.clone_for_stream());
         tokio::spawn(async move {
-            // Lite routing: a LITE push consumer receives from the union of topics it
-            // registered via `SyncLiteSubscription`. A lite message is stored in its
-            // bind (parent) topic and carries the lite topic name in the
-            // `__LITE_TOPIC` property, so the bind topic's queues are pulled and the
-            // messages of the subscribed lite topics are picked out of them. (Java
-            // keeps the lite messages in a `%LMQ%$parent$lite` light queue instead;
-            // this port filters in the proxy, which gives the same observable result
-            // for a single consumer group.)
+            // Lite routing: a LITE push consumer reads the light queues of the lite
+            // topics it registered via `SyncLiteSubscription`. Every lite topic has a
+            // queue and an offset of its own, so a lite consumer neither competes
+            // with the normal consumers of the bind topic nor shares their offset.
             let mut lite_topics = if !client_id.is_empty() {
                 this.context.clients.lite_topics_for(&client_id)
             } else {
@@ -2564,61 +2778,46 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                 } else {
                     topic.clone()
                 };
-                let queues = match this.backend.topic_route(&bind_topic).await {
-                    Ok((_, queues)) => queues,
-                    Err(_) => Vec::new(),
-                };
-                for queue in &queues {
-                    for qid in 0..queue.read_queues.max(0) {
-                        let offset = match this.committed_offset(&bind_topic, &group, qid).await {
-                            Ok(offset) => offset,
-                            Err(_) => continue,
-                        };
-                        let filter = this.context.clients.subscription_for(&client_id, &bind_topic);
-                        match this.pull_once(&bind_topic, &group, qid, offset, batch, filter).await
-                        {
-                            Ok((messages, _, _)) => {
-                                for message in &messages {
-                                    let message_lite_topic =
-                                        message.properties.get(LITE_TOPIC_PROPERTY);
-                                    if !message_lite_topic
-                                        .is_some_and(|lite| lite_topics.iter().any(|t| t == lite))
-                                    {
-                                        continue;
-                                    }
-                                    let handle = encode_receipt_handle(
-                                        &bind_topic,
-                                        &group,
-                                        qid,
-                                        message.queue_offset as i64,
-                                    );
-                                    let pb_message = to_pb_message(message, Some(handle));
-                                    if tx
-                                        .send(Ok(pb::ReceiveMessageResponse {
-                                            content: Some(
-                                                pb::receive_message_response::Content::Message(
-                                                    pb_message,
-                                                ),
-                                            ),
-                                        }))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
+                match this
+                    .pop_lite_once(&bind_topic, &group, &client_id, batch, invisible_time)
+                    .await
+                {
+                    Ok(messages) => {
+                        for message in &messages {
+                            // The receipt handle names the light queue, so the ack
+                            // commits the offset of the lite topic's own queue.
+                            let lmq = lite_queue_of(&bind_topic, message);
+                            let handle = encode_receipt_handle(
+                                &lmq,
+                                &group,
+                                0,
+                                message.queue_offset as i64,
+                            );
+                            let pb_message = to_pb_message(message, Some(handle));
+                            if tx
+                                .send(Ok(pb::ReceiveMessageResponse {
+                                    content: Some(
+                                        pb::receive_message_response::Content::Message(pb_message),
+                                    ),
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
                             }
-                            Err(_) => continue,
                         }
+                        let _ = tx
+                            .send(Ok(pb::ReceiveMessageResponse {
+                                content: Some(pb::receive_message_response::Content::Status(
+                                    pb_status(pb::Code::Ok, ""),
+                                )),
+                            }))
+                            .await;
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(Status::internal(error.to_string()))).await;
                     }
                 }
-                let _ = tx
-                    .send(Ok(pb::ReceiveMessageResponse {
-                        content: Some(pb::receive_message_response::Content::Status(
-                            pb_status(pb::Code::Ok, ""),
-                        )),
-                    }))
-                    .await;
                 return;
             }
 
@@ -2681,28 +2880,60 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         let mut entries = Vec::with_capacity(request.entries.len());
         for entry in &request.entries {
             let status = match decode_receipt_handle(&entry.receipt_handle) {
-                Some((_, group, queue_id, offset)) => {
-                    let result = self
-                        .backend
-                        .invoke_broker(
-                            &topic,
-                            15,
-                            &[
-                                ("topic", topic.clone()),
-                                ("consumerGroup", group),
-                                ("queueId", queue_id.to_string()),
-                                ("commitOffset", (offset + 1).to_string()),
-                            ],
-                            Vec::new(),
-                        )
-                        .await;
-                    match result {
-                        Ok(response) if response.code == 0 => pb_status(pb::Code::Ok, ""),
-                        Ok(response) => pb_status(
-                            map_response_code(response.code),
-                            response.remark.as_deref().unwrap_or("ack failed"),
-                        ),
-                        Err(error) => pb_status(pb::Code::InternalError, error.to_string()),
+                Some((handle_topic, group, queue_id, offset)) => {
+                    // A lite message is acked against its light queue, whose name the
+                    // receipt handle carries; a normal message is acked against the
+                    // topic of the request.
+                    if common::is_lite_topic_queue(&handle_topic) {
+                        // `AckMessageProcessor`: the ack clears the invisible entry and
+                        // commits the offset of the light queue, so the record is not
+                        // handed out again when its invisible span ends.
+                        let extra = format!("{handle_topic},{group},{queue_id},{offset},0,0");
+                        // The light queue is not a topic of its own, so the broker is
+                        // resolved through the topic it hangs below.
+                        let broker_topic = common::get_parent_topic(&handle_topic)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| handle_topic.clone());
+                        let result = self
+                            .backend
+                            .invoke_broker(
+                                &broker_topic,
+                                200051,
+                                &[("extraInfo", extra)],
+                                Vec::new(),
+                            )
+                            .await;
+                        match result {
+                            Ok(response) if response.code == 0 => pb_status(pb::Code::Ok, ""),
+                            Ok(response) => pb_status(
+                                map_response_code(response.code),
+                                response.remark.as_deref().unwrap_or("ack failed"),
+                            ),
+                            Err(error) => pb_status(pb::Code::InternalError, error.to_string()),
+                        }
+                    } else {
+                        let result = self
+                            .backend
+                            .invoke_broker(
+                                &topic,
+                                15,
+                                &[
+                                    ("topic", topic.clone()),
+                                    ("consumerGroup", group),
+                                    ("queueId", queue_id.to_string()),
+                                    ("commitOffset", (offset + 1).to_string()),
+                                ],
+                                Vec::new(),
+                            )
+                            .await;
+                        match result {
+                            Ok(response) if response.code == 0 => pb_status(pb::Code::Ok, ""),
+                            Ok(response) => pb_status(
+                                map_response_code(response.code),
+                                response.remark.as_deref().unwrap_or("ack failed"),
+                            ),
+                            Err(error) => pb_status(pb::Code::InternalError, error.to_string()),
+                        }
                     }
                 }
                 None => pb_status(pb::Code::InvalidReceiptHandle, "unparseable receipt handle"),
@@ -3301,6 +3532,24 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                     .clients
                     .notify_unsubscribe_lite(&group, &client_id, removed_topic);
             }
+            // The broker keeps the lite subscriptions of every client, so its lite
+            // pop path knows which light queues to read (Java
+            // `LiteSubscriptionService.syncLiteSubscription`).
+            let _ = self
+                .backend
+                .invoke_broker(
+                    &topic,
+                    200071,
+                    &[
+                        ("clientId", client_id.clone()),
+                        ("consumerGroup", group.clone()),
+                        ("topic", topic.clone()),
+                        ("action", request.action.to_string()),
+                        ("liteTopicSet", request.lite_topic_set.join(",")),
+                    ],
+                    Vec::new(),
+                )
+                .await;
         }
         Ok(Response::new(pb::SyncLiteSubscriptionResponse {
             status: Some(pb_status(pb::Code::Ok, "")),
@@ -4441,6 +4690,42 @@ pub async fn serve_remoting_front(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The queue a message group is pinned to must match Java's proxy, which
+    /// hashes the group's name with Guava's `Hashing.consistentHash`. The
+    /// expected values come from Guava 33.2.0 itself.
+    #[test]
+    fn message_group_picks_the_same_queue_as_java() {
+        // (group, buckets, expected bucket)
+        let cases = [
+            ("message_group", 4, 0),
+            ("message_group", 5, 4),
+            ("message_group", 8, 5),
+            ("g1", 7, 6),
+            ("A", 8, 0),
+            ("group-a", 3, 2),
+            ("group-a", 8, 7),
+            ("中文组", 8, 7),
+        ];
+        for (group, buckets, expected) in cases {
+            let hash = i64::from(java_string_hash(group));
+            assert_eq!(
+                consistent_hash(hash, buckets),
+                expected,
+                "group {group} over {buckets} buckets"
+            );
+        }
+    }
+
+    /// Java's `String.hashCode()`: the value the proxy hashes.
+    #[test]
+    fn java_string_hash_matches_java() {
+        assert_eq!(java_string_hash("message_group"), -1_225_525_177);
+        assert_eq!(java_string_hash("g1"), 3242);
+        assert_eq!(java_string_hash("A"), 65);
+        assert_eq!(java_string_hash("group-a"), 293_427_347);
+        assert_eq!(java_string_hash("中文组"), 20_070_666);
+    }
 
     /// A consumer's `Settings` must carry the group's retry policy, or a 5.x
     /// push consumer never starts scanning for assignments.
