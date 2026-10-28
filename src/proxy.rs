@@ -845,8 +845,16 @@ async fn merge_client_settings(
                 .await
             {
                 Some(group_config) => merge_subscription_settings(settings, &group_config, config),
-                // Java returns the untouched settings when the group is unknown.
-                None => settings.clone(),
+                // Java auto-creates the subscription group (`SubscriptionGroupManager`
+                // with `autoCreateSubscriptionGroup`) before the settings merge, so an
+                // unknown group still yields the auto-created defaults. Returning the
+                // settings untouched would leave `lite_subscription_quota` unset — the
+                // client reads it as 0 and refuses every lite subscription (42902).
+                None => merge_subscription_settings(
+                    settings,
+                    &crate::schedule::GroupConfig::new(group),
+                    config,
+                ),
             }
         }
         None => settings.clone(),
