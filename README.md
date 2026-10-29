@@ -116,9 +116,7 @@ cargo test             # 全量回归（lib + main + e2e + process + schedule + 
 
 ---
 
-## 已知差距（低优先级，未修）
-
-> 以下三项已在 2026-10-29 的提交中修复，此处保留为变更记录：
+## 已知差距（已修复）
 
 - **长轮询参数边界校验**：`ReceiveMessage` 路径现复用 `ProxyConfig` 的 `grpcClientConsumer{min,max}LongPollingTimeoutMillis`（默认 5000 / 20000）对 `awaitDuration` 做 clamp，并对 `invisibleDuration` 做 `[0, 12h]` 校验（`ILLEGAL_INVISIBLE_TIME`），不再只是统一 clamp `0..30s`。
 - **事务回查 per-message 计数**：`run_transaction_check` 现按 `(born_ts, check_times)` 跟踪每条半消息，免疫时间到达后递增 `check_times`，超过 `transactionCheckMax`（默认 15）即停止复查（Java `PROPERTY_TRANSACTION_CHECK_TIMES` 语义；注：Java 5.2.2 实际为常量免疫时间 + 计数上限，并非旧版描述的翻倍退避）。
