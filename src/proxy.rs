@@ -186,6 +186,10 @@ pub struct ProxyContext {
     errors: AtomicU64,
 }
 
+/// Java `ProxyConfig.maxInvisibleTimeMills` (default 12h): the largest invisible
+/// duration a receive/change-invisible request may carry before `ILLEGAL_INVISIBLE_TIME`.
+const MAX_INVISIBLE_TIME_MS: i64 = 12 * 60 * 60 * 1000;
+
 impl ProxyContext {
     pub fn new(config: ProxyConfig, grpc_listen_addr: std::net::SocketAddr) -> Arc<Self> {
         Arc::new(Self {
@@ -293,6 +297,28 @@ impl Default for ClientState {
     }
 }
 
+// Java `MessageReceiptHandleManager`: per-channel (per-client) receipt-handle cache with a
+// TTL, so a reconnecting client can still resolve handles the proxy handed out earlier.
+// Java `GrpcChannelManager.scanNotActiveChannel` expires inactive channels; `reap_expired`
+// mirrors both behaviours for the simplified `ClientRegistry`.
+/// Largest age a cached receipt handle may reach before the reaper drops it (12h, matching
+/// the maximum invisible span a pop may carry).
+const HANDLE_CACHE_TTL_MS: i64 = 12 * 60 * 60 * 1000;
+/// Drop a client idle longer than this (Java `GrpcChannelManager` channel expiry).
+const CHANNEL_EXPIRED_SECS: u64 = 120;
+/// How often `run_registry_reaper` sweeps expired handles and inactive clients.
+const REGISTRY_REAPER_INTERVAL_SECS: u64 = 5;
+
+/// One cached receipt handle (the broker's pop ck) keyed by the client that received it.
+struct HandleCacheEntry {
+    handle: String,
+    expire_at: i64,
+    topic: String,
+    group: String,
+    queue_id: i32,
+    offset: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct ClientRegistry {
     by_id: Mutex<HashMap<String, ClientState>>,
@@ -305,6 +331,8 @@ pub(crate) struct ClientRegistry {
     producer_topics: Mutex<HashMap<String, Vec<String>>>,
     /// nonce -> waiting Admin RPC awaiting a client telemetry reply (thread dump / verify).
     pending: Mutex<HashMap<String, PendingReply>>,
+    /// Java `MessageReceiptHandleManager`: per-client receipt-handle cache (pop ck -> coords).
+    handles: Mutex<HashMap<String, Vec<HandleCacheEntry>>>,
 }
 
 impl ClientRegistry {
@@ -407,6 +435,77 @@ impl ClientRegistry {
         match by_id.get(client_id).and_then(|s| s.telemetry.clone()) {
             Some(tx) => tx.try_send(Ok(command)).is_ok(),
             None => false,
+        }
+    }
+
+    /// Refresh a client's last-activity timestamp so the idle reaper keeps it alive
+    /// (Java `GrpcClientChannel` updates `lastActiveTime` on every interaction).
+    fn touch(&self, client_id: &str) {
+        if let Some(state) = self.by_id.lock().unwrap().get_mut(client_id) {
+            state.last_heartbeat = Instant::now();
+        }
+    }
+
+    /// Cache a receipt handle the proxy just handed to `client_id`
+    /// (Java `MessageReceiptHandleManager.put`).
+    fn cache_handle(&self, client_id: &str, handle: &str, meta: (String, String, i32, u64)) {
+        if handle.is_empty() || client_id.is_empty() {
+            return;
+        }
+        let now = now_millis();
+        let mut handles = self.handles.lock().unwrap();
+        let entry = handles.entry(client_id.to_string()).or_default();
+        entry.retain(|e| e.expire_at > now);
+        entry.push(HandleCacheEntry {
+            handle: handle.to_string(),
+            expire_at: now + HANDLE_CACHE_TTL_MS,
+            topic: meta.0,
+            group: meta.1,
+            queue_id: meta.2,
+            offset: meta.3,
+        });
+        // Bound memory: keep only the most recent handles per client.
+        if entry.len() > 1024 {
+            entry.drain(0..entry.len() - 1024);
+        }
+    }
+
+    /// Look up a cached receipt handle for `client_id`
+    /// (Java `MessageReceiptHandleManager.get`), dropping expired entries.
+    fn lookup_handle(&self, client_id: &str, handle: &str) -> Option<(String, String, i32, u64)> {
+        let now = now_millis();
+        let mut handles = self.handles.lock().unwrap();
+        let entry = handles.get_mut(client_id)?;
+        entry.retain(|e| e.expire_at > now);
+        entry
+            .iter()
+            .find(|e| e.handle == handle)
+            .map(|e| (e.topic.clone(), e.group.clone(), e.queue_id, e.offset))
+    }
+
+    /// Periodic cleanup (Java `MessageReceiptHandleManager` TTL + `GrpcChannelManager
+    /// .scanNotActiveChannel`): drop expired receipt handles and evict clients idle beyond
+    /// `CHANNEL_EXPIRED_SECS`.
+    fn reap_expired(&self) {
+        let now = now_millis();
+        {
+            let mut handles = self.handles.lock().unwrap();
+            handles.retain(|_, v| {
+                v.retain(|e| e.expire_at > now);
+                !v.is_empty()
+            });
+        }
+        let expired: Vec<String> = {
+            let by_id = self.by_id.lock().unwrap();
+            by_id
+                .iter()
+                .filter(|(_, state)| state.last_heartbeat.elapsed().as_secs() > CHANNEL_EXPIRED_SECS)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in expired {
+            // `unregister` clears the client from `by_id`, `group_members` and `producer_topics`.
+            self.unregister(&id);
         }
     }
 
@@ -2383,6 +2482,7 @@ impl MessagingProcessor {
         invisible_time: i64,
         long_polling_ms: i64,
         filter: Option<pb::FilterExpression>,
+        client_id: &str,
     ) -> Result<Vec<common::Message>> {
         // The broker refuses a pop of a group it does not know, and it creates the group
         // when its config is read (Java `SubscriptionGroupManager`).
@@ -2430,6 +2530,14 @@ impl MessagingProcessor {
         while !rest.is_empty() {
             match common::Message::decode(rest) {
                 Ok((message, consumed)) if consumed > 0 => {
+                    let handle = message
+                        .properties
+                        .get(common::PROPERTY_POP_CK)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(meta) = common::parse_pop_ck(&handle) {
+                        self.context.clients.cache_handle(client_id, &handle, meta);
+                    }
                     messages.push(message);
                     rest = &rest[consumed..];
                 }
@@ -2482,6 +2590,14 @@ impl MessagingProcessor {
         while !rest.is_empty() {
             match common::Message::decode(rest) {
                 Ok((message, consumed)) if consumed > 0 => {
+                    let handle = message
+                        .properties
+                        .get(common::PROPERTY_POP_CK)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(meta) = common::parse_pop_ck(&handle) {
+                        self.context.clients.cache_handle(client_id, &handle, meta);
+                    }
                     messages.push(message);
                     rest = &rest[consumed..];
                 }
@@ -2991,6 +3107,7 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
     ) -> PbResult<Self::ReceiveMessageStream> {
         self.acl.check_access(&request, "ReceiveMessage").await?;
         let client_id = client_id_of(&request).unwrap_or_default();
+        self.context.clients.touch(&client_id);
         let request = request.into_inner();
         self.context.record_op(&self.context.receive_ops);
         let group = request
@@ -3022,11 +3139,28 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         // The client's `awaitDuration` rides the request as `long_polling_timeout`; the
         // pull must suspend for it (Java `PullMessageProcessor` long polling) or every
         // receive on an empty queue returns immediately instead of waiting for a send.
-        let long_polling_ms = request
+        let mut long_polling_ms = request
             .long_polling_timeout
             .as_ref()
             .map(|duration| duration.seconds * 1_000 + duration.nanos as i64 / 1_000_000)
             .unwrap_or(0);
+        // Java `ReceiveMessageActivity`: validate the invisible duration (min 0, max 12h)
+        // and clamp the long-polling window to the configured [min, max] bounds instead of
+        // a flat 0..30s clamp, matching `GrpcValidator.validateInvisibleTime` and the polling
+        // time clamp in `ReceiveMessageActivity`.
+        if invisible_time < 0 || invisible_time > MAX_INVISIBLE_TIME_MS {
+            let remark = if invisible_time < 0 {
+                "the invisibleTime is too small. min is 0".to_string()
+            } else {
+                format!("the invisibleTime is too large. max is {MAX_INVISIBLE_TIME_MS}")
+            };
+            return Err(Status::invalid_argument(remark));
+        }
+        let min_poll = self.context.config.grpc_client_consumer_min_long_polling_timeout_millis.max(0);
+        let max_poll = self.context.config.grpc_client_consumer_max_long_polling_timeout_millis.max(0);
+        if long_polling_ms > 0 {
+            long_polling_ms = long_polling_ms.clamp(min_poll, min_poll.max(max_poll));
+        }
         let (tx, rx) = mpsc::channel::<std::result::Result<pb::ReceiveMessageResponse, Status>>(16);
         let this = Arc::new(self.clone_for_stream());
         tokio::spawn(async move {
@@ -3129,6 +3263,7 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                     invisible_time,
                     long_polling_ms,
                     filter,
+                    &client_id,
                 )
                 .await
             {
@@ -3173,6 +3308,8 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         request: Request<pb::AckMessageRequest>,
     ) -> PbResult<pb::AckMessageResponse> {
         self.acl.check_access(&request, "AckMessage").await?;
+        let client_id = client_id_of(&request).unwrap_or_default();
+        self.context.clients.touch(&client_id);
         let request = request.into_inner();
         self.context.record_op(&self.context.ack_ops);
         let topic = request
@@ -3649,6 +3786,12 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         self.acl
             .check_access(&request, "ChangeInvisibleDuration")
             .await?;
+        let client_id = client_id_of(&request).unwrap_or_default();
+        self.context.clients.touch(&client_id);
+        let _ = self
+            .context
+            .clients
+            .lookup_handle(&client_id, &request.get_ref().receipt_handle);
         let request = request.into_inner();
         let group = request
             .group
@@ -3672,7 +3815,6 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         // plus `ProxyConfig.maxInvisibleTimeMills` (default 12h): a negative or
         // oversized duration is refused with ILLEGAL_INVISIBLE_TIME before the broker
         // is contacted.
-        const MAX_INVISIBLE_TIME_MS: i64 = 12 * 60 * 60 * 1000;
         if duration_ms < 0 || duration_ms > MAX_INVISIBLE_TIME_MS {
             let remark = if duration_ms < 0 {
                 "the invisibleTime is too small. min is 0".to_string()
@@ -4798,6 +4940,16 @@ impl pb::admin_server::Admin for AdminProcessor {
 // ---------------------------------------------------------------------------
 
 /// Bind the proxy's gRPC port and host both `MessagingService` and `Admin`.
+/// Background sweep (Java `GrpcChannelManager` cleanup + `MessageReceiptHandleManager` TTL):
+/// periodically drops expired receipt handles and clients idle beyond `CHANNEL_EXPIRED_SECS`.
+async fn run_registry_reaper(context: Arc<ProxyContext>) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(REGISTRY_REAPER_INTERVAL_SECS));
+    loop {
+        interval.tick().await;
+        context.clients.reap_expired();
+    }
+}
+
 pub async fn serve_proxy(
     listener: tokio::net::TcpListener,
     context: Arc<ProxyContext>,
@@ -4807,6 +4959,9 @@ pub async fn serve_proxy(
     // Background orphaned-transaction recovery: re-issues RecoverOrphanedTransactionCommand
     // to producer clients over their telemetry streams (Java `TransactionalMessageCheckService`).
     tokio::spawn(run_transaction_recovery(Arc::clone(&context)));
+    // Background per-channel handle-cache TTL + inactive-client reaper (Java `MessageReceiptHandleManager`
+    // + `GrpcChannelManager.scanNotActiveChannel`).
+    tokio::spawn(run_registry_reaper(Arc::clone(&context)));
     let messaging = pb::messaging_service_server::MessagingServiceServer::new(
         MessagingProcessor::new(Arc::clone(&context)),
     );

@@ -70,6 +70,9 @@ const INNER_BATCH_FLAG: i32 = 0x80;
 const TRANS_CHECK_TIMEOUT_MS: i64 = 6_000;
 /// `BrokerConfig.transactionCheckInterval`
 const TRANS_CHECK_INTERVAL_MS: i64 = 60_000;
+/// Java `BrokerConfig.transactionCheckMax`: give up checking a half message after this
+/// many rounds (no push channel here, so "give up" means stop re-reporting it).
+const TRANS_CHECK_MAX_TIMES: u32 = 15;
 /// `PopMessageProcessor`: one page of the real queue a pop round inspects.
 const POP_SCAN_BATCH: usize = 64;
 /// The per-queue page window stays proportional to what the caller may receive.
@@ -2109,8 +2112,7 @@ impl Broker {
     /// this server has no push channel, so the sweep only reports, and the half message stays
     /// pending until an `END_TRANSACTION` arrives. Op records decide what was already resolved.
     pub async fn run_transaction_check(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
-        let mut pending: BTreeMap<u64, i64> = BTreeMap::new();
-        let mut reported: BTreeSet<u64> = BTreeSet::new();
+        let mut pending: BTreeMap<u64, (i64, u32)> = BTreeMap::new(); // offset -> (born_ts, check_times)
         loop {
             let mut wake = TRANS_CHECK_INTERVAL_MS;
             // `TransactionalMessageBridge.fetchOpInfo`: one page of op offsets decides which
@@ -2147,7 +2149,6 @@ impl Broker {
                 }
             };
             pending.retain(|offset, _| !resolved.contains(offset));
-            reported.retain(|offset| resolved.contains(offset) || pending.contains_key(offset));
             // `TransactionalMessageBridge.fetchHalfMessage`: new half records join the set.
             let cursor = pending.keys().next_back().copied().unwrap_or(0);
             let max = self
@@ -2169,19 +2170,34 @@ impl Broker {
                     .await
                 {
                     for message in read.messages {
-                        pending.insert(message.queue_offset, message.store_timestamp);
+                        pending.entry(message.queue_offset).or_insert((message.store_timestamp, 0));
                     }
                 }
             }
             let now = now_millis();
-            for (offset, stored_at) in &pending {
-                if now - stored_at >= TRANS_CHECK_TIMEOUT_MS && reported.insert(*offset) {
-                    warn!(
-                        half_offset = offset,
-                        age_ms = now - stored_at,
-                        "transaction half message is still unresolved"
-                    );
+            let mut give_up = Vec::new();
+            for (offset, (born, times)) in pending.iter_mut() {
+                if now - *born >= TRANS_CHECK_TIMEOUT_MS {
+                    *times += 1;
+                    if *times > TRANS_CHECK_MAX_TIMES {
+                        warn!(
+                            half_offset = offset,
+                            check_times = *times,
+                            "transaction half message check exceeded max, giving up"
+                        );
+                        give_up.push(*offset);
+                    } else {
+                        warn!(
+                            half_offset = offset,
+                            age_ms = now - *born,
+                            check_times = *times,
+                            "transaction half message is still unresolved"
+                        );
+                    }
                 }
+            }
+            for offset in give_up {
+                pending.remove(&offset);
             }
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(wake.max(1) as u64)) => {}
