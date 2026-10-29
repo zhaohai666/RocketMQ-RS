@@ -16,6 +16,7 @@ use crate::common::{
     TopicConfig, decode_batch, decode_properties, get_parent_topic, is_lite_topic_queue, now_millis,
     to_lmq_name,
 };
+use crate::common as common;
 use crate::filter::{self, Subscription};
 use crate::remoting::{Command, Handler};
 use crate::schedule::{
@@ -443,6 +444,11 @@ pub struct Broker {
     pop_invisible: Mutex<BTreeMap<(String, String, i32), BTreeMap<u64, u64>>>,
     /// `ConsumerOffsetManager`'s pop side: the next offset each (group, topic, queue) scans from.
     pop_offsets: Mutex<BTreeMap<(String, String, i32), u64>>,
+    /// `QueueLockManager`: one lock per (group, topic, queue). Java takes it around the
+    /// whole read of a queue, so two pops of the same queue never hand out the same
+    /// record; without it the read and the cursor advance race and a message is
+    /// delivered twice.
+    pop_locks: Mutex<BTreeMap<(String, String, i32), Arc<tokio::sync::Mutex<()>>>>,
     /// `LiteSubscriptionRegistry`: the lite topics each client subscribed to, so the
     /// lite pop path knows which light queues to read.
     lite_subscriptions: Mutex<BTreeMap<String, LiteSubscription>>,
@@ -637,6 +643,7 @@ impl Broker {
             reject_roll: AtomicU64::new(0),
             pop_invisible: Mutex::new(BTreeMap::new()),
             pop_offsets: Mutex::new(BTreeMap::new()),
+            pop_locks: Mutex::new(BTreeMap::new()),
             lite_subscriptions: Mutex::new(BTreeMap::new()),
             lite_locks: Mutex::new(BTreeMap::new()),
         })
@@ -1625,17 +1632,34 @@ impl Broker {
         };
         let now = now_millis();
         let invisible_until = now + invisible_time;
-        let delivered = self
-            .pop_queues(
-                &group,
-                &topic,
-                &queues,
-                max_nums,
-                now,
-                invisible_until,
-                subscription.as_ref(),
-            )
-            .await?;
+        // Java `PopMessageProcessor` holds the pop for `popTimeout` when the queue has
+        // nothing to hand out, which is what turns the client's await duration into a
+        // real long poll instead of an immediate empty answer.
+        let pop_timeout = optional_field(request, "popTimeout", 0i64)?.clamp(0, 30_000);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(pop_timeout as u64);
+        let mut updates = self.messages.subscribe();
+        let delivered = loop {
+            let delivered = self
+                .pop_queues(
+                    &group,
+                    &topic,
+                    &queues,
+                    max_nums,
+                    now,
+                    invisible_until,
+                    subscription.as_ref(),
+                )
+                .await?;
+            if !delivered.is_empty() || pop_timeout == 0 {
+                break delivered;
+            }
+            if tokio::time::timeout_at(deadline, updates.changed())
+                .await
+                .is_err()
+            {
+                break delivered;
+            }
+        };
         if delivered.is_empty() {
             return Ok(Command::response(request, 0));
         }
@@ -1677,6 +1701,9 @@ impl Broker {
     /// The delivery core shared by the pop paths: hand out the records of `queues`
     /// that are still invisible or newly readable, and register what was handed out
     /// so a later pop does not offer the same record again.
+    ///
+    /// Java's `PopMessageProcessor` reads every queue of a `queueId < 0` request in
+    /// turn, each of them under the queue's own `QueueLockManager` lock.
     async fn pop_queues(
         &self,
         group: &str,
@@ -1687,78 +1714,107 @@ impl Broker {
         invisible_until: i64,
         subscription: Option<&Subscription>,
     ) -> BrokerResult<Vec<Message>> {
-        // Phase one, under the locks: expired offsets and scan starts per queue. The guards are
-        // dropped before any I/O, exactly like the pull path keeps its lock scope tight.
-        struct Plan {
-            expired: Vec<u64>,
-            start: u64,
-            committed: u64,
-        }
-        let mut plans: BTreeMap<i32, Plan> = BTreeMap::new();
-        {
-            let invisible = self.pop_invisible.lock().unwrap();
-            let offsets = self.pop_offsets.lock().unwrap();
-            for queue in queues {
-                let key = (group.to_owned(), topic.to_owned(), *queue);
-                let expired = invisible
-                    .get(&key)
-                    .map(|seen| {
-                        seen.iter()
-                            .filter(|(_, until)| **until <= now as u64)
-                            .map(|(offset, _)| *offset)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let committed = self
-                    .store
-                    .consumer_offset(group, topic, *queue)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
-                let start = offsets.get(&key).copied().unwrap_or(committed);
-                plans.insert(
-                    *queue,
-                    Plan {
-                        expired,
-                        start,
-                        committed,
-                    },
-                );
-            }
-        }
-        // Phase two: the reads. Expired entries are offered before a fresh page of the queue,
-        // in queue order, until the caller's count is reached.
         let mut delivered: Vec<Message> = Vec::new();
         for queue_id in queues {
-            let queue = *queue_id;
-            let Some(plan) = plans.get(&queue) else { continue };
-            for offset in &plan.expired {
-                if delivered.len() >= max_nums {
-                    break;
-                }
-                // A record the group already committed is not handed out again, even
-                // when its invisible entry outlived the ack that cleared it.
-                if *offset < plan.committed {
-                    continue;
-                }
-                let topic = topic.to_owned();
-                let offset = *offset;
-                if let Some(message) = self
-                    .storage(move |store| store.message_by_queue_offset(&topic, queue, offset))
-                    .await?
-                {
-                    if subscription.is_none_or(|s| s.matches(&message)) {
-                        delivered.push(message);
-                    }
-                }
-            }            if delivered.len() >= max_nums {
+            if delivered.len() >= max_nums {
+                break;
+            }
+            // The read of a queue and the advance of its pop cursor belong to one
+            // critical section: without the lock two pops of the same queue read
+            // the same page and hand the same record out twice.
+            let lock = self.pop_lock(group, topic, *queue_id);
+            let _guard = lock.lock().await;
+            let mut from_queue = self
+                .pop_queue(
+                    group,
+                    topic,
+                    *queue_id,
+                    max_nums - delivered.len(),
+                    now,
+                    invisible_until,
+                    subscription,
+                )
+                .await?;
+            delivered.append(&mut from_queue);
+        }
+        Ok(delivered)
+    }
+
+    /// The lock that guards the read of one queue.
+    fn pop_lock(&self, group: &str, topic: &str, queue_id: i32) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.pop_locks.lock().unwrap();
+        locks
+            .entry((group.to_owned(), topic.to_owned(), queue_id))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// `PopMessageProcessor.popMsgFromQueue`: the records of a single queue that are
+    /// either invisible but past their invisible span, or readable from the group's
+    /// pop cursor.
+    async fn pop_queue(
+        &self,
+        group: &str,
+        topic: &str,
+        queue_id: i32,
+        max_nums: usize,
+        now: i64,
+        invisible_until: i64,
+        subscription: Option<&Subscription>,
+    ) -> BrokerResult<Vec<Message>> {
+        // Phase one, under the locks: expired offsets and the scan start of this
+        // queue. The guards are dropped before any I/O, exactly like the pull path
+        // keeps its lock scope tight.
+        let (expired, start, committed) = {
+            let invisible = self.pop_invisible.lock().unwrap();
+            let offsets = self.pop_offsets.lock().unwrap();
+            let key = (group.to_owned(), topic.to_owned(), queue_id);
+            let expired = invisible
+                .get(&key)
+                .map(|seen| {
+                    seen.iter()
+                        .filter(|(_, until)| **until <= now as u64)
+                        .map(|(offset, _)| *offset)
+                        .collect::<Vec<u64>>()
+                })
+                .unwrap_or_default();
+            let committed = self
+                .store
+                .consumer_offset(group, topic, queue_id)
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            let start = offsets.get(&key).copied().unwrap_or(committed);
+            (expired, start, committed)
+        };
+        // Phase two: the reads. Expired entries are offered before a fresh page of
+        // the queue, in queue order, until the caller's count is reached.
+        let mut delivered: Vec<Message> = Vec::new();
+        for offset in &expired {
+            if delivered.len() >= max_nums {
+                break;
+            }
+            // A record the group already committed is not handed out again, even
+            // when its invisible entry outlived the ack that cleared it.
+            if *offset < committed {
                 continue;
             }
             let topic = topic.to_owned();
-            let start = plan.start;
+            let offset = *offset;
+            if let Some(message) = self
+                .storage(move |store| store.message_by_queue_offset(&topic, queue_id, offset))
+                .await?
+            {
+                if subscription.is_none_or(|s| s.matches(&message)) {
+                    delivered.push(message);
+                }
+            }
+        }
+        if delivered.len() < max_nums {
+            let topic = topic.to_owned();
             let read = self
                 .storage(move |store| {
-                    store.read(&topic, queue, start, POP_SCAN_BATCH, MAX_PULL_BYTES, None)
+                    store.read(&topic, queue_id, start, POP_SCAN_BATCH, MAX_PULL_BYTES, None)
                 })
                 .await?;
             for message in read.messages {
@@ -1771,35 +1827,20 @@ impl Broker {
                 delivered.push(message);
             }
         }
-        // Phase three: register what was handed out and advance the cursors. A racing pop that
-        // already claimed an offset loses it here, which mirrors the buffer's atomic claim.
-        let mut new_offsets: BTreeMap<i32, u64> = BTreeMap::new();
+        // Phase three: register what was handed out and advance the cursor. A racing
+        // pop that already claimed an offset loses it here, which mirrors the
+        // buffer's atomic claim.
         {
             let mut invisible = self.pop_invisible.lock().unwrap();
             let mut offsets = self.pop_offsets.lock().unwrap();
+            let key = (group.to_owned(), topic.to_owned(), queue_id);
+            let mut next = offsets.get(&key).copied().unwrap_or(committed);
             for message in &delivered {
-                let key = (group.to_owned(), topic.to_owned(), message.queue_id);
-                let seen = invisible.entry(key).or_default();
+                let seen = invisible.entry(key.clone()).or_default();
                 seen.insert(message.queue_offset, invisible_until as u64);
-                let next = new_offsets
-                    .entry(message.queue_id)
-                    .or_insert_with(|| {
-                        offsets
-                            .get(&(group.to_owned(), topic.to_owned(), message.queue_id))
-                            .copied()
-                            .unwrap_or_else(|| {
-                                self.store
-                                    .consumer_offset(group, topic, message.queue_id)
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or(0)
-                            })
-                    });
-                *next = (*next).max(message.queue_offset + 1);
+                next = next.max(message.queue_offset + 1);
             }
-            for (queue, next) in &new_offsets {
-                offsets.insert((group.to_owned(), topic.to_owned(), *queue), *next);
-            }
+            offsets.insert(key, next);
         }
         Ok(delivered)
     }
@@ -1843,31 +1884,48 @@ impl Broker {
         let light_queues = self.light_queues_of(&client_id, &group, &parent_topic);
         let now = now_millis();
         let invisible_until = now + invisible_time;
+        // The lite pop waits for `popTimeout` as well, so a lite consumer's await
+        // duration is a real long poll.
+        let pop_timeout = optional_field(request, "popTimeout", 0i64)?.clamp(0, 30_000);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(pop_timeout as u64);
+        let mut updates = self.messages.subscribe();
         // Every message keeps the light queue it was read from, so its receipt
         // handle names the lite topic's own queue.
         let mut delivered: Vec<(String, Message)> = Vec::new();
-        for lmq in light_queues {
-            if delivered.len() >= max_nums {
+        loop {
+            delivered.clear();
+            for lmq in &light_queues {
+                if delivered.len() >= max_nums {
+                    break;
+                }
+                // Java holds the light queue's lock around the whole read, so a
+                // second pop of the same lite topic waits instead of handing out the
+                // records the first one already took.
+                let lock = self.lite_lock(&group, lmq);
+                let _guard = lock.lock().await;
+                let messages = self
+                    .pop_queues(
+                        &group,
+                        lmq,
+                        &[LMQ_QUEUE_ID],
+                        max_nums - delivered.len(),
+                        now,
+                        invisible_until,
+                        None,
+                    )
+                    .await?;
+                for message in messages {
+                    delivered.push((lmq.clone(), message));
+                }
+            }
+            if !delivered.is_empty() || pop_timeout == 0 {
                 break;
             }
-            // Java holds the light queue's lock around the whole read, so a
-            // second pop of the same lite topic waits instead of handing out the
-            // records the first one already took.
-            let lock = self.lite_lock(&group, &lmq);
-            let _guard = lock.lock().await;
-            let messages = self
-                .pop_queues(
-                    &group,
-                    &lmq,
-                    &[LMQ_QUEUE_ID],
-                    max_nums - delivered.len(),
-                    now,
-                    invisible_until,
-                    None,
-                )
-                .await?;
-            for message in messages {
-                delivered.push((lmq.clone(), message));
+            if tokio::time::timeout_at(deadline, updates.changed())
+                .await
+                .is_err()
+            {
+                break;
             }
         }
         if delivered.is_empty() {
@@ -3138,21 +3196,12 @@ fn pop_ck(
     pop_time: i64,
     invisible_until: i64,
 ) -> String {
-    format!("{topic},{group},{queue_id},{offset},{pop_time},{invisible_until}")
+    common::pop_ck(topic, group, queue_id, offset, pop_time, invisible_until)
 }
 
 /// Decodes a receipt handle back to its coordinates; the timestamps are informational.
 fn parse_pop_ck(ck: &str) -> Option<(String, String, i32, u64)> {
-    let parts: Vec<&str> = ck.split(',').collect();
-    if parts.len() != 6 {
-        return None;
-    }
-    Some((
-        parts[0].to_owned(),
-        parts[1].to_owned(),
-        parts[2].parse().ok()?,
-        parts[3].parse().ok()?,
-    ))
+    common::parse_pop_ck(ck)
 }
 
 fn json_response(request: &Command, value: serde_json::Value) -> BrokerResult<Command> {

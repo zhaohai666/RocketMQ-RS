@@ -17,25 +17,25 @@
 //!   namesrv and message commands to broker masters
 //!
 //! Fidelity notes (Java proxy is ~40k LOC; this is a best-effort port):
-//! - **Real forwarding** for query_route / send_message / receive_message (pop-lite:
-//!   pull + receipt-handle offset commit) / ack_message / pull_message / update_offset /
-//!   get_offset / query_offset / get_topic_route / runtime stats.
-//! - **Average-hash load balancing** (Java `AverageHashLoadBalancingStats`):
-//!   `query_assignment` hands each consumer group the contiguous queue slice
-//!   `[i*N/M, (i+1)*N/M)` of the topic's readable queues, where `i` is the group's
-//!   index and `M` the configured `consumer_group_count`; with
-//!   `high_accuracy_allocation` a consistent-hash ring picks the owning group per
-//!   queue instead.
+//! - **Real forwarding** for query_route / send_message / receive_message (broker POP,
+//!   receipt handle = the broker's pop check point) / ack_message / pull_message /
+//!   update_offset / get_offset / query_offset / get_topic_route / runtime stats.
+//! - **Java's assignment model**: `query_assignment` follows `RouteActivity.queryAssignment`
+//!   — a group that consumes in order (FIFO) owns every readable queue of the topic,
+//!   every other group gets a single assignment whose queue id is `-1`. The `-1` tells
+//!   the client that the server picks the queue, which is what the pop path does: the
+//!   broker picks the queue (`PopMessageProcessor` reads all queues of a `queueId < 0`
+//!   request) and keeps the message invisible until it is acked.
 //! - **Pooled forwarding**: commands ride persistent connections from
 //!   [`PooledRemotingClient`] (idle 30s, <=32 per address, one in-flight request per
 //!   connection at a time) instead of one short connection per invoke.
 //! - **ACL hook**: when `enable_acl` is set, `MessagingProcessor` verifies the gRPC
 //!   `Authorization` metadata (Credential/Signature) against the `crate::auth` user
 //!   store using `auth::cal_signature` before each RPC body is processed.
-//! - **Simplified**: the consumer-group index is derived from a hash of the group
-//!   name modulo a *locally configured* group count — Java negotiates the group
-//!   distribution across the proxy cluster at runtime, which a single process cannot
-//!   observe; ACL signature content is the empty byte string (see [`AclGuard`]).
+//! - **Simplified**: the ACL signature content is the empty byte string (see
+//!   [`AclGuard`]); admin diagnostics that cannot reach a live client (thread dumps,
+//!   verify-consumption) return typed empty/failed statuses instead of erroring the
+//!   surface.
 //! - **Stubs**: no service RPC answers `NOT_IMPLEMENTED` any more; admin diagnostics
 //!   that cannot reach a live client (thread dumps, verify-consumption) return typed
 //!   empty/failed statuses instead of erroring the surface.
@@ -86,18 +86,10 @@ pub struct ProxyConfig {
     pub local_serve_addr: String,
     pub enable_acl: bool,
     pub enable_trace: bool,
-    pub high_accuracy_allocation: bool,
-    pub load_balancing_strategy: String,
     /// Producer group stamped on messages forwarded with `SEND_MESSAGE`.
     pub default_producer_group: String,
     /// Per-command forwarding timeout towards namesrv/broker.
     pub forward_timeout_millis: u64,
-    /// Number of consumer groups the average-hash balancer should assume for this
-    /// proxy process (Java `AverageHashLoadBalancingStats` learns the group count
-    /// through cluster-wide negotiation, which a single process cannot observe; the
-    /// group index is `hash(group) % consumer_group_count`). `None` falls back to 1,
-    /// i.e. this proxy owns every queue — the pre-balancing behavior.
-    pub consumer_group_count: Option<u32>,
     /// Java `ProxyConfig.maxMessageSize`: the body size a producer may send.
     pub max_message_size: i32,
     /// Java `ProxyConfig.enableTopicMessageTypeCheck`: whether the broker validates a
@@ -135,11 +127,8 @@ impl Default for ProxyConfig {
             local_serve_addr: String::new(),
             enable_acl: false,
             enable_trace: false,
-            high_accuracy_allocation: false,
-            load_balancing_strategy: "average_hash".into(),
             default_producer_group: "PID_DEFAULT".into(),
             forward_timeout_millis: 3_000,
-            consumer_group_count: None,
             max_message_size: 4 * 1024 * 1024,
             enable_topic_message_type_check: true,
             max_lite_topic_size: 64,
@@ -309,6 +298,11 @@ pub(crate) struct ClientRegistry {
     by_id: Mutex<HashMap<String, ClientState>>,
     /// group -> client ids currently connected (registered via heartbeat/telemetry).
     group_members: Mutex<HashMap<String, Vec<String>>>,
+    /// topic -> client ids of the producers that publish to it. In the 5.x gRPC
+    /// model the producer group *is* the topic name (Java `SendMessageActivity`:
+    /// "here use topicName as producerGroup for transactional checker"), so this
+    /// index is what lets the transaction check reach the right producer.
+    producer_topics: Mutex<HashMap<String, Vec<String>>>,
     /// nonce -> waiting Admin RPC awaiting a client telemetry reply (thread dump / verify).
     pending: Mutex<HashMap<String, PendingReply>>,
 }
@@ -318,14 +312,36 @@ impl ClientRegistry {
     /// re-registration (heartbeat vs telemetry settings) does not drop the stream.
     fn register(&self, mut state: ClientState) {
         let mut by_id = self.by_id.lock().unwrap();
+        let previous_topics = by_id
+            .get(&state.client_id)
+            .map(|prev| prev.publish_topics.clone())
+            .unwrap_or_default();
         if let Some(prev) = by_id.get(&state.client_id) {
             state.telemetry = prev.telemetry.clone();
+            // A heartbeat re-registers with a fresh `ClientState` that carries no consumer
+            // context; without this the client's lite subscriptions (registered via
+            // `SyncLiteSubscription`) would be wiped on every heartbeat and the lite
+            // consumer would fall back to pulling the bind topic's own queue.
+            state.lite_topics = prev.lite_topics.clone();
+            // The same applies to the producer topics a heartbeat does not carry.
+            if state.publish_topics.is_empty() {
+                state.publish_topics = previous_topics.clone();
+            }
         }
         if !state.group.is_empty() {
             let mut groups = self.group_members.lock().unwrap();
             let entry = groups.entry(state.group.clone()).or_default();
             if !entry.contains(&state.client_id) {
                 entry.push(state.client_id.clone());
+            }
+        }
+        if !state.publish_topics.is_empty() {
+            let mut topics = self.producer_topics.lock().unwrap();
+            for topic in &state.publish_topics {
+                let entry = topics.entry(topic.clone()).or_default();
+                if !entry.contains(&state.client_id) {
+                    entry.push(state.client_id.clone());
+                }
             }
         }
         by_id.insert(state.client_id.clone(), state);
@@ -340,6 +356,17 @@ impl ClientRegistry {
                     members.retain(|id| id != client_id);
                     if members.is_empty() {
                         groups.remove(&state.group);
+                    }
+                }
+            }
+            if !state.publish_topics.is_empty() {
+                let mut topics = self.producer_topics.lock().unwrap();
+                for topic in &state.publish_topics {
+                    if let Some(members) = topics.get_mut(topic) {
+                        members.retain(|id| id != client_id);
+                        if members.is_empty() {
+                            topics.remove(topic);
+                        }
                     }
                 }
             }
@@ -383,35 +410,22 @@ impl ClientRegistry {
         }
     }
 
-    /// Push a telemetry command to every connected client of `group`.
-    fn push_to_group(&self, group: &str, command: pb::TelemetryCommand) {
-        let members = self.group_members.lock().unwrap();
-        if let Some(ids) = members.get(group) {
-            for id in ids {
-                self.push_command(id, command.clone());
+    /// Push a telemetry command to every producer that publishes to `topic`.
+    /// Java `GrpcClientChannelManager` registers a producer under each topic it
+    /// publishes to (the topic name *is* the producer group in the 5.x gRPC
+    /// model), so this is the path the transaction check takes.
+    fn push_to_producer_topic(&self, topic: &str, command: pb::TelemetryCommand) -> usize {
+        let producers = self.producer_topics.lock().unwrap();
+        let Some(ids) = producers.get(topic) else {
+            return 0;
+        };
+        let mut pushed = 0;
+        for id in ids {
+            if self.push_command(id, command.clone()) {
+                pushed += 1;
             }
         }
-    }
-
-    fn group_member_count(&self, group: &str) -> usize {
-        self.group_members
-            .lock()
-            .unwrap()
-            .get(group)
-            .map(Vec::len)
-            .unwrap_or(0)
-    }
-
-    /// Stable position of `client_id` within its group's (sorted) member list,
-    /// used for deterministic, collision-free load balancing. `None` when the
-    /// client is unknown (e.g. assignment before heartbeat).
-    fn group_index_of(&self, group: &str, client_id: &str) -> Option<usize> {
-        let members = self.group_members.lock().unwrap();
-        members.get(group).and_then(|ids| {
-            let mut sorted = ids.clone();
-            sorted.sort();
-            sorted.iter().position(|id| id == client_id)
-        })
+        pushed
     }
 
     /// Consumer's filter expression for `(client_id, topic)`, if the client registered one.
@@ -525,6 +539,22 @@ impl ClientRegistry {
         by_id.values()
             .filter(|state| state.group == group)
             .find_map(|state| state.lite_topics.keys().next().cloned())
+    }
+
+    /// Whether the client (or any member of its group) registered as a lite consumer
+    /// (`ClientType::LitePushConsumer` / `LiteSimpleConsumer`). Used to stop the
+    /// receive fall-back to the bind topic's own queue once the lite set is empty.
+    fn is_lite_consumer(&self, client_id: &str, group: &str) -> bool {
+        const LITE_TYPES: [i32; 2] = [5, 6]; // pb::ClientType::LitePushConsumer / LiteSimpleConsumer
+        let by_id = self.by_id.lock().unwrap();
+        if let Some(state) = by_id.get(client_id) {
+            if LITE_TYPES.contains(&state.client_type) {
+                return true;
+            }
+        }
+        by_id.values().any(|state| {
+            state.group == group && LITE_TYPES.contains(&state.client_type)
+        })
     }
 
     /// Apply a `SyncLiteSubscription` action to a client's lite topic sets and return
@@ -884,77 +914,192 @@ fn bind_topic_of(registry: &ClientRegistry, client_id: &str, group: &str) -> Str
 /// are ignored and the scan simply retries on the next interval.
 async fn run_transaction_recovery(context: Arc<ProxyContext>) {
     const HALF_TOPIC: &str = "RMQ_SYS_TRANS_HALF_TOPIC";
+    const OP_TOPIC: &str = "RMQ_SYS_TRANS_OP_HALF_TOPIC";
+    /// The reference scans every `transactionCheckInterval` (60s); half of that
+    /// keeps the first check well inside a client's patience without hammering
+    /// the store.
     const CHECK_INTERVAL_SECS: u64 = 30;
-    const ORPHAN_AGE_MS: i64 = 60_000;
+    /// Java `BrokerConfig.transactionTimeOut` (6s): the age a half message must
+    /// reach before a check round may touch it.
+    const ORPHAN_AGE_MS: i64 = 6_000;
+    /// The synthetic consumer the check reads the half and op queues with. The
+    /// broker auto-creates it (`autoCreateGroup`), like Java's
+    /// `SubscriptionGroupManager` creates the check group on the first read.
+    const CHECK_GROUP: &str = "__transaction_check";
+    /// A pull round never walks more pages than this; the op topic grows by one
+    /// 8-byte record per resolved transaction, so the bound is generous.
+    const MAX_PULL_ROUNDS: usize = 1_000;
     let backend = ProxyBackend::from_config(&context.config);
     loop {
         tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
-        let res = backend
-            .invoke_broker(
-                HALF_TOPIC,
-                11,
-                &[
-                    ("topic", HALF_TOPIC.to_string()),
-                    ("consumerGroup", "__transaction_check".to_string()),
-                    ("queueId", "-1".to_string()),
-                    ("queueOffset", "0".to_string()),
-                    ("maxMsgNums", "64".to_string()),
-                    ("sysFlag", "4".to_string()),
-                    ("expressionType", "TAG".to_string()),
-                    ("subExpression", "*".to_string()),
-                ],
-                Vec::new(),
-            )
-            .await;
-        let Ok(res) = res else { continue };
-        if res.code != 0 {
-            continue;
-        }
-        let mut rest = res.body.as_slice();
-        while !rest.is_empty() {
-            match common::Message::decode(rest) {
-                Ok((msg, consumed)) if consumed > 0 => {
-                    rest = &rest[consumed..];
-                    let born = msg
-                        .properties
-                        .get("BORN_TIMESTAMP")
-                        .and_then(|v| v.parse::<i64>().ok())
-                        .unwrap_or(0);
-                    if now_millis() - born < ORPHAN_AGE_MS {
-                        continue;
-                    }
-                    let group = msg
-                        .properties
-                        .get("PRODUCER_GROUP")
-                        .cloned()
-                        .unwrap_or_default();
-                    if group.is_empty() {
-                        continue;
-                    }
-                    let pb_msg = to_pb_message(&msg, None);
-                    let transaction_id = msg
-                        .properties
-                        .get("UNIQ_KEY")
-                        .cloned()
-                        .unwrap_or_else(|| format!("{}@{}", msg.topic, msg.queue_offset));
-                    let command = pb::TelemetryCommand {
-                        status: None,
-                        command: Some(
-                            pb::telemetry_command::Command::RecoverOrphanedTransactionCommand(
-                                pb::RecoverOrphanedTransactionCommand {
-                                    message: Some(pb_msg),
-                                    transaction_id,
-                                },
-                            ),
-                        ),
-                    };
-                    context.clients.push_to_group(&group, command);
+        // Replay the op topic: one 8-byte big-endian half offset per resolved
+        // half message. A half message named by an op record is committed or
+        // rolled back and must never be checked again — re-checking a committed
+        // half would make the producer answer COMMIT a second time and duplicate
+        // the delivery (Java `TransactionalMessageService.check` skips these too).
+        let mut resolved = std::collections::HashSet::new();
+        let mut cursor = 0u64;
+        for _ in 0..MAX_PULL_ROUNDS {
+            let response = match pull_check_queue(&backend, OP_TOPIC, CHECK_GROUP, cursor).await {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(%error, "transaction recovery: op topic replay failed");
+                    break;
                 }
-                Ok(_) => break,
-                Err(_) => break,
+            };
+            if response.code != 0 {
+                break; // 19/20/21: nothing (or nothing more) at the cursor.
+            }
+            let mut rest = response.body.as_slice();
+            while !rest.is_empty() {
+                match common::Message::decode(rest) {
+                    Ok((record, consumed)) if consumed > 0 => {
+                        rest = &rest[consumed..];
+                        if record.body.len() == 8 {
+                            resolved.insert(u64::from_be_bytes(
+                                record.body[..8].try_into().unwrap(),
+                            ));
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            match response
+                .ext_fields
+                .get("nextBeginOffset")
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                Some(next) if next > cursor => cursor = next,
+                _ => break,
             }
         }
+        // Scan the half queue: every record past the immunity age that no op
+        // record resolves is an orphan and is offered to its producer.
+        let mut cursor = 0u64;
+        let mut scanned = 0usize;
+        let mut pushed = 0usize;
+        for _ in 0..MAX_PULL_ROUNDS {
+            let response = match pull_check_queue(&backend, HALF_TOPIC, CHECK_GROUP, cursor).await {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(%error, "transaction recovery: half topic scan failed");
+                    break;
+                }
+            };
+            if response.code != 0 {
+                break; // 19/20/21: nothing (or nothing more) at the cursor.
+            }
+            let mut rest = response.body.as_slice();
+            while !rest.is_empty() {
+                let msg = match common::Message::decode(rest) {
+                    Ok((msg, consumed)) if consumed > 0 => {
+                        rest = &rest[consumed..];
+                        msg
+                    }
+                    _ => break,
+                };
+                scanned += 1;
+                if resolved.contains(&msg.physical_offset) {
+                    continue;
+                }
+                if now_millis() - msg.born_timestamp < ORPHAN_AGE_MS {
+                    continue;
+                }
+                // The half message carries its real topic (the one the producer
+                // actually publishes to) as `REAL_TOPIC`; the 5.x gRPC producer
+                // registers under that topic, so that is the key the recovery
+                // command must be pushed by. `PRODUCER_GROUP` is the topic name too
+                // (the proxy stamps it on the send), but `REAL_TOPIC` is the
+                // authoritative destination for the listener lookup.
+                let real_topic = msg
+                    .properties
+                    .get(crate::schedule::REAL_TOPIC)
+                    .cloned()
+                    .or_else(|| msg.properties.get("PRODUCER_GROUP").cloned())
+                    .unwrap_or_default();
+                if real_topic.is_empty() {
+                    continue;
+                }
+                // Java's `TransactionalMessageCheckService` restores the real topic
+                // before handing the message to the recovery command, so the client
+                // can route it to the right transaction listener.
+                let mut recovered = msg.clone();
+                recovered.topic = real_topic.clone();
+                let pb_msg = to_pb_message(&recovered, None);
+                let transaction_id = msg
+                    .properties
+                    .get("UNIQ_KEY")
+                    .cloned()
+                    .unwrap_or_else(|| format!("{}@{}", real_topic, msg.queue_offset));
+                let command = pb::TelemetryCommand {
+                    status: None,
+                    command: Some(
+                        pb::telemetry_command::Command::RecoverOrphanedTransactionCommand(
+                            pb::RecoverOrphanedTransactionCommand {
+                                message: Some(pb_msg),
+                                transaction_id,
+                            },
+                        ),
+                    ),
+                };
+                let delivered = context.clients.push_to_producer_topic(&real_topic, command);
+                if delivered == 0 {
+                    warn!(%real_topic, offset = msg.physical_offset, "transaction recovery: no live producer for topic");
+                } else {
+                    info!(
+                        %real_topic, offset = msg.physical_offset, producers = delivered,
+                        "transaction recovery: orphaned half message offered for check"
+                    );
+                    pushed += delivered;
+                }
+            }
+            match response
+                .ext_fields
+                .get("nextBeginOffset")
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                Some(next) if next > cursor => cursor = next,
+                _ => break,
+            }
+        }
+        if scanned > 0 || !resolved.is_empty() {
+            info!(
+                scanned, pushed, resolved = resolved.len(),
+                "transaction recovery round finished"
+            );
+        }
     }
+}
+
+/// One non-suspending `PULL_MESSAGE` read of a transaction system queue. The
+/// half and op records always sit on queue 0 (the bridge store queues them
+/// there), and an empty read answers `PULL_NOT_FOUND` (19) immediately instead
+/// of long polling. `sysFlag=4` marks the subscription as carried in the
+/// request, which the pull header requires.
+async fn pull_check_queue(
+    backend: &ProxyBackend,
+    topic: &str,
+    group: &str,
+    offset: u64,
+) -> Result<Command> {
+    backend
+        .invoke_broker(
+            topic,
+            11,
+            &[
+                ("topic", topic.to_string()),
+                ("consumerGroup", group.to_string()),
+                ("queueId", "0".to_string()),
+                ("queueOffset", offset.to_string()),
+                ("maxMsgNums", "64".to_string()),
+                ("sysFlag", "4".to_string()),
+                ("expressionType", "TAG".to_string()),
+                ("subExpression", "*".to_string()),
+                ("subscription", "*".to_string()),
+            ],
+            Vec::new(),
+        )
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1450,6 +1595,26 @@ impl ProxyBackend {
         self.invoke_broker_command(topic, request).await
     }
 
+    /// `invoke_broker` with an explicit transport timeout. A long-polled pull holds the
+    /// broker for the whole suspend window, so its timeout must exceed it (the default
+    /// `self.timeout` would abort the request mid-suspend).
+    pub async fn invoke_broker_with_timeout(
+        &self,
+        topic: &str,
+        code: i32,
+        ext: &[(&str, String)],
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Command> {
+        let mut request = Command::request(code);
+        for (key, value) in ext {
+            request = request.with_ext(*key, value.clone());
+        }
+        request = request.with_body(body);
+        let addr = self.master_addr(topic).await?;
+        self.client.invoke(&addr, request, timeout).await
+    }
+
     /// Invoke a broker command on a broker that was picked beforehand, instead of
     /// the topic's master. Java's `SendMessageQueueSelector` picks the queue
     /// first and sends the message to the broker that owns it.
@@ -1521,11 +1686,11 @@ impl ProxyBackend {
     /// stored with `AttributeParser.ATTR_ADD_PLUS_SIGN`); the legacy `topicSysFlag`
     /// low bits are honoured when set.
     ///
-    /// A topic without an explicit declaration accepts every type the server
-    /// supports, matching the Java proxy, which leaves `accept_message_types`
-    /// unset. Advertising `[Normal]` instead would make a 5.x client reject
-    /// FIFO / delay / priority / transaction messages before they ever reach the
-    /// broker.
+    /// A topic without an explicit declaration is a **NORMAL** topic, like Java's
+    /// `TopicConfig.getTopicMessageType()`: a 5.x client refuses to publish a
+    /// FIFO / delay / transaction / priority / lite message to it, because the
+    /// client checks the message type against `accept_message_types` before it
+    /// sends (`ProducerImpl.send0`).
     pub async fn topic_message_types(&self, topic: &str) -> Vec<i32> {
         match self
             .invoke_broker(topic, 351, &[("topic", topic.to_string())], Vec::new())
@@ -1550,8 +1715,12 @@ impl ProxyBackend {
                 if sys_flag != 0 {
                     return message_types_from_sys_flag(sys_flag);
                 }
-                all_message_types()
+                // Java `TopicConfig.getTopicMessageType()`: no `+message.type`
+                // attribute means the topic is a NORMAL topic.
+                vec![pb::MessageType::Normal as i32]
             }
+            // The topic does not exist (yet): the broker will create it on the
+            // first send, so nothing can be validated against it.
             _ => all_message_types(),
         }
     }
@@ -1642,8 +1811,69 @@ fn message_types_from_attribute(declared: &str) -> Vec<i32> {
         "TRANSACTION" => vec![pb::MessageType::Transaction as i32],
         "LITE" => vec![pb::MessageType::Lite as i32],
         "PRIORITY" => vec![pb::MessageType::Priority as i32],
-        // `MIXED`, and anything unknown, accepts every type.
-        _ => all_message_types(),
+        // `MIXED`, and anything unknown, accepts the four classic types, like
+        // Java's `RouteActivity.parseTopicMessageType`: a mixed topic takes
+        // normal, FIFO, delay and transactional messages, but not lite or
+        // priority ones.
+        _ => mixed_message_types(),
+    }
+}
+
+/// Java `TopicMessageType.MIXED`: the message types a mixed topic accepts.
+fn mixed_message_types() -> Vec<i32> {
+    vec![
+        pb::MessageType::Normal as i32,
+        pb::MessageType::Fifo as i32,
+        pb::MessageType::Delay as i32,
+        pb::MessageType::Transaction as i32,
+    ]
+}
+
+/// The type of a message that is about to be published.
+///
+/// A 5.x client states the type in `system_properties.message_type`
+/// (`PublishingMessageImpl`); when it does not, the type follows from the
+/// message's own fields, like Java's `TopicMessageType.parseFromMessageProperty`.
+fn message_type_of(message: &pb::Message) -> i32 {
+    let Some(system) = message.system_properties.as_ref() else {
+        return pb::MessageType::Normal as i32;
+    };
+    if system.message_type != 0 {
+        return system.message_type;
+    }
+    if system
+        .message_group
+        .as_ref()
+        .is_some_and(|group| !group.trim().is_empty())
+    {
+        return pb::MessageType::Fifo as i32;
+    }
+    if system
+        .lite_topic
+        .as_ref()
+        .is_some_and(|topic| !topic.trim().is_empty())
+    {
+        return pb::MessageType::Lite as i32;
+    }
+    if system.delivery_timestamp.is_some() {
+        return pb::MessageType::Delay as i32;
+    }
+    if system.priority.is_some() {
+        return pb::MessageType::Priority as i32;
+    }
+    pb::MessageType::Normal as i32
+}
+
+/// The Java name of a v2 message type, used in the validation error message.
+fn message_type_name(message_type: i32) -> &'static str {
+    match message_type {
+        value if value == pb::MessageType::Normal as i32 => "NORMAL",
+        value if value == pb::MessageType::Fifo as i32 => "FIFO",
+        value if value == pb::MessageType::Delay as i32 => "DELAY",
+        value if value == pb::MessageType::Transaction as i32 => "TRANSACTION",
+        value if value == pb::MessageType::Lite as i32 => "LITE",
+        value if value == pb::MessageType::Priority as i32 => "PRIORITY",
+        _ => "MESSAGE_TYPE_UNSPECIFIED",
     }
 }
 
@@ -1670,7 +1900,7 @@ fn endpoints_from_addr(addr: &str) -> Option<pb::Endpoints> {
     })
 }
 
-const PROPERTIES: [&str; 5] = ["TAGS", "KEYS", "UNIQ_KEY", "SHARDING_KEY", "RECONSUME_TIMES"];
+const PROPERTIES: [&str; 6] = ["TAGS", "KEYS", "UNIQ_KEY", "SHARDING_KEY", "RECONSUME_TIMES", "PRIORITY"];
 
 /// Java `MessageConst.PROPERTY_LITE_TOPIC`: the lite topic a message belongs to.
 /// A lite message is stored in its bind (parent) topic and carries the lite
@@ -1765,6 +1995,11 @@ fn encode_send_properties(message: &pb::Message) -> Result<String> {
         if let Some(attempt) = system.delivery_attempt {
             properties.insert("RECONSUME_TIMES".into(), attempt.to_string());
         }
+        // `MessageConst.PROPERTY_PRIORITY`: the broker stores the priority as a plain
+        // property, and `to_pb_message` reads it back so `MessageView.getPriority` works.
+        if let Some(priority) = system.priority {
+            properties.insert("PRIORITY".into(), priority.to_string());
+        }
         if let Some(lite_topic) = &system.lite_topic {
             if !lite_topic.is_empty() {
                 properties.insert(LITE_TOPIC_PROPERTY.into(), lite_topic.clone());
@@ -1825,7 +2060,10 @@ fn to_pb_message(message: &common::Message, receipt_handle: Option<String>) -> p
         orphaned_transaction_recovery_duration: None,
         dead_letter_queue: None,
         lite_topic: message.properties.get(LITE_TOPIC_PROPERTY).cloned(),
-        priority: None,
+        priority: message
+            .properties
+            .get("PRIORITY")
+            .and_then(|value| value.parse().ok()),
     };
     let user_properties: std::collections::HashMap<String, String> = message
         .properties
@@ -1877,107 +2115,6 @@ fn decode_query_frame(body: &[u8]) -> Result<Vec<common::Message>> {
         ));
     }
     Ok(messages)
-}
-
-/// Receipt handle for the pop-lite flow: opaque to clients, parseable here.
-fn encode_receipt_handle(topic: &str, group: &str, queue_id: i32, offset: i64) -> String {
-    format!("rh:{topic}:{group}:{queue_id}:{offset}")
-}
-
-/// The light queue a lite message belongs to: `%LMQ%$bind$lite`. A lite message
-/// is dispatched to that queue, which keeps an offset sequence of its own.
-fn lite_queue_of(bind_topic: &str, message: &common::Message) -> String {
-    message
-        .properties
-        .get(LITE_TOPIC_PROPERTY)
-        .and_then(|lite| common::to_lmq_name(bind_topic, lite))
-        .unwrap_or_else(|| bind_topic.to_owned())
-}
-
-fn decode_receipt_handle(handle: &str) -> Option<(String, String, i32, i64)> {
-    let rest = handle.strip_prefix("rh:")?;
-    let mut parts = rest.split(':');
-    let topic = parts.next()?.to_string();
-    let group = parts.next()?.to_string();
-    let queue_id = parts.next()?.parse().ok()?;
-    let offset = parts.next()?.parse().ok()?;
-    Some((topic, group, queue_id, offset))
-}
-
-// ---------------------------------------------------------------------------
-// Load balancing (Java `AverageHashLoadBalancingStats`)
-// ---------------------------------------------------------------------------
-
-/// FNV-1a 64-bit: stable across runs and platforms, good enough for ring/slice
-/// placement (no crypto requirements in the balancer).
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// Number of consumer groups the average-hash balancer assumes for this proxy.
-fn consumer_group_count(config: &ProxyConfig) -> u64 {
-    u64::from(config.consumer_group_count.unwrap_or(1)).max(1)
-}
-
-/// Index of `group` in the average-hash distribution: `hash(group) % group_count`.
-///
-/// Java (`AverageHashLoadBalancingStats`) learns how the proxy cluster negotiated
-/// its consumer-group distribution through runtime metadata shared between proxy
-/// peers; a single process cannot observe sibling proxies, so the group index is
-/// derived from a stable hash of the group name modulo a locally configured
-/// `ProxyConfig::consumer_group_count` (default 1 = "this proxy owns every queue").
-/// Every proxy in a cluster must run the same group count for the per-group queue
-/// slices to partition cleanly.
-fn group_index(config: &ProxyConfig, group: &str) -> u64 {
-    fnv1a(group.as_bytes()) % consumer_group_count(config)
-}
-
-/// Contiguous queue slice `[i*N/M, (i+1)*N/M)` handed to group index `i` when the
-/// topic has `N` readable queues and `M` groups — the average-hash allocation:
-/// floor boundaries so the slices are disjoint and cover `[0, N)` exactly.
-fn average_hash_slice(group_idx: u64, total: u64, groups: u64) -> std::ops::Range<u64> {
-    let start = group_idx * total / groups;
-    let end = (group_idx + 1) * total / groups;
-    start..end.max(start)
-}
-
-/// Virtual nodes each group occupies on the consistent-hash ring.
-const RING_VIRTUAL_NODES: u64 = 64;
-
-/// Consistent-hash ring over group indexes (simplified Java
-/// `ConsistentHashLoadBalancer`): every group index occupies
-/// [`RING_VIRTUAL_NODES`] ring positions hashed with FNV-1a; `key` resolves to the
-/// first ring position at or after `hash(key)`, wrapping around.
-fn ring_lookup(groups: u64, key: &[u8]) -> u64 {
-    if groups <= 1 {
-        return 0;
-    }
-    let mut ring: Vec<(u64, u64)> =
-        Vec::with_capacity((groups * RING_VIRTUAL_NODES) as usize);
-    for group in 0..groups {
-        for v in 0..RING_VIRTUAL_NODES {
-            let label = format!("vn:{group}:{v}");
-            ring.push((fnv1a(label.as_bytes()), group));
-        }
-    }
-    ring.sort_unstable();
-    let point = fnv1a(key);
-    let idx = ring.partition_point(|(pos, _)| *pos < point);
-    ring[idx % ring.len()].1
-}
-
-/// Whether this group index owns queue `(broker, id)` of `topic` under
-/// `high_accuracy_allocation`: the consistent-hash ring decides the owning group
-/// per queue instead of a group-wide slice.
-fn ring_owns_queue(config: &ProxyConfig, topic: &str, broker: &str, id: i32, mine: u64) -> bool {
-    let groups = consumer_group_count(config);
-    let key = format!("{topic}:{broker}:{id}");
-    ring_lookup(groups, key.as_bytes()) == mine
 }
 
 // ---------------------------------------------------------------------------
@@ -2216,13 +2353,94 @@ impl MessagingProcessor {
             .await?;
         if response.code != 0 {
             // 22 = QUERY_NOT_FOUND: the group never committed; start from the beginning.
+            info!(
+                %topic, %group, queue_id, code = response.code,
+                "committed_offset: no commit found, starting from 0"
+            );
             return Ok(0);
         }
-        Ok(response
+        let offset = response
             .ext_fields
             .get("offset")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0))
+            .unwrap_or(0);
+        info!(%topic, %group, queue_id, offset, "committed_offset");
+        Ok(offset)
+    }
+
+    /// `POP_MESSAGE`: pop a message of the topic for the group.
+    ///
+    /// Java `ReceiveMessageActivity` hands the request to the broker's pop, which picks
+    /// the queue, keeps the message invisible and answers with a receipt handle (the
+    /// pop ck). A queue id below zero means "any queue of the topic", which is what the
+    /// client asks for when the assignment only names the topic.
+    async fn pop_once(
+        &self,
+        topic: &str,
+        group: &str,
+        queue_id: i32,
+        batch: i32,
+        invisible_time: i64,
+        long_polling_ms: i64,
+        filter: Option<pb::FilterExpression>,
+    ) -> Result<Vec<common::Message>> {
+        // The broker refuses a pop of a group it does not know, and it creates the group
+        // when its config is read (Java `SubscriptionGroupManager`).
+        self.backend
+            .subscription_group_config("", group)
+            .await
+            .ok_or_else(|| Error::NotFound(format!("subscription group [{group}] does not exist")))?;
+        let mut fields = vec![
+            ("topic", topic.to_string()),
+            ("consumerGroup", group.to_string()),
+            ("queueId", queue_id.to_string()),
+            ("maxMsgNums", batch.max(1).to_string()),
+            ("invisibleTime", invisible_time.to_string()),
+            ("popTimeout", long_polling_ms.clamp(0, 30_000).to_string()),
+        ];
+        if let Some(filter) = filter.as_ref() {
+            if !filter.expression.is_empty() && filter.expression != "*" {
+                fields.push(("exp", filter.expression.clone()));
+                fields.push((
+                    "expType",
+                    if filter.r#type == 2 {
+                        "SQL92".to_string()
+                    } else {
+                        "TAG".to_string()
+                    },
+                ));
+            }
+        }
+        // The broker holds the pop for the whole long-poll window; the transport needs
+        // the suspend plus a margin instead of the default backend timeout.
+        let timeout = Duration::from_millis(u64::try_from(long_polling_ms.clamp(0, 30_000)).unwrap_or(30_000) + 3_000);
+        let response = self
+            .backend
+            .invoke_broker_with_timeout(topic, 200050, &fields, Vec::new(), timeout)
+            .await?;
+        if response.code != 0 {
+            return Err(Error::NotFound(format!(
+                "pop failed (code {}): {}",
+                response.code,
+                response.remark.as_deref().unwrap_or("")
+            )));
+        }
+        let mut messages = Vec::new();
+        let mut rest = response.body.as_slice();
+        while !rest.is_empty() {
+            match common::Message::decode(rest) {
+                Ok((message, consumed)) if consumed > 0 => {
+                    messages.push(message);
+                    rest = &rest[consumed..];
+                }
+                Ok(_) => break,
+                Err(error) => {
+                    warn!(%error, "stopping pop body decode at undecodable record");
+                    break;
+                }
+            }
+        }
+        Ok(messages)
     }
 
     /// `POP_LITE_MESSAGE`: read the light queues of the lite topics a client
@@ -2235,10 +2453,12 @@ impl MessagingProcessor {
         client_id: &str,
         batch: i32,
         invisible_time: i64,
+        long_polling_ms: i64,
     ) -> Result<Vec<common::Message>> {
+        let timeout = Duration::from_millis(u64::try_from(long_polling_ms.clamp(0, 30_000)).unwrap_or(30_000) + 3_000);
         let response = self
             .backend
-            .invoke_broker(
+            .invoke_broker_with_timeout(
                 bind_topic,
                 200070,
                 &[
@@ -2247,8 +2467,10 @@ impl MessagingProcessor {
                     ("topic", bind_topic.to_string()),
                     ("maxMsgNum", batch.max(1).to_string()),
                     ("invisibleTime", invisible_time.to_string()),
+                    ("popTimeout", long_polling_ms.clamp(0, 30_000).to_string()),
                 ],
                 Vec::new(),
+                timeout,
             )
             .await?;
         if response.code != 0 {
@@ -2281,6 +2503,7 @@ impl MessagingProcessor {
         offset: i64,
         batch: i32,
         filter: Option<pb::FilterExpression>,
+        suspend_ms: i64,
     ) -> Result<(Vec<common::Message>, i64, i64)> {
         // The broker learns a proxy-managed consumer group's subscription through the pull
         // request itself (Java `compensateSubscribeData`); forward the real filter expression
@@ -2293,26 +2516,42 @@ impl MessagingProcessor {
             Some(2) => "SQL92".to_string(),
             _ => "TAG".to_string(),
         };
-        let response = self
-            .backend
-            .invoke_broker(
-                topic,
-                11,
-                &[
-                    ("topic", topic.to_string()),
-                    ("consumerGroup", group.to_string()),
-                    ("queueId", queue_id.to_string()),
-                    ("queueOffset", offset.to_string()),
-                    ("maxMsgNums", batch.max(1).to_string()),
-                    ("sysFlag", "0".to_string()),
-                    ("expressionType", sub_type),
-                    ("subExpression", "*".to_string()),
-                    ("subscription", sub_expr),
-                    ("subVersion", "0".to_string()),
-                ],
-                Vec::new(),
-            )
-            .await?;
+        // `PullMessageRequestHeader.sysFlag` `SUSPEND_FLAG` (0x2): the broker holds an
+        // empty read for `suspendTimeoutMillis` (Java `PullMessageProcessor` long polling),
+        // which is what turns the client's `awaitDuration` into a real long poll instead
+        // of an immediate empty answer. The broker caps the suspend at 30s.
+        let suspend_ms = suspend_ms.clamp(0, 30_000);
+        let sys_flag = if suspend_ms > 0 { 2 } else { 0 };
+        let mut fields = vec![
+            ("topic", topic.to_string()),
+            ("consumerGroup", group.to_string()),
+            ("queueId", queue_id.to_string()),
+            ("queueOffset", offset.to_string()),
+            ("maxMsgNums", batch.max(1).to_string()),
+            ("sysFlag", sys_flag.to_string()),
+            ("expressionType", sub_type),
+            ("subExpression", "*".to_string()),
+            ("subscription", sub_expr),
+            ("subVersion", "0".to_string()),
+        ];
+        if suspend_ms > 0 {
+            fields.push(("suspendTimeoutMillis", suspend_ms.to_string()));
+        }
+        let response = if suspend_ms > 0 {
+            // The broker holds this request for the whole suspend window; allow the
+            // transport the suspend plus a margin instead of the default 3s timeout.
+            self.backend
+                .invoke_broker_with_timeout(
+                    topic,
+                    11,
+                    &fields,
+                    Vec::new(),
+                    Duration::from_millis(u64::try_from(suspend_ms).unwrap_or(30_000) + 3_000),
+                )
+                .await?
+        } else {
+            self.backend.invoke_broker(topic, 11, &fields, Vec::new()).await?
+        };
         let next_begin = response
             .ext_fields
             .get("nextBeginOffset")
@@ -2332,6 +2571,12 @@ impl MessagingProcessor {
         // poll: 19 = no message at the offset, 20 = the offset moved forward,
         // 21 = the offset is out of range. Java's proxy turns these into an empty
         // pull result plus the offset to retry from, not into a failure.
+        info!(
+            %topic, %group, queue_id, offset, suspend_ms, code = response.code,
+            messages = response.body.len(),
+            next_begin, max, min,
+            "pull_once: broker response"
+        );
         match response.code {
             0 => {}
             19 => return Ok((Vec::new(), offset, max)),
@@ -2485,6 +2730,11 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             return Err(Status::invalid_argument("no messages in request"));
         }
         let mut entries = Vec::with_capacity(request.messages.len());
+        // Java `DefaultTopicMessageTypeValidator`: a message's type must match
+        // the type its topic declares. The topic types are looked up once per
+        // topic per request.
+        let mut accepted_types: std::collections::HashMap<String, Vec<i32>> =
+            std::collections::HashMap::new();
         for message in &request.messages {
             self.context.record_op(&self.context.send_ops);
             let topic = message
@@ -2502,6 +2752,33 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             if message.body.is_empty() {
                 entries.push(pb::SendResultEntry {
                     status: Some(pb_status(pb::Code::MessageBodyEmpty, "empty body")),
+                    ..Default::default()
+                });
+                continue;
+            }
+            let actual_type = message_type_of(message);
+            let accepted = match accepted_types.get(&topic) {
+                Some(types) => types.clone(),
+                None => {
+                    let types = self.backend.topic_message_types(&topic).await;
+                    accepted_types.insert(topic.clone(), types.clone());
+                    types
+                }
+            };
+            if !accepted.contains(&actual_type) {
+                entries.push(pb::SendResultEntry {
+                    status: Some(pb_status(
+                        pb::Code::MessagePropertyConflictWithType,
+                        format!(
+                            "TopicMessageType validate failed, the expected type is {}, but actual type is {}",
+                            accepted
+                                .iter()
+                                .map(|value| message_type_name(*value))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            message_type_name(actual_type)
+                        ),
+                    )),
                     ..Default::default()
                 });
                 continue;
@@ -2549,10 +2826,11 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                     10,
                     &[
                         ("topic", topic.clone()),
-                        (
-                            "producerGroup",
-                            self.context.config.default_producer_group.clone(),
-                        ),
+                        // Java `SendMessageActivity.buildMessage`: "here use topicName as
+                        // producerGroup for transactional checker". The 5.x gRPC model has
+                        // no separate producer group, so the topic name is the group the
+                        // transaction check is routed by.
+                        ("producerGroup", topic.clone()),
                         ("queueId", queue_id.to_string()),
                         // A transactional message must carry the prepared flag, so the
                         // broker stores it as a half message (`MessageSysFlag`
@@ -2625,15 +2903,6 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         request: Request<pb::QueryAssignmentRequest>,
     ) -> PbResult<pb::QueryAssignmentResponse> {
         self.acl.check_access(&request, "QueryAssignment").await?;
-        // Identify the caller so its real position within the connected group can be
-        // used for load balancing (falls back to the static hash when unknown).
-        let client_id = client_id_of(&request).unwrap_or_default();
-        // Average-hash load balancing (Java `AverageHashLoadBalancingStats`): instead
-        // of fanning one consumer over every readable queue, each consumer group owns
-        // a contiguous slice `[i*N/M, (i+1)*N/M)` of the topic's `N` readable queues,
-        // where `i` is the group's index and `M` the assumed group count. With
-        // `high_accuracy_allocation` the owning group is chosen per queue through a
-        // consistent-hash ring instead of a whole-group slice.
         let request = request.into_inner();
         let topic = request
             .topic
@@ -2650,55 +2919,35 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .topic_route(&topic)
             .await
             .map_err(|e| self.error_status(&e))?;
-        // Flatten the readable queues in route order; the slice indexes into this
-        // stable ordering.
-        let mut readable: Vec<(&QueueRoute, i32)> = Vec::new();
-        for queue in &queues {
-            for id in 0..queue.read_queues.max(0) {
-                readable.push((queue, id));
-            }
-        }
-
-        let config = &self.context.config;
-        // Prefer the real connected-group membership for load balancing; fall back to
-        // the statically configured group count when no client has heart-beated yet.
-        let live = self.context.clients.group_member_count(&group);
-        let groups = if live > 0 {
-            live as u64
-        } else {
-            consumer_group_count(config)
-        };
-        let mine = match self.context.clients.group_index_of(&group, &client_id) {
-            Some(idx) => idx as u64,
-            None => group_index(config, &group),
-        };
-        let average_hash = config
-            .load_balancing_strategy
-            .eq_ignore_ascii_case("average_hash");
-        let owned: Vec<(&QueueRoute, i32)> = if !average_hash || groups <= 1 {
-            // Unknown strategy (or a single group): every readable queue is assigned,
-            // preserving the pre-balancing fan-out behavior.
-            readable.iter().copied().collect()
-        } else if config.high_accuracy_allocation {
-            readable
-                .iter()
-                .copied()
-                .filter(|(queue, id)| {
-                    ring_owns_queue(config, &topic, &queue.broker_name, *id, mine)
-                })
-                .collect()
-        } else {
-            let slice = average_hash_slice(mine, readable.len() as u64, groups);
-            readable
-                .into_iter()
-                .enumerate()
-                .filter(|(index, _)| {
-                    let index = *index as u64;
-                    index >= slice.start && index < slice.end
-                })
-                .map(|(_, item)| item)
-                .collect()
-        };
+        // Java `RouteActivity.queryAssignment`: a group that consumes in order (FIFO)
+        // owns every readable queue of the topic, while every other group gets a
+        // single assignment per broker whose queue id is -1. The -1 tells the client
+        // that the server picks the queue, which is what the pop path does: the broker
+        // chooses the queue and keeps the message invisible until it is acked. Slicing
+        // the queues per client would make two clients of one group read the same queue.
+        let group_config = self.backend.subscription_group_config("", &group).await;
+        let fifo = group_config
+            .as_ref()
+            .is_some_and(|config| config.consume_message_orderly);
+        // A lite group reads light queues, never the bind topic's own queues, so it
+        // gets the "server picks" assignment even when it consumes in order.
+        let lite = group_config
+            .as_ref()
+            .is_some_and(|config| config.lite_bind_topic().is_some_and(|t| !t.is_empty()));
+        // Java iterates the route's queue data, which holds one entry per broker.
+        // `PermName.PERM_READ` is `1 << 2`.
+        const PERM_READ: i32 = 0x1 << 2;
+        let owned: Vec<(&QueueRoute, i32)> = queues
+            .iter()
+            .filter(|queue| queue.perm & PERM_READ != 0 && queue.read_queues > 0)
+            .flat_map(|queue| {
+                if fifo && !lite {
+                    (0..queue.read_queues).map(move |id| (queue, id)).collect::<Vec<_>>()
+                } else {
+                    vec![(queue, -1)]
+                }
+            })
+            .collect();
 
         // Same type fidelity as QueryRoute: advertise the topic's real message types.
         let accept_message_types = self.backend.topic_message_types(&topic).await;
@@ -2719,6 +2968,13 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                     accept_message_types: accept_message_types.clone(),
                 }),
             });
+        }
+        if assignments.is_empty() {
+            // Java answers `FORBIDDEN, "no readable queue"` when the topic has none.
+            return Ok(Response::new(pb::QueryAssignmentResponse {
+                status: Some(pb_status(pb::Code::Forbidden, "no readable queue")),
+                assignments,
+            }));
         }
         Ok(Response::new(pb::QueryAssignmentResponse {
             status: Some(pb_status(pb::Code::Ok, "")),
@@ -2763,6 +3019,14 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .as_ref()
             .map(|duration| duration.seconds * 1_000 + duration.nanos as i64 / 1_000_000)
             .unwrap_or(15_000);
+        // The client's `awaitDuration` rides the request as `long_polling_timeout`; the
+        // pull must suspend for it (Java `PullMessageProcessor` long polling) or every
+        // receive on an empty queue returns immediately instead of waiting for a send.
+        let long_polling_ms = request
+            .long_polling_timeout
+            .as_ref()
+            .map(|duration| duration.seconds * 1_000 + duration.nanos as i64 / 1_000_000)
+            .unwrap_or(0);
         let (tx, rx) = mpsc::channel::<std::result::Result<pb::ReceiveMessageResponse, Status>>(16);
         let this = Arc::new(self.clone_for_stream());
         tokio::spawn(async move {
@@ -2778,6 +3042,21 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             if lite_topics.is_empty() {
                 lite_topics = this.context.clients.lite_topics_for_group(&group);
             }
+            // A lite consumer whose lite set is currently empty must get nothing: falling
+            // back to a plain pull of the bind topic would hand it the dual-dispatched
+            // lite messages anyway (Java `LitePushConsumerImpl` pops only light queues).
+            if lite_topics.is_empty()
+                && this.context.clients.is_lite_consumer(&client_id, &group)
+            {
+                let _ = tx
+                    .send(Ok(pb::ReceiveMessageResponse {
+                        content: Some(pb::receive_message_response::Content::Status(
+                            pb_status(pb::Code::Ok, ""),
+                        )),
+                    }))
+                    .await;
+                return;
+            }
             if !lite_topics.is_empty() {
                 // The bind topic is the topic the client was assigned; the lite topics
                 // it subscribed to hang below it.
@@ -2787,20 +3066,26 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                     topic.clone()
                 };
                 match this
-                    .pop_lite_once(&bind_topic, &group, &client_id, batch, invisible_time)
+                    .pop_lite_once(
+                        &bind_topic,
+                        &group,
+                        &client_id,
+                        batch,
+                        invisible_time,
+                        long_polling_ms,
+                    )
                     .await
                 {
                     Ok(messages) => {
                         for message in &messages {
-                            // The receipt handle names the light queue, so the ack
-                            // commits the offset of the lite topic's own queue.
-                            let lmq = lite_queue_of(&bind_topic, message);
-                            let handle = encode_receipt_handle(
-                                &lmq,
-                                &group,
-                                0,
-                                message.queue_offset as i64,
-                            );
+                            // The receipt handle is the pop ck the broker stamped on the
+                            // message; it names the light queue, so the ack commits the
+                            // offset of the lite topic's own queue.
+                            let handle = message
+                                .properties
+                                .get(common::PROPERTY_POP_CK)
+                                .cloned()
+                                .unwrap_or_default();
                             let pb_message = to_pb_message(message, Some(handle));
                             if tx
                                 .send(Ok(pb::ReceiveMessageResponse {
@@ -2829,21 +3114,31 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                 return;
             }
 
-            // Pop-lite: pull from the committed offset, hand each message a receipt
-            // handle; `ack_message` commits the offset it encodes.
-            let offset = match this.committed_offset(&topic, &group, queue_id).await {
-                Ok(offset) => offset,
-                Err(error) => {
-                    let _ = tx.send(Err(Status::internal(error.to_string()))).await;
-                    return;
-                }
-            };
+            // Java `ReceiveMessageActivity` pops the message: the broker picks the queue,
+            // keeps the message invisible for the invisible duration and hands out a
+            // receipt handle (the pop ck). The ack and the invisible-duration change
+            // are addressed by that handle, so an unacked message is not handed out
+            // again before its invisible window ends.
             let filter = this.context.clients.subscription_for(&client_id, &topic);
-            match this.pull_once(&topic, &group, queue_id, offset, batch, filter).await {
-                Ok((messages, _next, _max)) => {
+            match this
+                .pop_once(
+                    &topic,
+                    &group,
+                    queue_id,
+                    batch,
+                    invisible_time,
+                    long_polling_ms,
+                    filter,
+                )
+                .await
+            {
+                Ok(messages) => {
                     for message in &messages {
-                        let handle =
-                            encode_receipt_handle(&topic, &group, queue_id, message.queue_offset as i64);
+                        let handle = message
+                            .properties
+                            .get(common::PROPERTY_POP_CK)
+                            .cloned()
+                            .unwrap_or_default();
                         let pb_message = to_pb_message(message, Some(handle));
                         if tx
                             .send(Ok(pb::ReceiveMessageResponse {
@@ -2887,64 +3182,21 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .unwrap_or_default();
         let mut entries = Vec::with_capacity(request.entries.len());
         for entry in &request.entries {
-            let status = match decode_receipt_handle(&entry.receipt_handle) {
-                Some((handle_topic, group, queue_id, offset)) => {
-                    // A lite message is acked against its light queue, whose name the
-                    // receipt handle carries; a normal message is acked against the
-                    // topic of the request.
-                    if common::is_lite_topic_queue(&handle_topic) {
-                        // `AckMessageProcessor`: the ack clears the invisible entry and
-                        // commits the offset of the light queue, so the record is not
-                        // handed out again when its invisible span ends.
-                        let extra = format!("{handle_topic},{group},{queue_id},{offset},0,0");
-                        // The light queue is not a topic of its own, so the broker is
-                        // resolved through the topic it hangs below.
-                        let broker_topic = common::get_parent_topic(&handle_topic)
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| handle_topic.clone());
-                        let result = self
-                            .backend
-                            .invoke_broker(
-                                &broker_topic,
-                                200051,
-                                &[("extraInfo", extra)],
-                                Vec::new(),
-                            )
-                            .await;
-                        match result {
-                            Ok(response) if response.code == 0 => pb_status(pb::Code::Ok, ""),
-                            Ok(response) => pb_status(
-                                map_response_code(response.code),
-                                response.remark.as_deref().unwrap_or("ack failed"),
-                            ),
-                            Err(error) => pb_status(pb::Code::InternalError, error.to_string()),
-                        }
-                    } else {
-                        let result = self
-                            .backend
-                            .invoke_broker(
-                                &topic,
-                                15,
-                                &[
-                                    ("topic", topic.clone()),
-                                    ("consumerGroup", group),
-                                    ("queueId", queue_id.to_string()),
-                                    ("commitOffset", (offset + 1).to_string()),
-                                ],
-                                Vec::new(),
-                            )
-                            .await;
-                        match result {
-                            Ok(response) if response.code == 0 => pb_status(pb::Code::Ok, ""),
-                            Ok(response) => pb_status(
-                                map_response_code(response.code),
-                                response.remark.as_deref().unwrap_or("ack failed"),
-                            ),
-                            Err(error) => pb_status(pb::Code::InternalError, error.to_string()),
-                        }
-                    }
-                }
-                None => pb_status(pb::Code::InvalidReceiptHandle, "unparseable receipt handle"),
+            // The receipt handle is the pop ck the broker handed out; the ack tells the
+            // broker that the message is done, which clears its invisible entry and
+            // advances the group's committed offset.
+            let handle = entry.receipt_handle.clone();
+            let result = self
+                .backend
+                .invoke_broker(&topic, 200051, &[("extraInfo", handle)], Vec::new())
+                .await;
+            let status = match result {
+                Ok(response) if response.code == 0 => pb_status(pb::Code::Ok, ""),
+                Ok(response) => pb_status(
+                    map_response_code(response.code),
+                    response.remark.as_deref().unwrap_or("ack failed"),
+                ),
+                Err(error) => pb_status(pb::Code::InternalError, error.to_string()),
             };
             entries.push(pb::AckMessageResultEntry {
                 message_id: entry.message_id.clone(),
@@ -2979,9 +3231,9 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         if group.is_empty() || topic.is_empty() {
             return Err(Status::invalid_argument("group and topic are required"));
         }
-        // The pop-lite handle carries the origin queue coordinates; `delayLevel = -1` makes the
+        // The pop ck carries the origin queue coordinates; `delayLevel = -1` makes the
         // broker's send-back route straight into the group's dead-letter topic.
-        let Some((_, _, queue_id, offset)) = decode_receipt_handle(&request.receipt_handle) else {
+        let Some((_, _, queue_id, offset)) = common::parse_pop_ck(&request.receipt_handle) else {
             return Ok(Response::new(pb::ForwardMessageToDeadLetterQueueResponse {
                 status: Some(pb_status(
                     pb::Code::InvalidReceiptHandle,
@@ -2989,6 +3241,7 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                 )),
             }));
         };
+        let offset = u64::from(offset);
         let result = self
             .backend
             .invoke_broker(
@@ -3056,7 +3309,7 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         let (tx, rx) = mpsc::channel::<std::result::Result<pb::PullMessageResponse, Status>>(16);
         let this = Arc::new(self.clone_for_stream());
         tokio::spawn(async move {
-            match this.pull_once(&topic, &group, queue_id, offset, batch, None).await {
+            match this.pull_once(&topic, &group, queue_id, offset, batch, None, 0).await {
                 Ok((messages, next, max)) => {
                     for message in &messages {
                         if tx
@@ -3415,18 +3668,24 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .as_ref()
             .map(|duration| duration.seconds.saturating_mul(1000) + (duration.nanos / 1_000_000) as i64)
             .unwrap_or(0);
-        // A broker pop receipt (comma-separated coordinates) forwards to the broker's
-        // CHANGE_MESSAGE_INVISIBLETIME; the pull-based pop-lite handle has no invisible state
-        // to mutate on this proxy.
-        if request.receipt_handle.starts_with("rh:") {
+        // Java `GrpcValidator.validateInvisibleTime` (the single-arg overload, min 0)
+        // plus `ProxyConfig.maxInvisibleTimeMills` (default 12h): a negative or
+        // oversized duration is refused with ILLEGAL_INVISIBLE_TIME before the broker
+        // is contacted.
+        const MAX_INVISIBLE_TIME_MS: i64 = 12 * 60 * 60 * 1000;
+        if duration_ms < 0 || duration_ms > MAX_INVISIBLE_TIME_MS {
+            let remark = if duration_ms < 0 {
+                "the invisibleTime is too small. min is 0".to_string()
+            } else {
+                format!("the invisibleTime is too large. max is {MAX_INVISIBLE_TIME_MS}")
+            };
             return Ok(Response::new(pb::ChangeInvisibleDurationResponse {
-                status: Some(pb_status(
-                    pb::Code::InvalidReceiptHandle,
-                    "pull-based receipt handles have no invisible duration",
-                )),
+                status: Some(pb_status(pb::Code::IllegalInvisibleTime, remark)),
                 ..Default::default()
             }));
         }
+        // The receipt handle is the pop ck the broker handed out; the invisible span of
+        // that outstanding message is changed on the broker.
         let result = self
             .backend
             .invoke_broker(
@@ -4904,17 +5163,6 @@ mod tests {
     }
 
     #[test]
-    fn receipt_handle_roundtrip() {
-        let handle = encode_receipt_handle("topic-x", "group-y", 3, 42);
-        let (topic, group, queue, offset) = decode_receipt_handle(&handle).unwrap();
-        assert_eq!(topic, "topic-x");
-        assert_eq!(group, "group-y");
-        assert_eq!(queue, 3);
-        assert_eq!(offset, 42);
-        assert!(decode_receipt_handle("garbage").is_none());
-    }
-
-    #[test]
     fn endpoints_conversion() {
         let endpoints = endpoints_from_addr("127.0.0.1:10911").unwrap();
         assert_eq!(endpoints.scheme, pb::AddressScheme::IPv4 as i32);
@@ -4964,48 +5212,6 @@ mod tests {
         assert!(properties.contains("UNIQ_KEY\x01mid-1\x02"));
         assert!(properties.contains("SHARDING_KEY\x01g\x02"));
         assert!(properties.contains("k1\x01v1\x02"));
-    }
-
-    #[test]
-    fn average_hash_slice_partitions_all_queues() {
-        // The slices of all groups are disjoint and cover [0, N) exactly.
-        for total in 0..40u64 {
-            for groups in 1..=7u64 {
-                let mut covered = 0u64;
-                for group in 0..groups {
-                    let slice = average_hash_slice(group, total, groups);
-                    assert_eq!(slice.start, covered);
-                    assert!(slice.end >= slice.start);
-                    covered = slice.end;
-                }
-                assert_eq!(covered, total);
-            }
-        }
-    }
-
-    #[test]
-    fn group_index_is_stable_and_bounded() {
-        let mut config = ProxyConfig::default();
-        config.consumer_group_count = Some(4);
-        let a = group_index(&config, "GID-order");
-        assert_eq!(a, group_index(&config, "GID-order"));
-        assert!(a < 4);
-        // Default (unset) group count is 1: every group maps to index 0.
-        assert_eq!(group_index(&ProxyConfig::default(), "anything"), 0);
-        assert_eq!(consumer_group_count(&ProxyConfig::default()), 1);
-    }
-
-    #[test]
-    fn ring_lookup_is_deterministic() {
-        let config = ProxyConfig {
-            consumer_group_count: Some(3),
-            ..Default::default()
-        };
-        let first = ring_owns_queue(&config, "topic-a", "broker-1", 2, 0);
-        assert_eq!(first, ring_owns_queue(&config, "topic-a", "broker-1", 2, 0));
-        // With a single group the ring trivially owns every queue.
-        let single = ProxyConfig::default();
-        assert!(ring_owns_queue(&single, "topic-a", "broker-1", 2, 0));
     }
 
     #[test]

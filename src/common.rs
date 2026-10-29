@@ -97,6 +97,39 @@ pub fn get_lite_topic(lmq_name: &str) -> Option<&str> {
     split_lite_topic(lmq_name).map(|(_, lite)| lite)
 }
 
+/// `MessageConst.PROPERTY_POP_CK`: the receipt handle a pop stamps on every
+/// message it hands out.
+pub const PROPERTY_POP_CK: &str = "RMQ_SYS_POP_CK";
+
+/// The receipt handle one pop hands out (`MessageConst.PROPERTY_POP_CK`).
+///
+/// Names may carry `|` but never `,`, so the comma is a safe separator; the
+/// caller only ever decodes handles this server produced.
+pub fn pop_ck(
+    topic: &str,
+    group: &str,
+    queue_id: i32,
+    offset: u64,
+    pop_time: i64,
+    invisible_until: i64,
+) -> String {
+    format!("{topic},{group},{queue_id},{offset},{pop_time},{invisible_until}")
+}
+
+/// Decodes a receipt handle back to its coordinates; the timestamps are informational.
+pub fn parse_pop_ck(ck: &str) -> Option<(String, String, i32, u64)> {
+    let parts: Vec<&str> = ck.split(',').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    Some((
+        parts[0].to_owned(),
+        parts[1].to_owned(),
+        parts[2].parse().ok()?,
+        parts[3].parse().ok()?,
+    ))
+}
+
 /// `LiteUtil.getParentAndLiteTopic`: a light queue holds exactly one `$`.
 fn split_lite_topic(lmq_name: &str) -> Option<(&str, &str)> {
     if !is_lite_topic_queue(lmq_name) {
