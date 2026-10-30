@@ -18,6 +18,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install protoc (required by build.rs via prost-build/tonic-build)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          protoc --version
+
       - name: Install Rust toolchain (pinned to project rust-version)
         uses: dtolnay/rust-toolchain@stable
         with:
