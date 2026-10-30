@@ -2032,6 +2032,21 @@ fn combine_request_content(fields: &BTreeMap<String, String>, body: &[u8]) -> Ve
     bytes
 }
 
+/// Stamp a remoting command with `AccessKey`/`Signature` so an ACL-enabled
+/// broker accepts it (Java: the proxy's `innerClientAuthenticationCredentials`
+/// are applied through an `AclClientRPCHook` before every broker invocation).
+/// The signature covers all ext values (sorted, `Signature` excluded)
+/// concatenated with the body — `AclUtils.combineRequestContent`.
+pub fn sign_remoting_command(request: &mut Command, access_key: &str, secret: &str) {
+    request
+        .ext_fields
+        .insert(ACCESS_KEY.to_string(), access_key.to_string());
+    request.ext_fields.remove(SIGNATURE);
+    let content = combine_request_content(&request.ext_fields, &request.body);
+    let signature = cal_signature(&content, secret);
+    request.ext_fields.insert(SIGNATURE.to_string(), signature);
+}
+
 /// Java: authentication.chain.DefaultAuthenticationHandler — verifies the signature.
 pub struct DefaultAuthenticationHandler {
     metadata: Arc<LocalAuthenticationMetadataProvider>,

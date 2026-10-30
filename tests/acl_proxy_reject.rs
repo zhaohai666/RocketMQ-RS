@@ -97,11 +97,13 @@ async fn start_proxy(
 ) -> (SocketAddr, watch::Sender<bool>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut config = ProxyConfig::default();
-    config.name_server_address = vec![ns_addr.to_string()];
-    config.enable_acl = enable_acl;
-    config.acl_config_file = acl_config_file;
-    config.listen_port = addr.port();
+    let config = ProxyConfig {
+        name_server_address: vec![ns_addr.to_string()],
+        enable_acl,
+        acl_config_file,
+        listen_port: addr.port(),
+        ..ProxyConfig::default()
+    };
     let context = ProxyContext::new(config, addr);
     let (shutdown, rx) = watch::channel(false);
     tokio::spawn(serve_proxy(listener, context, rx));
@@ -173,9 +175,7 @@ async fn acl_enabled_proxy_rejects_all_anonymous_requests() {
     let (acl_addr, acl_shutdown) = start_proxy(ns_addr, true, None).await;
     let mut client = connect_with_retry(acl_addr).await;
     let result = client.query_route(query_route_request()).await;
-    let err = result
-        .err()
-        .expect("ACL-enabled proxy MUST reject anonymous requests");
+    let err = result.expect_err("ACL-enabled proxy MUST reject anonymous requests");
     let msg = err.message().to_lowercase();
     println!("ACL=ON(无用户) QueryRoute -> gRPC error: {msg}");
     assert!(
@@ -261,8 +261,7 @@ async fn acl_with_plain_acl_file_allows_signed_grpc_requests() {
     let err = client
         .query_route(request)
         .await
-        .err()
-        .expect("wrong secret MUST be rejected");
+        .expect_err("wrong secret MUST be rejected");
     println!(
         "ACL=ON 错误签名 QueryRoute -> gRPC error: {}",
         err.message()
@@ -278,8 +277,7 @@ async fn acl_with_plain_acl_file_allows_signed_grpc_requests() {
     let err = client
         .query_route(request)
         .await
-        .err()
-        .expect("missing datetime MUST be rejected");
+        .expect_err("missing datetime MUST be rejected");
     println!(
         "ACL=ON 缺 datetime QueryRoute -> gRPC error: {}",
         err.message()

@@ -12,7 +12,8 @@ use rocketmq_rs::container::{BrokerContainer, BrokerContainerConfig};
 use rocketmq_rs::controller::{ControllerConfig, ControllerManager};
 use rocketmq_rs::namesrv::Namesrv;
 use rocketmq_rs::proxy::{ProxyConfig, ProxyContext};
-use rocketmq_rs::remoting::{Command, Handler, invoke, serve};
+use rocketmq_rs::remoting;
+use rocketmq_rs::remoting::{Command, Handler, TlsConfig, invoke, serve, serve_tls};
 use rocketmq_rs::store::Store;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -59,6 +60,8 @@ struct NamesrvArgs {
     data_dir: PathBuf,
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
     broker_timeout_secs: u64,
+    #[command(flatten)]
+    tls: TlsArgs,
 }
 
 #[derive(Debug, Args)]
@@ -101,11 +104,13 @@ struct BrokerArgs {
     recall_message_enable: bool,
     /// Reject commands whose AccessKey/Signature do not verify against the
     /// loaded ACL accounts (BrokerConfig.enableAcl).
-    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    #[arg(long, action = ArgAction::SetTrue)]
     acl_enable: bool,
     /// Path of the plain-ACL accounts file (Java `plain_acl.yml`; JSON or YAML).
     #[arg(long)]
     acl_config: Option<PathBuf>,
+    #[command(flatten)]
+    tls: TlsArgs,
     /// Optional additional broker listener; no automatic VIP port is opened.
     #[arg(long)]
     vip_listen: Option<SocketAddr>,
@@ -133,11 +138,13 @@ struct StandaloneArgs {
     recall_message_enable: bool,
     /// Reject commands whose AccessKey/Signature do not verify against the
     /// loaded ACL accounts (BrokerConfig.enableAcl).
-    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    #[arg(long, action = ArgAction::SetTrue)]
     acl_enable: bool,
     /// Path of the plain-ACL accounts file (Java `plain_acl.yml`; JSON or YAML).
     #[arg(long)]
     acl_config: Option<PathBuf>,
+    #[command(flatten)]
+    tls: TlsArgs,
 }
 
 #[derive(Debug, Args)]
@@ -157,11 +164,19 @@ struct ProxyArgs {
     #[arg(long, value_delimiter = ';', action = ArgAction::Append, value_parser = parse_endpoint)]
     namesrv: Vec<String>,
     /// Enable plain-ACL signature verification on the gRPC path.
-    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    #[arg(long, action = ArgAction::SetTrue)]
     acl_enable: bool,
     /// Path of the plain-ACL accounts file (Java `plain_acl.yml`; JSON or YAML).
     #[arg(long)]
     acl_config: Option<PathBuf>,
+    /// Java `innerClientAuthenticationCredentials` (`accessKey:secretKey`):
+    /// stamp every broker-bound command with these credentials so an
+    /// ACL-enabled broker accepts proxy traffic.
+    #[arg(long)]
+    inner_credentials: Option<String>,
+    /// Serve the gRPC listener over TLS with the given certificate/key.
+    #[command(flatten)]
+    tls: TlsArgs,
 }
 
 #[derive(Debug, Args)]
@@ -367,17 +382,28 @@ async fn run_proxy(args: ProxyArgs, mut signals: ShutdownSignals) -> Result<()> 
         .acl_config
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
+    config.inner_acl_credentials = args.inner_credentials.clone();
     config.validate()?;
     if config.name_server_address.is_empty() {
         warn!("proxy has no nameserver address; route queries will fail until one is configured");
     }
-    info!(listen = %actual, nameservers = ?config.name_server_address, "gRPC proxy starting");
+    if args.tls.tls_listen.is_some() {
+        warn!("proxy TLS applies to the gRPC listener itself; --tls-listen is ignored");
+    }
+    let tls = args.tls.grpc_tls();
+    info!(
+        listen = %actual,
+        nameservers = ?config.name_server_address,
+        tls = tls.is_some(),
+        "gRPC proxy starting"
+    );
     let context = ProxyContext::new(config, actual);
     let (stop, shutdown) = watch::channel(false);
-    let mut task = tokio::spawn(rocketmq_rs::proxy::serve_proxy(
+    let mut task = tokio::spawn(rocketmq_rs::proxy::serve_proxy_tls(
         listener,
         context,
         shutdown.clone(),
+        tls,
     ));
     tokio::select! {
         joined = &mut task => {
@@ -414,6 +440,59 @@ struct Server {
     name: &'static str,
     listener: TcpListener,
     handler: Arc<dyn Handler>,
+    /// When set, this listener serves TLS instead of plaintext
+    /// (Java `TlsSystemConfig`-driven listeners).
+    tls: Option<TlsConfig>,
+}
+
+/// CLI TLS flags shared by every command that opens a listener.
+#[derive(Debug, Clone, Default, clap::Args)]
+struct TlsArgs {
+    /// Optional second listener serving TLS alongside the plaintext one
+    /// (remoting services; Java permissive `tls.server.mode`).
+    #[arg(long)]
+    tls_listen: Option<SocketAddr>,
+    /// PEM server certificate for the TLS listener.
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+    /// PEM server key for the TLS listener.
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
+}
+
+impl TlsArgs {
+    /// Build the remoting `TlsConfig` from the explicit CLI flags, falling
+    /// back to the Java `TlsSystemConfig` environment variables.
+    fn remoting_config(&self, mode: remoting::TlsMode) -> Result<TlsConfig> {
+        let mut tls = TlsConfig {
+            mode,
+            ..rocketmq_rs::remoting::tls_config_from_env()
+        };
+        if let Some(path) = &self.tls_cert {
+            tls.server_cert_path = Some(path.to_string_lossy().into_owned());
+        }
+        if let Some(path) = &self.tls_key {
+            tls.server_key_path = Some(path.to_string_lossy().into_owned());
+        }
+        if tls.server_cert_path.is_none() || tls.server_key_path.is_none() {
+            return Err(Error::Invalid(
+                "TLS listener requires --tls-cert and --tls-key (or the \
+                 TLS_SERVER_CERT/TLS_SERVER_KEY environment variables)"
+                    .into(),
+            ));
+        }
+        Ok(tls)
+    }
+
+    fn grpc_tls(&self) -> Option<TlsConfig> {
+        if self.tls_cert.is_none() && self.tls_key.is_none() {
+            return None;
+        }
+        Some(
+            self.remoting_config(remoting::TlsMode::Enforced)
+                .expect("tls cert/key flags validated at parse time"),
+        )
+    }
 }
 
 struct Services {
@@ -441,12 +520,23 @@ async fn prepare_namesrv(args: NamesrvArgs) -> Result<Services> {
         args.data_dir,
         Duration::from_secs(args.broker_timeout_secs),
     )?);
-    Ok(Services {
-        servers: vec![Server {
-            name: "namesrv",
-            listener,
+    let mut servers = vec![Server {
+        name: "namesrv",
+        listener,
+        handler: namesrv.clone(),
+        tls: None,
+    }];
+    if let Some(tls_listen) = args.tls.tls_listen {
+        let (tls_listener, _) = bind_listener("namesrv-tls", tls_listen).await?;
+        servers.push(Server {
+            name: "namesrv-tls",
+            listener: tls_listener,
             handler: namesrv.clone(),
-        }],
+            tls: Some(args.tls.remoting_config(remoting::TlsMode::Enforced)?),
+        });
+    }
+    Ok(Services {
+        servers,
         namesrv: Some(namesrv),
         broker: None,
         nameservers: Vec::new(),
@@ -495,12 +585,27 @@ async fn prepare_broker(args: BrokerArgs) -> Result<Services> {
         name: "broker",
         listener,
         handler: broker.clone(),
+        tls: None,
     }];
     if let Some(listener) = vip {
         servers.push(Server {
             name: "broker-vip",
             listener,
             handler: broker.clone(),
+            tls: None,
+        });
+    }
+    if let Some(tls_listen) = args.tls.tls_listen {
+        let (tls_listener, tls_addr) = bind_listener("broker-tls", tls_listen).await?;
+        info!(
+            advertise = %tls_addr,
+            "Broker TLS listener bound (advertise it via --advertise if clients connect to it)"
+        );
+        servers.push(Server {
+            name: "broker-tls",
+            listener: tls_listener,
+            handler: broker.clone(),
+            tls: Some(args.tls.remoting_config(remoting::TlsMode::Enforced)?),
         });
     }
     let mut nameservers = args.namesrv;
@@ -548,18 +653,32 @@ async fn prepare_standalone(args: StandaloneArgs) -> Result<Services> {
         "Standalone development server bound; NameServer registration is pending"
     );
     Ok(Services {
-        servers: vec![
-            Server {
-                name: "namesrv",
-                listener: namesrv_listener,
-                handler: namesrv.clone(),
-            },
-            Server {
-                name: "broker",
-                listener: broker_listener,
-                handler: broker.clone(),
-            },
-        ],
+        servers: {
+            let mut servers = vec![
+                Server {
+                    name: "namesrv",
+                    listener: namesrv_listener,
+                    handler: namesrv.clone(),
+                    tls: None,
+                },
+                Server {
+                    name: "broker",
+                    listener: broker_listener,
+                    handler: broker.clone(),
+                    tls: None,
+                },
+            ];
+            if let Some(tls_listen) = args.tls.tls_listen {
+                let (tls_listener, _) = bind_listener("broker-tls", tls_listen).await?;
+                servers.push(Server {
+                    name: "broker-tls",
+                    listener: tls_listener,
+                    handler: broker.clone(),
+                    tls: Some(args.tls.remoting_config(remoting::TlsMode::Enforced)?),
+                });
+            }
+            servers
+        },
         namesrv: Some(namesrv),
         broker: Some(broker),
         nameservers: vec![namesrv_address.to_string()],
@@ -644,10 +763,11 @@ async fn supervise(services: Services, mut signals: ShutdownSignals) -> Result<(
     for server in services.servers {
         let shutdown = shutdown.clone();
         tasks.spawn(async move {
-            (
-                server.name,
-                serve(server.listener, server.handler, shutdown).await,
-            )
+            let result = match server.tls {
+                Some(tls) => serve_tls(server.listener, server.handler, shutdown, tls).await,
+                None => serve(server.listener, server.handler, shutdown).await,
+            };
+            (server.name, result)
         });
     }
     let namesrv = services.namesrv;
@@ -1073,7 +1193,6 @@ mod tests {
             vec!["rocketmq", "broker", "--namesrv", "localhost:0"],
             vec!["rocketmq", "namesrv", "--broker-timeout-secs", "0"],
             vec!["rocketmq", "broker", "--ha-listen", "127.0.0.1:10912"],
-            vec!["rocketmq", "broker", "--acl-enable"],
             vec!["rocketmq", "admin", "broker-config"],
             vec![
                 "rocketmq",
@@ -1088,6 +1207,12 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args.clone()).is_err(), "{args:?}");
         }
+        let cli = Cli::try_parse_from(["rocketmq", "broker", "--acl-enable"])
+            .expect("--acl-enable is a boolean flag");
+        let Commands::Broker(args) = cli.command else {
+            panic!("expected broker");
+        };
+        assert!(args.acl_enable);
     }
 
     #[test]

@@ -89,6 +89,10 @@ pub struct ProxyConfig {
     /// or YAML). Loaded at startup when `enable_acl` is set; without it the
     /// proxy knows no users and rejects every request.
     pub acl_config_file: Option<String>,
+    /// Java `AuthConfig.innerClientAuthenticationCredentials` (`ak:sk`): when
+    /// set, every command forwarded to a broker is stamped with these
+    /// credentials so an ACL-enabled broker accepts proxy traffic.
+    pub inner_acl_credentials: Option<String>,
     pub enable_trace: bool,
     /// Producer group stamped on messages forwarded with `SEND_MESSAGE`.
     pub default_producer_group: String,
@@ -131,6 +135,7 @@ impl Default for ProxyConfig {
             local_serve_addr: String::new(),
             enable_acl: false,
             acl_config_file: None,
+            inner_acl_credentials: None,
             enable_trace: false,
             default_producer_group: "PID_DEFAULT".into(),
             forward_timeout_millis: 3_000,
@@ -1456,6 +1461,10 @@ pub struct ProxyBackend {
     nameservers: Vec<String>,
     timeout: Duration,
     cursor: AtomicUsize,
+    /// Java `AuthConfig.innerClientAuthenticationCredentials` (`ak:sk`): when
+    /// set, every broker-bound command is signed with them (see
+    /// [`ProxyBackend::apply_inner_credentials`]).
+    inner_credentials: Option<(String, String)>,
     /// Cached consumer-group configs, keyed by group name. Java keeps the same
     /// data in a Guava cache (`ClusterMetadataService.subscriptionGroupConfigCache`)
     /// so a client that re-reports its `Settings` does not re-query the broker.
@@ -1469,6 +1478,7 @@ impl Clone for ProxyBackend {
             nameservers: self.nameservers.clone(),
             timeout: self.timeout,
             cursor: AtomicUsize::new(self.cursor.load(Ordering::Relaxed)),
+            inner_credentials: self.inner_credentials.clone(),
             group_configs: Arc::clone(&self.group_configs),
         }
     }
@@ -1482,15 +1492,41 @@ impl ProxyBackend {
             nameservers,
             timeout,
             cursor: AtomicUsize::new(0),
+            inner_credentials: None,
             group_configs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn from_config(config: &ProxyConfig) -> Self {
-        Self::new(
+        let mut backend = Self::new(
             config.name_server_address.clone(),
             Duration::from_millis(config.forward_timeout_millis),
-        )
+        );
+        if let Some(credentials) = config
+            .inner_acl_credentials
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            match credentials.split_once(':') {
+                Some((ak, sk)) if !ak.is_empty() && !sk.is_empty() => {
+                    backend.inner_credentials = Some((ak.to_string(), sk.to_string()));
+                }
+                _ => warn!(
+                    value = %credentials,
+                    "innerAclCredentials must be `accessKey:secretKey`; ignoring"
+                ),
+            }
+        }
+        backend
+    }
+
+    /// Java: the proxy signs every broker-bound command with its inner client
+    /// credentials (`AclClientRPCHook` semantics) so an ACL-enabled broker
+    /// accepts forwarded traffic. A no-op when no credentials are configured.
+    fn apply_inner_credentials(&self, request: &mut Command) {
+        if let Some((access_key, secret)) = &self.inner_credentials {
+            auth::sign_remoting_command(request, access_key, secret);
+        }
     }
 
     /// Round-robin over namesrv addresses until one answers.
@@ -1705,7 +1741,10 @@ impl ProxyBackend {
             }
         }
         let addr = self.one_broker_addr(cluster).await.ok()?;
-        let request = Command::request(352).with_ext("group", group.to_string());
+        // ACL-enabled brokers reject unsigned broker queries; sign this one
+        // with the inner credentials like every other broker-bound command.
+        let mut request = Command::request(352).with_ext("group", group.to_string());
+        self.apply_inner_credentials(&mut request);
         let response = self
             .client
             .invoke(&addr, request, self.timeout)
@@ -1740,6 +1779,7 @@ impl ProxyBackend {
             request = request.with_ext(*key, value.clone());
         }
         request = request.with_body(body);
+        self.apply_inner_credentials(&mut request);
         self.invoke_broker_command(topic, request).await
     }
 
@@ -1759,6 +1799,7 @@ impl ProxyBackend {
             request = request.with_ext(*key, value.clone());
         }
         request = request.with_body(body);
+        self.apply_inner_credentials(&mut request);
         let addr = self.master_addr(topic).await?;
         self.client.invoke(&addr, request, timeout).await
     }
@@ -1778,6 +1819,7 @@ impl ProxyBackend {
             request = request.with_ext(*key, value.clone());
         }
         request = request.with_body(body);
+        self.apply_inner_credentials(&mut request);
         self.client.invoke(&addr, request, self.timeout).await
     }
 
@@ -1822,7 +1864,12 @@ impl ProxyBackend {
 
     /// Resolve the topic's master, then forward a fully built command over the
     /// pooled channel towards it.
-    pub async fn invoke_broker_command(&self, topic: &str, request: Command) -> Result<Command> {
+    pub async fn invoke_broker_command(
+        &self,
+        topic: &str,
+        mut request: Command,
+    ) -> Result<Command> {
+        self.apply_inner_credentials(&mut request);
         let addr = self.master_addr(topic).await?;
         self.client.invoke(&addr, request, self.timeout).await
     }
@@ -5091,6 +5138,19 @@ pub async fn serve_proxy(
     context: Arc<ProxyContext>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    serve_proxy_tls(listener, context, shutdown, None).await
+}
+
+/// [`serve_proxy`] with an optional TLS layer on the gRPC listener
+/// (Java `GrpcServerBuilder` with `TlsContext`). The certificate/key come from
+/// the remoting-side `TlsConfig` (`serverCertPath`/`serverKeyPath`); the same
+/// `rustls` stack backs both the remoting and gRPC listeners.
+pub async fn serve_proxy_tls(
+    listener: tokio::net::TcpListener,
+    context: Arc<ProxyContext>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls: Option<remoting::TlsConfig>,
+) -> Result<()> {
     context.config.validate()?;
     // ACL bootstrap: load the plain-ACL accounts into the shared metadata
     // providers before any request can arrive (Java wires the AuthMigrator at
@@ -5120,8 +5180,37 @@ pub async fn serve_proxy(
         MessagingProcessor::new(Arc::clone(&context)),
     );
     let admin = pb::admin_server::AdminServer::new(AdminProcessor::new(Arc::clone(&context)));
-    info!(addr = %listener.local_addr()?, "grpc proxy listening");
-    tonic::transport::Server::builder()
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(tls) = &tls {
+        if tls.mode == remoting::TlsMode::Disabled {
+            return Err(Error::Invalid(
+                "proxy TLS listener requires tls.mode != disabled".into(),
+            ));
+        }
+        // rustls 0.23 requires a process-level CryptoProvider for the builder
+        // tonic uses internally; `ring` matches the remoting TLS stack.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = std::fs::read_to_string(
+            tls.server_cert_path
+                .as_deref()
+                .ok_or_else(|| Error::Invalid("proxy TLS requires server_cert_path".into()))?,
+        )?;
+        let key = std::fs::read_to_string(
+            tls.server_key_path
+                .as_deref()
+                .ok_or_else(|| Error::Invalid("proxy TLS requires server_key_path".into()))?,
+        )?;
+        builder = builder
+            .tls_config(
+                tonic::transport::server::ServerTlsConfig::new()
+                    .identity(tonic::transport::Identity::from_pem(cert, key)),
+            )
+            .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+        info!(addr = %listener.local_addr()?, "grpc proxy listening over TLS");
+    } else {
+        info!(addr = %listener.local_addr()?, "grpc proxy listening");
+    }
+    builder
         .add_service(messaging)
         .add_service(admin)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
