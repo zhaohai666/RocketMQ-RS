@@ -11,6 +11,7 @@ use serde_json::json;
 use tokio::sync::{Notify, watch};
 use tracing::warn;
 
+use crate::auth;
 use crate::common;
 use crate::common::{
     Error, LMQ_QUEUE_ID, Message, PROPERTY_INNER_MULTI_DISPATCH, PROPERTY_LITE_TOPIC, Result,
@@ -96,6 +97,12 @@ pub struct BrokerConfig {
     pub timer_wheel_enable: bool,
     /// `BrokerConfig.recallMessageEnable`
     pub recall_message_enable: bool,
+    /// `authConfig.authenticationEnabled` + `authorizationEnabled`: reject
+    /// requests that fail plain-ACL signature verification.
+    pub enable_acl: bool,
+    /// Path of the legacy plain-ACL accounts file (Java `plain_acl.yml`;
+    /// JSON or YAML). Loaded via [`Broker::load_acl_accounts`] at startup.
+    pub acl_config_file: Option<String>,
 }
 
 impl Default for BrokerConfig {
@@ -112,6 +119,8 @@ impl Default for BrokerConfig {
             message_delay_level: schedule::DEFAULT_DELAY_LEVELS.into(),
             timer_wheel_enable: true,
             recall_message_enable: false,
+            enable_acl: false,
+            acl_config_file: None,
         }
     }
 }
@@ -421,9 +430,77 @@ struct WheelEntry {
     enqueue_ms: i64,
 }
 
+/// ACL engine wired into the broker's request path (Java: the broker's
+/// `AccessValidator` + `PlainAccessValidator`). Authentication always rejects
+/// commands whose `AccessKey`/`Signature` ext fields do not verify against a
+/// registered user; authorization additionally evaluates the caller's ACL.
+struct BrokerAcl {
+    authentication: Arc<auth::DefaultAuthenticationProvider>,
+    authorization: Arc<auth::DefaultAuthorizationProvider>,
+    authorization_enabled: bool,
+    auth_metadata: Arc<auth::LocalAuthenticationMetadataProvider>,
+    acl_metadata: Arc<auth::LocalAuthorizationMetadataProvider>,
+    acl_config_file: Option<String>,
+}
+
+impl BrokerAcl {
+    fn new(config: &BrokerConfig) -> Self {
+        let auth_metadata = auth::LocalAuthenticationMetadataProvider::new();
+        let acl_metadata = auth::LocalAuthorizationMetadataProvider::new();
+        let auth_config = auth::AuthConfig {
+            authentication_enabled: true,
+            ..auth::AuthConfig::default()
+        };
+        let authorization_config = auth::AuthConfig {
+            authorization_enabled: true,
+            ..auth::AuthConfig::default()
+        };
+        Self {
+            authentication: auth::DefaultAuthenticationProvider::new(
+                auth_config,
+                Arc::clone(&auth_metadata),
+            ),
+            authorization: auth::DefaultAuthorizationProvider::new(
+                authorization_config,
+                Arc::clone(&auth_metadata),
+                Arc::clone(&acl_metadata),
+            ),
+            authorization_enabled: true,
+            auth_metadata,
+            acl_metadata,
+            acl_config_file: config.acl_config_file.clone(),
+        }
+    }
+
+    /// Startup bootstrap: load the plain-ACL accounts into the metadata
+    /// providers. Returns the number of accounts loaded.
+    async fn load_accounts(&self) -> Result<usize> {
+        let Some(path) = self.acl_config_file.as_deref() else {
+            return Ok(0);
+        };
+        auth::bootstrap_plain_acl(&self.auth_metadata, &self.acl_metadata, path).await
+    }
+
+    /// Gate one inbound command: signature authentication first, then (when
+    /// the caller carries an access key) the authorization policy chain.
+    async fn check(&self, command: &Command) -> Result<()> {
+        self.authentication.authenticate_command(command).await?;
+        if self.authorization_enabled {
+            for ctx in self.authorization.build_contexts(command, "")? {
+                self.authorization.authorize(&ctx).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct Broker {
     store: Arc<Store>,
     config: BrokerConfig,
+    /// ACL engine: present only when `enable_acl` is set. Verifies every
+    /// inbound remoting command's signature and (when enabled) evaluates the
+    /// caller's authorization policy, like Java's `AccessValidator` hook.
+    acl: Option<BrokerAcl>,
     /// `consumerTable`: group -> subscription/connection state (Java `ConsumerManager`).
     groups: Mutex<BTreeMap<String, GroupInfo>>,
     /// peer (TCP) -> client id, so `disconnected` can drop the channel marker.
@@ -625,9 +702,15 @@ impl Broker {
         let (messages, _) = watch::channel(0);
         let mut filters = FilterRegistry::default();
         filters.hydrate(&store)?;
+        let acl = if config.enable_acl {
+            Some(BrokerAcl::new(&config))
+        } else {
+            None
+        };
         Ok(Self {
             store,
             config,
+            acl,
             groups: Mutex::new(BTreeMap::new()),
             peer_channels: Mutex::new(BTreeMap::new()),
             filters: Mutex::new(filters),
@@ -657,6 +740,26 @@ impl Broker {
     }
     pub fn config(&self) -> &BrokerConfig {
         &self.config
+    }
+
+    /// Startup bootstrap: when ACL is enabled and `aclConfigFile` is set, load
+    /// the plain-ACL accounts into the broker's metadata providers (Java
+    /// `AuthMigrator` at broker startup). Returns the account count (0 when
+    /// ACL is disabled or no file is configured).
+    pub async fn load_acl_accounts(&self) -> Result<usize> {
+        match &self.acl {
+            Some(acl) => {
+                let accounts = acl.load_accounts().await?;
+                if accounts == 0 {
+                    tracing::warn!(
+                        "broker ACL is enabled but no aclConfigFile is set; \
+                         every request will be rejected until users are registered"
+                    );
+                }
+                Ok(accounts)
+            }
+            None => Ok(0),
+        }
     }
 
     pub fn registration(&self) -> Result<Command> {
@@ -2886,6 +2989,15 @@ impl Broker {
     }
 
     async fn process(&self, request: &Command, peer: SocketAddr) -> BrokerResult<Command> {
+        // Java `AccessValidator`: every command is authenticated (and, with an
+        // access key present, authorized) before its processor runs. A failure
+        // surfaces as SYSTEM_ERROR with the auth error as the remark, matching
+        // the Java broker's generic exception answer.
+        if let Some(acl) = &self.acl {
+            if let Err(error) = acl.check(request).await {
+                return Err(Failure::new(1, error.to_string()));
+            }
+        }
         match request.code {
             10 | 310 | 320 => self.send(request, peer).await,
             11 | 361 => self.pull(request).await,

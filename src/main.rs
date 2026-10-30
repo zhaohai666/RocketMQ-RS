@@ -99,6 +99,13 @@ struct BrokerArgs {
     /// BrokerConfig.recallMessageEnable
     #[arg(long, default_value_t = false, action = ArgAction::Set)]
     recall_message_enable: bool,
+    /// Reject commands whose AccessKey/Signature do not verify against the
+    /// loaded ACL accounts (BrokerConfig.enableAcl).
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    acl_enable: bool,
+    /// Path of the plain-ACL accounts file (Java `plain_acl.yml`; JSON or YAML).
+    #[arg(long)]
+    acl_config: Option<PathBuf>,
     /// Optional additional broker listener; no automatic VIP port is opened.
     #[arg(long)]
     vip_listen: Option<SocketAddr>,
@@ -124,6 +131,13 @@ struct StandaloneArgs {
     /// BrokerConfig.recallMessageEnable
     #[arg(long, default_value_t = false, action = ArgAction::Set)]
     recall_message_enable: bool,
+    /// Reject commands whose AccessKey/Signature do not verify against the
+    /// loaded ACL accounts (BrokerConfig.enableAcl).
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    acl_enable: bool,
+    /// Path of the plain-ACL accounts file (Java `plain_acl.yml`; JSON or YAML).
+    #[arg(long)]
+    acl_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -142,6 +156,12 @@ struct ProxyArgs {
     /// NameServer host:port addresses; repeat this flag or separate with ';'.
     #[arg(long, value_delimiter = ';', action = ArgAction::Append, value_parser = parse_endpoint)]
     namesrv: Vec<String>,
+    /// Enable plain-ACL signature verification on the gRPC path.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    acl_enable: bool,
+    /// Path of the plain-ACL accounts file (Java `plain_acl.yml`; JSON or YAML).
+    #[arg(long)]
+    acl_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -342,6 +362,11 @@ async fn run_proxy(args: ProxyArgs, mut signals: ShutdownSignals) -> Result<()> 
     if !args.namesrv.is_empty() {
         config.name_server_address = args.namesrv.clone();
     }
+    config.enable_acl = args.acl_enable;
+    config.acl_config_file = args
+        .acl_config
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
     config.validate()?;
     if config.name_server_address.is_empty() {
         warn!("proxy has no nameserver address; route queries will fail until one is configured");
@@ -453,8 +478,18 @@ async fn prepare_broker(args: BrokerArgs) -> Result<Services> {
             message_delay_level: args.message_delay_level,
             timer_wheel_enable: args.timer_wheel_enable,
             recall_message_enable: args.recall_message_enable,
+            enable_acl: args.acl_enable,
+            acl_config_file: args
+                .acl_config
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
         },
     )?);
+    // ACL bootstrap before any request can arrive.
+    let accounts = broker.load_acl_accounts().await?;
+    if accounts > 0 {
+        info!(accounts, "plain ACL accounts loaded");
+    }
     info!(advertise = %advertised_addr, "Broker bound; NameServer registration is pending");
     let mut servers = vec![Server {
         name: "broker",
@@ -497,9 +532,16 @@ async fn prepare_standalone(args: StandaloneArgs) -> Result<Services> {
             enable_property_filter: args.enable_property_filter,
             timer_wheel_enable: args.timer_wheel_enable,
             recall_message_enable: args.recall_message_enable,
+            enable_acl: args.acl_enable,
+            acl_config_file: args
+                .acl_config
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
             ..BrokerConfig::default()
         },
     )?);
+    // ACL bootstrap before any request can arrive.
+    broker.load_acl_accounts().await?;
     info!(
         namesrv = %namesrv_address,
         advertise = %broker_address,

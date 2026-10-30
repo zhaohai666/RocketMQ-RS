@@ -83,6 +83,10 @@ pub struct InnerBrokerSpec {
     pub timer_wheel_enable: bool,
     #[serde(default = "default_false")]
     pub recall_message_enable: bool,
+    #[serde(default = "default_false")]
+    pub enable_acl: bool,
+    #[serde(default)]
+    pub acl_config_file: Option<String>,
 }
 
 impl InnerBrokerSpec {
@@ -99,6 +103,8 @@ impl InnerBrokerSpec {
             message_delay_level: self.message_delay_level.clone(),
             timer_wheel_enable: self.timer_wheel_enable,
             recall_message_enable: self.recall_message_enable,
+            enable_acl: self.enable_acl,
+            acl_config_file: self.acl_config_file.clone(),
         }
     }
 }
@@ -188,6 +194,14 @@ impl BrokerContainer {
     /// [`BrokerContainer::wait`] to block until shutdown.
     pub async fn start(&mut self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         for controller in &self.controllers {
+            // ACL bootstrap before the listener can accept any request.
+            let accounts = controller.broker.load_acl_accounts().await?;
+            if accounts > 0 {
+                info!(
+                    broker = controller.broker_name(),
+                    accounts, "plain ACL accounts loaded"
+                );
+            }
             let listener = TcpListener::bind(controller.listen)
                 .await
                 .map_err(|error| {

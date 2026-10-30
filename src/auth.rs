@@ -2505,6 +2505,56 @@ impl AuthMigrator {
     }
 }
 
+/// Load a legacy plain-ACL accounts file (Java `plain_acl.yml`). Both the
+/// top-level single-account form and the `accounts:` list form are accepted,
+/// and the file may be YAML (`.yml`/`.yaml`) or JSON (any other extension).
+/// Field names follow Java's `PlainAccessConfig` (camelCase).
+pub fn load_plain_acl(path: &str) -> Result<Vec<PlainAccessConfig>> {
+    let raw = std::fs::read_to_string(path)?;
+    let lower = path.to_ascii_lowercase();
+    let value: serde_json::Value = if lower.ends_with(".yml") || lower.ends_with(".yaml") {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw)
+            .map_err(|error| Error::Invalid(format!("invalid plain ACL YAML: {error}")))?;
+        serde_json::to_value(yaml)
+            .map_err(|error| Error::Invalid(format!("invalid plain ACL YAML: {error}")))?
+    } else {
+        serde_json::from_str(&raw)
+            .map_err(|error| Error::Invalid(format!("invalid plain ACL JSON: {error}")))?
+    };
+
+    if let Some(accounts) = value.get("accounts") {
+        let accounts: Vec<PlainAccessConfig> = serde_json::from_value(accounts.clone())
+            .map_err(|error| Error::Invalid(format!("invalid plain ACL accounts: {error}")))?;
+        if accounts.is_empty() {
+            return Err(Error::Invalid("plain ACL file has no accounts".into()));
+        }
+        return Ok(accounts);
+    }
+    // Top-level single-account form (Java: AclUtils.getYamlDataObject fallback).
+    let account: PlainAccessConfig = serde_json::from_value(value)
+        .map_err(|error| Error::Invalid(format!("invalid plain ACL account: {error}")))?;
+    if account.access_key.is_empty() {
+        return Err(Error::Invalid("plain ACL file has no accessKey".into()));
+    }
+    Ok(vec![account])
+}
+
+/// Startup bootstrap: load a plain-ACL accounts file and migrate every account
+/// into the authentication/authorization metadata providers (Java runs the
+/// `AuthMigrator` against the loaded accounts when the server starts with ACL
+/// enabled). Returns the number of accounts in the file.
+pub async fn bootstrap_plain_acl(
+    auth_metadata: &Arc<LocalAuthenticationMetadataProvider>,
+    acl_metadata: &Arc<LocalAuthorizationMetadataProvider>,
+    path: &str,
+) -> Result<usize> {
+    let accounts = load_plain_acl(path)?;
+    AuthMigrator::new(auth_metadata.clone(), acl_metadata.clone())
+        .migrate(&accounts)
+        .await?;
+    Ok(accounts.len())
+}
+
 fn parse_perm_pair(raw: &str) -> Option<(String, String)> {
     let mut parts = raw.splitn(2, EQUAL);
     let name = parts.next()?.trim().to_string();

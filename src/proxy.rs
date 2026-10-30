@@ -85,6 +85,10 @@ pub struct ProxyConfig {
     pub proxy_name: String,
     pub local_serve_addr: String,
     pub enable_acl: bool,
+    /// Path of the legacy plain-ACL accounts file (Java `plain_acl.yml`; JSON
+    /// or YAML). Loaded at startup when `enable_acl` is set; without it the
+    /// proxy knows no users and rejects every request.
+    pub acl_config_file: Option<String>,
     pub enable_trace: bool,
     /// Producer group stamped on messages forwarded with `SEND_MESSAGE`.
     pub default_producer_group: String,
@@ -126,6 +130,7 @@ impl Default for ProxyConfig {
             proxy_name: "DefaultProxy".into(),
             local_serve_addr: String::new(),
             enable_acl: false,
+            acl_config_file: None,
             enable_trace: false,
             default_producer_group: "PID_DEFAULT".into(),
             forward_timeout_millis: 3_000,
@@ -179,6 +184,11 @@ pub struct ProxyContext {
     /// balancing, server→client telemetry command dispatch and admin subscription
     /// introspection.
     pub(crate) clients: Arc<ClientRegistry>,
+    /// Shared authentication/authorization metadata (users + ACLs). Populated at
+    /// startup from `acl_config_file`; every `AclGuard` clone verifies against
+    /// the same table so registered users survive across connections.
+    pub(crate) auth_metadata: Arc<auth::LocalAuthenticationMetadataProvider>,
+    pub(crate) acl_metadata: Arc<auth::LocalAuthorizationMetadataProvider>,
     started_at: Instant,
     send_ops: AtomicU64,
     receive_ops: AtomicU64,
@@ -196,6 +206,8 @@ impl ProxyContext {
             config,
             grpc_listen_addr: grpc_listen_addr.to_string(),
             clients: Arc::new(ClientRegistry::default()),
+            auth_metadata: auth::LocalAuthenticationMetadataProvider::new(),
+            acl_metadata: auth::LocalAuthorizationMetadataProvider::new(),
             started_at: Instant::now(),
             send_ops: AtomicU64::new(0),
             receive_ops: AtomicU64::new(0),
@@ -2265,17 +2277,15 @@ fn decode_query_frame(body: &[u8]) -> Result<Vec<common::Message>> {
 // ---------------------------------------------------------------------------
 
 /// gRPC ACL guard for `MessagingProcessor`. Java authenticates gRPC clients by
-/// parsing the `Authorization` metadata — `MQv2 HMAC-SHA1 Credential=<ak>, ...,
-/// Signature=<base64>` — and verifying the signature over the canonical signed
-/// content with the user's secret key via `auth::cal_signature`.
+/// parsing the `Authorization` metadata — `MQv2-HMAC-SHA1 Credential=<ak>,
+/// SignedHeaders=x-mq-date-time, Signature=<hex>` — and verifying, with the
+/// user's secret key, `HMAC-SHA1` over the **`x-mq-date-time` header bytes**
+/// (Java `DefaultAuthenticationContextBuilder.build`: `context.setContent(
+/// datetime.getBytes(UTF_8))`). The wire signature is hex-encoded; the server
+/// converts it to Base64 (`hexToBase64`) before the constant-time comparison.
 ///
-/// Adaptation note: the canonical gRPC signing content (all signed metadata values
-/// plus the length-prefixed request body, per `DefaultAuthenticationContextBuilder`)
-/// cannot be reconstructed from tonic's decoded requests, so the guard verifies the
-/// signature over the **empty byte string**. Clients must sign `b""` with
-/// HMAC-SHA1/Base64 (`auth::cal_signature`); user lookup, disable-status checks and
-/// the signature algorithm stay fully inside `crate::auth`, which this module does
-/// not modify.
+/// Tolerance: a signature that is not valid hex is compared as-is, so clients
+/// that sign the datetime and emit Base64 directly also pass.
 #[derive(Clone)]
 struct AclGuard {
     enabled: bool,
@@ -2283,11 +2293,22 @@ struct AclGuard {
 }
 
 impl AclGuard {
-    fn from_config(config: &ProxyConfig) -> Self {
+    /// Build a guard from the proxy context: shares the startup-bootstrapped
+    /// user table so `bootstrap_plain_acl` accounts are visible here.
+    fn from_context(context: &ProxyContext) -> Self {
         Self {
-            enabled: config.enable_acl,
-            metadata: auth::LocalAuthenticationMetadataProvider::new(),
+            enabled: context.config.enable_acl,
+            metadata: Arc::clone(&context.auth_metadata),
         }
+    }
+
+    /// Test/construction helper: an isolated guard over one provider.
+    #[cfg(test)]
+    fn with_metadata(
+        enabled: bool,
+        metadata: Arc<auth::LocalAuthenticationMetadataProvider>,
+    ) -> Self {
+        Self { enabled, metadata }
     }
 
     /// Register a user so its signatures can be verified (mirrors Java's
@@ -2302,6 +2323,9 @@ impl AclGuard {
     /// Extract `Credential`/`Signature` tokens from an `Authorization` header.
     /// Tokens are comma/space separated `Key=Value` pairs with case-insensitive
     /// keys (tolerates both `Credential=` and Java's `AccessKey=` spellings).
+    /// A `Credential` may carry the datetime suffix Java clients append
+    /// (`Credential=<user>/<datetime>`); only the part before the `/` names
+    /// the user.
     fn parse_authorization(header: &str) -> Option<(String, String)> {
         let mut access_key = None;
         let mut signature = None;
@@ -2310,14 +2334,18 @@ impl AclGuard {
             if token.is_empty() {
                 continue;
             }
-            // Tokens without `=` (scheme prefixes like "MQv2 HMAC-SHA1") are skipped;
+            // Tokens without `=` (scheme prefixes like "MQv2-HMAC-SHA1") are skipped;
             // a signature value's own `==` padding survives split_once (first `=` only).
             let Some((key, value)) = token.split_once('=') else {
                 continue;
             };
+            let value = value.trim();
             match key.trim().to_ascii_lowercase().as_str() {
-                "credential" | "accesskey" => access_key = Some(value.trim().to_string()),
-                "signature" => signature = Some(value.trim().to_string()),
+                "credential" | "accesskey" => {
+                    let user = value.split('/').next().unwrap_or(value);
+                    access_key = Some(user.to_string());
+                }
+                "signature" => signature = Some(value.to_string()),
                 _ => {}
             }
         }
@@ -2350,7 +2378,8 @@ impl AclGuard {
             return Ok(());
         }
         let header = Self::authorization_metadata(request);
-        self.check_header(header, rpc_code).await
+        let datetime = Self::datetime_metadata(request);
+        self.check_header(header, datetime, rpc_code).await
     }
 
     /// Pull the `Authorization` metadata out of a request synchronously, as an
@@ -2363,12 +2392,23 @@ impl AclGuard {
             .map(ToOwned::to_owned)
     }
 
+    /// Java `GrpcConstants.DATE_TIME` (`x-mq-date-time`): the signed datetime
+    /// whose raw bytes form the canonical gRPC signing content.
+    fn datetime_metadata<T>(request: &Request<T>) -> Option<String> {
+        request
+            .metadata()
+            .get(auth::grpc_header::DATE_TIME)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+    }
+
     /// Verify an owned Authorization header. Unlike [`AclGuard::check_access`] this
     /// is safe to await from handlers of `Streaming` requests, whose `&Request`
-    /// handles are not `Sync` (the future only carries the owned `Option<String>`).
+    /// handles are not `Sync` (the future only carries the owned `Option<String>`s).
     async fn check_header(
         &self,
         header: Option<String>,
+        datetime: Option<String>,
         rpc_code: &str,
     ) -> std::result::Result<(), Status> {
         if !self.enabled {
@@ -2383,6 +2423,12 @@ impl AclGuard {
                 "Authorization must carry Credential=<accessKey> and Signature=<signature>",
             )
         })?;
+        // Java: an Authorization header without `x-mq-date-time` fails the
+        // context build with "datetime is null."
+        let datetime = datetime
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| Status::unauthenticated("datetime is null"))?;
         let user = self
             .metadata
             .get_user(&access_key)
@@ -2395,8 +2441,15 @@ impl AclGuard {
             )));
         }
         let secret = user.password.as_deref().unwrap_or("");
-        let expected = auth::cal_signature(&[], secret);
-        if !Self::signature_matches(&expected, &signature) {
+        // Java signs the raw datetime bytes and emits the signature hex-encoded;
+        // the server hex-decodes + Base64-encodes before comparing. A non-hex
+        // signature is compared as-is, so Base64 signers stay welcome.
+        let expected = auth::cal_signature(datetime.as_bytes(), secret);
+        let actual = match auth::hex_to_base64(&signature) {
+            Ok(converted) => converted,
+            Err(_) => signature.clone(),
+        };
+        if !Self::signature_matches(&expected, &actual) {
             return Err(Status::unauthenticated("check signature failed"));
         }
         Ok(())
@@ -2451,7 +2504,7 @@ pub struct MessagingProcessor {
 impl MessagingProcessor {
     pub fn new(context: Arc<ProxyContext>) -> Self {
         let backend = ProxyBackend::from_config(&context.config);
-        let acl = AclGuard::from_config(&context.config);
+        let acl = AclGuard::from_context(&context);
         Self {
             context,
             backend,
@@ -3767,7 +3820,10 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         // `Settings`, and keep the registry in sync from the client's `Settings`.
         // `Streaming` bodies are not `Sync`, so the id is taken from the owned header.
         let authorization = AclGuard::authorization_metadata(&request);
-        self.acl.check_header(authorization, "Telemetry").await?;
+        let datetime = AclGuard::datetime_metadata(&request);
+        self.acl
+            .check_header(authorization, datetime, "Telemetry")
+            .await?;
         let client_id = client_id_of(&request).unwrap_or_default();
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel::<std::result::Result<pb::TelemetryCommand, Status>>(16);
@@ -5036,6 +5092,24 @@ pub async fn serve_proxy(
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     context.config.validate()?;
+    // ACL bootstrap: load the plain-ACL accounts into the shared metadata
+    // providers before any request can arrive (Java wires the AuthMigrator at
+    // startup). Without a accounts file an enabled proxy still rejects every
+    // request — it simply has no users to authenticate against.
+    if context.config.enable_acl {
+        match &context.config.acl_config_file {
+            Some(path) => {
+                let accounts =
+                    auth::bootstrap_plain_acl(&context.auth_metadata, &context.acl_metadata, path)
+                        .await?;
+                info!(path, accounts, "plain ACL accounts loaded");
+            }
+            None => warn!(
+                "proxy ACL is enabled but no aclConfigFile is set; \
+                 every request will be rejected until users are registered"
+            ),
+        }
+    }
     // Background orphaned-transaction recovery: re-issues RecoverOrphanedTransactionCommand
     // to producer clients over their telemetry streams (Java `TransactionalMessageCheckService`).
     tokio::spawn(run_transaction_recovery(Arc::clone(&context)));
@@ -5088,7 +5162,7 @@ struct RemotingFrontProcessor {
 impl RemotingFrontProcessor {
     fn new(context: Arc<ProxyContext>) -> Self {
         let backend = ProxyBackend::from_config(&context.config);
-        let acl = AclGuard::from_config(&context.config);
+        let acl = AclGuard::from_context(&context);
         Self {
             context,
             backend,
@@ -5465,28 +5539,39 @@ mod tests {
         let parsed = AclGuard::parse_authorization("AccessKey=ak,Signature=sig").unwrap();
         assert_eq!(parsed.0, "ak");
         assert_eq!(parsed.1, "sig");
+        // Java clients may suffix the credential with the datetime; only the
+        // part before the `/` names the user.
+        let parsed =
+            AclGuard::parse_authorization("Credential=alice/20231227T194619Z,Signature=ab")
+                .unwrap();
+        assert_eq!(parsed.0, "alice");
         assert!(AclGuard::parse_authorization("Credential=only-key").is_none());
     }
 
     #[tokio::test]
     async fn acl_signature_verification_roundtrip() {
-        let mut config = ProxyConfig::default();
-        config.enable_acl = true;
-        let guard = AclGuard::from_config(&config);
+        let guard = AclGuard::with_metadata(true, auth::LocalAuthenticationMetadataProvider::new());
         guard.register_user("alice", "secret-1").await.unwrap();
-        // Signature over the empty content (the guard's signing contract).
-        let signature = auth::cal_signature(&[], "secret-1");
-        let header = format!("Credential=alice, Signature={signature}");
-        assert!(AclGuard::parse_authorization(&header).is_some());
+        // Java wire form: the datetime header bytes are signed and the
+        // signature is hex-encoded; the guard converts hex -> Base64.
+        let datetime = "20231227T194619Z";
+        let expected = auth::cal_signature(datetime.as_bytes(), "secret-1");
+        let header = format!(
+            "MQv2-HMAC-SHA1 Credential=alice/20231227T194619Z, \
+             SignedHeaders=x-mq-date-time, Signature={}",
+            auth::sign_v2_hex(datetime.as_bytes(), "secret-1")
+        );
         let (access_key, parsed_signature) = AclGuard::parse_authorization(&header).unwrap();
-        let user = guard.metadata.get_user(&access_key).await.unwrap().unwrap();
-        let expected = auth::cal_signature(&[], user.password.as_deref().unwrap_or(""));
-        assert!(AclGuard::signature_matches(&expected, &parsed_signature));
+        assert_eq!(access_key, "alice");
+        assert_eq!(parsed_signature.len(), 40); // hex form on the wire
+        let converted = auth::hex_to_base64(&parsed_signature).unwrap();
+        assert!(AclGuard::signature_matches(&expected, &converted));
+        // A Base64 signature over the same content is equally accepted.
+        assert!(AclGuard::signature_matches(&expected, &expected));
         // Wrong secret must not match.
-        let wrong = auth::cal_signature(&[], "other-secret");
+        let wrong = auth::cal_signature(datetime.as_bytes(), "other-secret");
         assert!(!AclGuard::signature_matches(&expected, &wrong));
-        // Disabled guard passes everything (verify via check_access plumbing).
-        let off = AclGuard::from_config(&ProxyConfig::default());
+        let off = AclGuard::with_metadata(false, auth::LocalAuthenticationMetadataProvider::new());
         assert!(!off.enabled);
     }
 }
