@@ -138,14 +138,14 @@ async fn wait_for_signal() {
     tokio::pin!(ctrl_c);
     #[cfg(unix)]
     {
-        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            Ok(term) => term,
-            Err(_) => {
-                let _ = ctrl_c.await;
-                return;
-            }
-        };
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(term) => term,
+                Err(_) => {
+                    let _ = ctrl_c.await;
+                    return;
+                }
+            };
         tokio::select! {
             _ = &mut ctrl_c => {}
             _ = term.recv() => {}
@@ -208,7 +208,10 @@ mod tests {
     #[test]
     fn md5_matches_known_vector_and_is_stable() {
         // MD5("abc") = 900150983cd24fb0d6963f7d28e17f72
-        assert_eq!(format!("{:x}", md5::compute(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            format!("{:x}", md5::compute(b"abc")),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("watch.txt");
         {
@@ -257,9 +260,6 @@ mod tests {
             ServerUtil::parse_namesrv_addrs("  a:1 ; ; b:2 "),
             vec!["a:1", "b:2"]
         );
-        assert_eq!(
-            ServerUtil::parse_namesrv_addrs(""),
-            vec!["127.0.0.1:9876"]
-        );
+        assert_eq!(ServerUtil::parse_namesrv_addrs(""), vec!["127.0.0.1:9876"]);
     }
 }

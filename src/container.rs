@@ -188,16 +188,18 @@ impl BrokerContainer {
     /// [`BrokerContainer::wait`] to block until shutdown.
     pub async fn start(&mut self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         for controller in &self.controllers {
-            let listener = TcpListener::bind(controller.listen).await.map_err(|error| {
-                Error::Io(std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "cannot bind inner broker {} to {}: {error}",
-                        controller.broker_name(),
-                        controller.listen
-                    ),
-                ))
-            })?;
+            let listener = TcpListener::bind(controller.listen)
+                .await
+                .map_err(|error| {
+                    Error::Io(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot bind inner broker {} to {}: {error}",
+                            controller.broker_name(),
+                            controller.listen
+                        ),
+                    ))
+                })?;
             let actual = listener.local_addr()?;
             info!(
                 broker = controller.broker_name(),
@@ -372,7 +374,10 @@ async fn drain(
     }
 }
 
-async fn expiry_maintenance(broker: Arc<Broker>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+async fn expiry_maintenance(
+    broker: Arc<Broker>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let mut interval = time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {

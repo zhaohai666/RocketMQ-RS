@@ -184,8 +184,8 @@ type HmacSha1 = Hmac<Sha1>;
 
 /// Compute the RocketMQ request signature: HMAC-SHA1 over `data` with `key`, Base64 encoded.
 pub fn cal_signature(data: &[u8], key: &str) -> String {
-    let mut mac = HmacSha1::new_from_slice(key.as_bytes())
-        .expect("HMAC accepts keys of any length");
+    let mut mac =
+        HmacSha1::new_from_slice(key.as_bytes()).expect("HMAC accepts keys of any length");
     mac.update(data);
     let result = mac.finalize();
     base64_encode(&result.into_bytes())
@@ -232,17 +232,20 @@ pub mod grpc_header {
 pub fn hex_decode(input: &str) -> Result<Vec<u8>> {
     let hex = input.trim();
     if hex.len() % 2 != 0 {
-        return Err(Error::Invalid(format!("odd hex string length: {}", hex.len())));
+        return Err(Error::Invalid(format!(
+            "odd hex string length: {}",
+            hex.len()
+        )));
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
     let bytes = hex.as_bytes();
     for pair in bytes.chunks(2) {
-        let hi = (pair[0] as char).to_digit(16).ok_or_else(|| {
-            Error::Invalid(format!("invalid hex char: {}", pair[0] as char))
-        })?;
-        let lo = (pair[1] as char).to_digit(16).ok_or_else(|| {
-            Error::Invalid(format!("invalid hex char: {}", pair[1] as char))
-        })?;
+        let hi = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| Error::Invalid(format!("invalid hex char: {}", pair[0] as char)))?;
+        let lo = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| Error::Invalid(format!("invalid hex char: {}", pair[1] as char)))?;
         out.push(((hi << 4) | lo) as u8);
     }
     Ok(out)
@@ -274,8 +277,8 @@ pub fn sign_v2(data: &[u8], key: &str) -> String {
 /// Hex-encoded form of the v2 signature (what goes into the `Signature=`
 /// item of the `Authorization` header).
 pub fn sign_v2_hex(data: &[u8], key: &str) -> String {
-    let mut mac = HmacSha1::new_from_slice(key.as_bytes())
-        .expect("HMAC accepts keys of any length");
+    let mut mac =
+        HmacSha1::new_from_slice(key.as_bytes()).expect("HMAC accepts keys of any length");
     mac.update(data);
     hex_encode(&mac.finalize().into_bytes())
 }
@@ -778,7 +781,11 @@ impl Resource {
         } else {
             name.to_string()
         };
-        Self::of(ResourceType::Group, Some(stripped), ResourcePattern::Literal)
+        Self::of(
+            ResourceType::Group,
+            Some(stripped),
+            ResourcePattern::Literal,
+        )
     }
 
     pub fn of_any(any_type: ResourceType) -> Self {
@@ -814,7 +821,9 @@ impl Resource {
         match self.resource_type {
             ResourceType::Any => ASTERISK.to_string(),
             _ => match self.resource_pattern {
-                ResourcePattern::Any => format!("{}{}{}", self.resource_type.name(), COLON, ASTERISK),
+                ResourcePattern::Any => {
+                    format!("{}{}{}", self.resource_type.name(), COLON, ASTERISK)
+                }
                 ResourcePattern::Literal => format!(
                     "{}{}{}",
                     self.resource_type.name(),
@@ -843,12 +852,10 @@ impl Resource {
         let other_name = other.resource_name.as_deref().unwrap_or("");
         match self.resource_pattern {
             ResourcePattern::Any => true,
-            ResourcePattern::Literal => {
-                self.resource_name.as_deref().unwrap_or("") == other_name
+            ResourcePattern::Literal => self.resource_name.as_deref().unwrap_or("") == other_name,
+            ResourcePattern::Prefixed => {
+                other_name.starts_with(self.resource_name.as_deref().unwrap_or(""))
             }
-            ResourcePattern::Prefixed => other_name.starts_with(
-                self.resource_name.as_deref().unwrap_or(""),
-            ),
         }
     }
 }
@@ -887,7 +894,9 @@ impl Environment {
             Some(t) => t,
             None => return false,
         };
-        self.source_ips.iter().any(|src| is_ip_in_range(target, src))
+        self.source_ips
+            .iter()
+            .any(|src| is_ip_in_range(target, src))
     }
 }
 
@@ -1025,19 +1034,27 @@ impl Acl {
         environment: Option<Environment>,
         decision: Decision,
     ) -> Self {
-        let policy = Policy::of_resources(PolicyType::Custom, resources, actions, environment, decision);
+        let policy = Policy::of_resources(
+            PolicyType::Custom,
+            resources,
+            actions,
+            environment,
+            decision,
+        );
         Self::of(subject, vec![policy])
     }
 
     pub fn get_policy(&self, policy_type: PolicyType) -> Option<&Policy> {
-        self.policies
-            .iter()
-            .find(|p| p.policy_type == policy_type)
+        self.policies.iter().find(|p| p.policy_type == policy_type)
     }
 
     /// Insert/update entries for the given policy type. Java: Acl.updatePolicy.
     pub fn update_policy(&mut self, policy_type: PolicyType, new_entries: Vec<PolicyEntry>) {
-        if let Some(policy) = self.policies.iter_mut().find(|p| p.policy_type == policy_type) {
+        if let Some(policy) = self
+            .policies
+            .iter_mut()
+            .find(|p| p.policy_type == policy_type)
+        {
             for entry in new_entries {
                 if let Some(existing) = policy
                     .entries
@@ -1072,12 +1089,7 @@ pub struct AuthorizationContext {
 }
 
 impl AuthorizationContext {
-    pub fn of(
-        subject: Subject,
-        resource: Resource,
-        actions: Vec<Action>,
-        source_ip: &str,
-    ) -> Self {
+    pub fn of(subject: Subject, resource: Resource, actions: Vec<Action>, source_ip: &str) -> Self {
         Self {
             subject,
             resource,
@@ -1192,10 +1204,7 @@ impl LocalAuthenticationMetadataProvider {
     }
 
     pub async fn create_user(&self, user: User) -> Result<()> {
-        self.users
-            .write()
-            .await
-            .insert(user.username.clone(), user);
+        self.users.write().await.insert(user.username.clone(), user);
         Ok(())
     }
 
@@ -1292,7 +1301,7 @@ impl AclAuthorizationHandler {
                             return Err(Error::Auth(format!(
                                 "no matched policies for {}",
                                 ctx.subject_key()
-                            )))
+                            )));
                         }
                     },
                 }
@@ -1303,7 +1312,7 @@ impl AclAuthorizationHandler {
                     return Err(Error::Auth(format!(
                         "no matched policies for {}",
                         ctx.subject_key()
-                    )))
+                    )));
                 }
             },
         };
@@ -1494,9 +1503,7 @@ impl AuthorizationStrategyProvider for DefaultAuthorizationStrategyProvider {
             None => AclAuthorizationHandler::new(self.acl_metadata.clone()),
         };
         vec![
-            AuthorizationHandler::User(UserAuthorizationHandler::new(
-                self.auth_metadata.clone(),
-            )),
+            AuthorizationHandler::User(UserAuthorizationHandler::new(self.auth_metadata.clone())),
             AuthorizationHandler::Acl(acl),
         ]
     }
@@ -1611,7 +1618,10 @@ impl DefaultAuthorizationProvider {
         };
         let code = command.code;
         let mut result: Vec<AuthorizationContext> = Vec::new();
-        let add = |subject: &Subject, resource: Resource, actions: Vec<Action>, out: &mut Vec<AuthorizationContext>| {
+        let add = |subject: &Subject,
+                   resource: Resource,
+                   actions: Vec<Action>,
+                   out: &mut Vec<AuthorizationContext>| {
             out.push(
                 AuthorizationContext::of(subject.clone(), resource, actions, source_ip)
                     .with_rpc_code(code.to_string()),
@@ -1622,7 +1632,12 @@ impl DefaultAuthorizationProvider {
             request_code::GET_ROUTEINFO_BY_TOPIC => {
                 let topic = require_resource(fields.get("topic"), "topic")?;
                 if is_retry_topic(&topic) {
-                    add(&subject, Resource::of_group(&topic), vec![Action::Sub, Action::Get], &mut result);
+                    add(
+                        &subject,
+                        Resource::of_group(&topic),
+                        vec![Action::Sub, Action::Get],
+                        &mut result,
+                    );
                 } else {
                     add(
                         &subject,
@@ -1635,9 +1650,19 @@ impl DefaultAuthorizationProvider {
             request_code::SEND_MESSAGE | request_code::SEND_REPLY_MESSAGE => {
                 let topic = require_resource(fields.get("topic"), "topic")?;
                 if is_retry_topic(&topic) {
-                    add(&subject, Resource::of_group(&topic), vec![Action::Sub], &mut result);
+                    add(
+                        &subject,
+                        Resource::of_group(&topic),
+                        vec![Action::Sub],
+                        &mut result,
+                    );
                 } else {
-                    add(&subject, Resource::of_topic(&topic), vec![Action::Pub], &mut result);
+                    add(
+                        &subject,
+                        Resource::of_topic(&topic),
+                        vec![Action::Pub],
+                        &mut result,
+                    );
                 }
             }
             request_code::SEND_MESSAGE_V2
@@ -1645,15 +1670,30 @@ impl DefaultAuthorizationProvider {
             | request_code::SEND_REPLY_MESSAGE_V2 => {
                 let topic = require_resource(fields.get("b"), "topic")?;
                 if is_retry_topic(&topic) {
-                    add(&subject, Resource::of_group(&topic), vec![Action::Sub], &mut result);
+                    add(
+                        &subject,
+                        Resource::of_group(&topic),
+                        vec![Action::Sub],
+                        &mut result,
+                    );
                 } else {
-                    add(&subject, Resource::of_topic(&topic), vec![Action::Pub], &mut result);
+                    add(
+                        &subject,
+                        Resource::of_topic(&topic),
+                        vec![Action::Pub],
+                        &mut result,
+                    );
                 }
             }
             request_code::END_TRANSACTION => {
                 if let Some(topic) = fields.get("topic") {
                     if !topic.is_empty() {
-                        add(&subject, Resource::of_topic(topic), vec![Action::Pub], &mut result);
+                        add(
+                            &subject,
+                            Resource::of_topic(topic),
+                            vec![Action::Pub],
+                            &mut result,
+                        );
                     }
                 }
             }
@@ -1668,15 +1708,30 @@ impl DefaultAuthorizationProvider {
             }
             request_code::CONSUMER_SEND_MSG_BACK => {
                 let group = require_resource(fields.get("group"), "consumer group")?;
-                add(&subject, Resource::of_group(&group), vec![Action::Sub], &mut result);
+                add(
+                    &subject,
+                    Resource::of_group(&group),
+                    vec![Action::Sub],
+                    &mut result,
+                );
             }
             request_code::PULL_MESSAGE | request_code::LITE_PULL_MESSAGE => {
                 let topic = require_resource(fields.get("topic"), "topic")?;
                 let group = require_resource(fields.get("consumerGroup"), "consumer group")?;
                 if !is_retry_topic(&topic) {
-                    add(&subject, Resource::of_topic(&topic), vec![Action::Sub], &mut result);
+                    add(
+                        &subject,
+                        Resource::of_topic(&topic),
+                        vec![Action::Sub],
+                        &mut result,
+                    );
                 }
-                add(&subject, Resource::of_group(&group), vec![Action::Sub], &mut result);
+                add(
+                    &subject,
+                    Resource::of_group(&group),
+                    vec![Action::Sub],
+                    &mut result,
+                );
             }
             request_code::QUERY_MESSAGE => {
                 let topic = require_resource(fields.get("topic"), "topic")?;
@@ -1692,7 +1747,12 @@ impl DefaultAuthorizationProvider {
                 // an explicit consumer group/topic is present in ext fields.
                 if let Some(group) = fields.get("consumerGroup") {
                     if !group.is_empty() {
-                        add(&subject, Resource::of_group(group), vec![Action::Sub], &mut result);
+                        add(
+                            &subject,
+                            Resource::of_group(group),
+                            vec![Action::Sub],
+                            &mut result,
+                        );
                     }
                 }
             }
@@ -1745,12 +1805,22 @@ impl DefaultAuthorizationProvider {
                 // Simplified: rely on ext fields consumerGroup/topic when present.
                 if let Some(group) = fields.get("consumerGroup") {
                     if !group.is_empty() {
-                        add(&subject, Resource::of_group(group), vec![Action::Sub], &mut result);
+                        add(
+                            &subject,
+                            Resource::of_group(group),
+                            vec![Action::Sub],
+                            &mut result,
+                        );
                     }
                 }
                 if let Some(topic) = fields.get("topic") {
                     if !topic.is_empty() && !is_retry_topic(topic) {
-                        add(&subject, Resource::of_topic(topic), vec![Action::Sub], &mut result);
+                        add(
+                            &subject,
+                            Resource::of_topic(topic),
+                            vec![Action::Sub],
+                            &mut result,
+                        );
                     }
                 }
             }
@@ -1848,7 +1918,9 @@ impl AuthorizationMetadataManager {
                 .auth_metadata
                 .get_user(&username)
                 .await?
-                .ok_or_else(|| Error::Auth(format!("subject {} does not exist", subject.subject_key())))?;
+                .ok_or_else(|| {
+                    Error::Auth(format!("subject {} does not exist", subject.subject_key()))
+                })?;
             if user.user_status == UserStatus::Disable {
                 return Err(Error::Auth(format!("User:{} is disabled", username)));
             }
@@ -1869,7 +1941,9 @@ impl AuthorizationMetadataManager {
         subject_filter: Option<&str>,
         resource_filter: Option<&str>,
     ) -> Result<Vec<Acl>> {
-        self.acl_metadata.list_acl(subject_filter, resource_filter).await
+        self.acl_metadata
+            .list_acl(subject_filter, resource_filter)
+            .await
     }
 }
 
@@ -1882,7 +1956,10 @@ fn validate_acl(acl: &Acl) -> Result<()> {
             return Err(Error::Invalid("the policy entries is empty".into()));
         }
         for entry in &policy.entries {
-            if entry.resource.resource_type == ResourceType::Any && entry.resource.resource_pattern == ResourcePattern::Any && entry.resource.resource_name.is_some() {
+            if entry.resource.resource_type == ResourceType::Any
+                && entry.resource.resource_pattern == ResourcePattern::Any
+                && entry.resource.resource_name.is_some()
+            {
                 return Err(Error::Invalid("invalid resource".into()));
             }
             if entry.actions.is_empty() {
@@ -2010,10 +2087,7 @@ impl DefaultAuthenticationProvider {
         if !self.auth_config.authentication_enabled {
             return Ok(());
         }
-        if !self
-            .auth_config
-            .is_authentication_required(&ctx.rpc_code)
-        {
+        if !self.auth_config.is_authentication_required(&ctx.rpc_code) {
             return Ok(());
         }
         let handler = DefaultAuthenticationHandler::new(self.metadata.clone());
@@ -2333,12 +2407,7 @@ impl AuthMigrator {
     pub async fn migrate(&self, accounts: &[PlainAccessConfig]) -> Result<()> {
         for account in accounts {
             let username = account.access_key.clone();
-            if self
-                .auth_manager
-                .get_user(&username)
-                .await?
-                .is_some()
-            {
+            if self.auth_manager.get_user(&username).await?.is_some() {
                 continue;
             }
             self.create_user_and_acl(account).await?;
@@ -2724,7 +2793,10 @@ mod tests {
     fn base64_roundtrip_known_vectors() {
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
-        assert_eq!(base64_encode(b"any carnal pleasure."), "YW55IGNhcm5hbCBwbGVhc3VyZS4=");
+        assert_eq!(
+            base64_encode(b"any carnal pleasure."),
+            "YW55IGNhcm5hbCBwbGVhc3VyZS4="
+        );
         // decode back
         assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
         assert_eq!(
@@ -2752,9 +2824,18 @@ mod tests {
         let any_topic = Resource::from_key("Topic:*").unwrap();
         assert!(any_topic.is_match(&Resource::of_topic("Whatever")));
         // resource_key round trip.
-        assert_eq!(Resource::from_key("Topic:foo").unwrap().resource_key(), "Topic:foo");
-        assert_eq!(Resource::from_key("Topic:*").unwrap().resource_key(), "Topic:*");
-        assert_eq!(Resource::from_key("Group:pre*").unwrap().resource_key(), "Group:pre*");
+        assert_eq!(
+            Resource::from_key("Topic:foo").unwrap().resource_key(),
+            "Topic:foo"
+        );
+        assert_eq!(
+            Resource::from_key("Topic:*").unwrap().resource_key(),
+            "Topic:*"
+        );
+        assert_eq!(
+            Resource::from_key("Group:pre*").unwrap().resource_key(),
+            "Group:pre*"
+        );
         assert_eq!(Resource::from_key("*").unwrap().resource_key(), "*");
     }
 
@@ -2768,23 +2849,38 @@ mod tests {
             Decision::Deny,
         );
         let allow_prefixed = PolicyEntry::of(
-            Resource::of(ResourceType::Topic, Some("A".into()), ResourcePattern::Prefixed),
+            Resource::of(
+                ResourceType::Topic,
+                Some("A".into()),
+                ResourcePattern::Prefixed,
+            ),
             vec![Action::Pub],
             None,
             Decision::Allow,
         );
         // For an exact request "A", the literal (more specific) is chosen; deny wins.
-        assert_eq!(compare_policy_entries(&deny_literal, &allow_prefixed), Ordering::Less);
+        assert_eq!(
+            compare_policy_entries(&deny_literal, &allow_prefixed),
+            Ordering::Less
+        );
 
         // Prefix length: longer prefix is more specific (comes first).
         let long = PolicyEntry::of(
-            Resource::of(ResourceType::Topic, Some("Abc".into()), ResourcePattern::Prefixed),
+            Resource::of(
+                ResourceType::Topic,
+                Some("Abc".into()),
+                ResourcePattern::Prefixed,
+            ),
             vec![Action::Pub],
             None,
             Decision::Allow,
         );
         let short = PolicyEntry::of(
-            Resource::of(ResourceType::Topic, Some("A".into()), ResourcePattern::Prefixed),
+            Resource::of(
+                ResourceType::Topic,
+                Some("A".into()),
+                ResourcePattern::Prefixed,
+            ),
             vec![Action::Pub],
             None,
             Decision::Allow,
@@ -2792,8 +2888,18 @@ mod tests {
         assert_eq!(compare_policy_entries(&long, &short), Ordering::Less);
 
         // Equal resources: DENY first.
-        let a_deny = PolicyEntry::of(Resource::of_topic("Z"), vec![Action::Pub], None, Decision::Deny);
-        let a_allow = PolicyEntry::of(Resource::of_topic("Z"), vec![Action::Pub], None, Decision::Allow);
+        let a_deny = PolicyEntry::of(
+            Resource::of_topic("Z"),
+            vec![Action::Pub],
+            None,
+            Decision::Deny,
+        );
+        let a_allow = PolicyEntry::of(
+            Resource::of_topic("Z"),
+            vec![Action::Pub],
+            None,
+            Decision::Allow,
+        );
         assert_eq!(compare_policy_entries(&a_deny, &a_allow), Ordering::Less);
     }
 
@@ -3027,11 +3133,20 @@ mod tests {
         assert!(acl.get_policy(PolicyType::Default).is_some());
         // TopicA=PUB -> ALLOW, TopicB-style DENY would be DENY; here TopicA is ALLOW.
         let custom = acl.get_policy(PolicyType::Custom).unwrap();
-        assert!(custom.entries.iter().any(|e| e.resource == Resource::of_topic("TopicA")
-            && e.decision == Decision::Allow));
+        assert!(
+            custom.entries.iter().any(
+                |e| e.resource == Resource::of_topic("TopicA") && e.decision == Decision::Allow
+            )
+        );
         let default = acl.get_policy(PolicyType::Default).unwrap();
-        assert!(default.entries.iter().any(|e| e.resource.resource_type == ResourceType::Topic
-            && e.actions.contains(&Action::Pub) && e.actions.contains(&Action::Sub)));
+        assert!(
+            default
+                .entries
+                .iter()
+                .any(|e| e.resource.resource_type == ResourceType::Topic
+                    && e.actions.contains(&Action::Pub)
+                    && e.actions.contains(&Action::Sub))
+        );
     }
 
     #[test]
@@ -3061,7 +3176,10 @@ mod tests {
             "2001:db8::1/128"
         ));
         // Embedded IPv4 tail.
-        assert!(is_ip_in_range("::ffff:192.168.1.9", "::ffff:192.168.0.0/112"));
+        assert!(is_ip_in_range(
+            "::ffff:192.168.1.9",
+            "::ffff:192.168.0.0/112"
+        ));
         assert!(!is_ip_in_range("::ffff:10.0.0.1", "::ffff:192.168.0.0/112"));
         // Zone index tolerated.
         assert!(is_ip_in_range("fe80::1%eth0", "fe80::/16"));
@@ -3132,8 +3250,14 @@ mod tests {
                 .to_string(),
         );
         grpc.insert("x-mq-date-time".to_string(), "20231227T194619Z".to_string());
-        grpc.insert("rpc-remote-address".to_string(), "10.0.0.7:9876".to_string());
-        grpc.insert("x-mq-rpc-name".to_string(), "apache.rocketmq.v2.SendMessage".to_string());
+        grpc.insert(
+            "rpc-remote-address".to_string(),
+            "10.0.0.7:9876".to_string(),
+        );
+        grpc.insert(
+            "x-mq-rpc-name".to_string(),
+            "apache.rocketmq.v2.SendMessage".to_string(),
+        );
         grpc.insert("x-mq-client-id".to_string(), "client-1".to_string());
         let ctx = context_from_grpc_headers(&grpc).unwrap();
         assert_eq!(ctx.subject.username(), "abc");

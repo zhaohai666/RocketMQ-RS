@@ -507,7 +507,9 @@ impl RaftNode {
                             None
                         }
                     }
-                    _ if core.last_activity.elapsed() >= core.election_timeout => Some(Action::Elect),
+                    _ if core.last_activity.elapsed() >= core.election_timeout => {
+                        Some(Action::Elect)
+                    }
                     _ => None,
                 }
             };
@@ -563,7 +565,11 @@ impl RaftNode {
         }
         info!(node = %self.id, term, "raft: starting election");
         for peer in &self.remotes {
-            let Some(resp) = self.transport.send(peer, request.clone(), RPC_TIMEOUT).await else {
+            let Some(resp) = self
+                .transport
+                .send(peer, request.clone(), RPC_TIMEOUT)
+                .await
+            else {
                 continue;
             };
             if resp.code != response_code::SUCCESS {
@@ -612,7 +618,10 @@ impl RaftNode {
                     let next = *core.next_index.get(peer).unwrap_or(&1);
                     let prev = next - 1;
                     let (code, entries) = if next <= core.last_log_index() {
-                        (request_code::RAFT_APPEND, core.log[(next - 1) as usize..].to_vec())
+                        (
+                            request_code::RAFT_APPEND,
+                            core.log[(next - 1) as usize..].to_vec(),
+                        )
                     } else {
                         (request_code::RAFT_HEARTBEAT, Vec::new())
                     };
@@ -679,7 +688,8 @@ impl RaftNode {
         }
         let mut n = core.last_log_index();
         while n > core.commit_index {
-            if core.term_at(n) == core.term && self.count_acks(&core, n) >= quorum(self.cluster_size)
+            if core.term_at(n) == core.term
+                && self.count_acks(&core, n) >= quorum(self.cluster_size)
             {
                 break;
             }
@@ -863,7 +873,10 @@ mod tests {
             if let Some(leader) = nodes.iter().find(|n| n.is_leader()) {
                 return leader.clone();
             }
-            assert!(Instant::now() < deadline, "timed out waiting for leader ({what})");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for leader ({what})"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -874,7 +887,10 @@ mod tests {
             if nodes.iter().all(|n| n.status().last_applied >= at_least) {
                 return;
             }
-            assert!(Instant::now() < deadline, "timed out waiting for apply ({what})");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for apply ({what})"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -939,8 +955,7 @@ mod tests {
         // the carried leader_commit is applied immediately.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let transport = Arc::new(MemTransport::new());
-        let (node, recorder) =
-            spawn_node(&transport, "n1", vec!["n1".to_string()], &shutdown_rx);
+        let (node, recorder) = spawn_node(&transport, "n1", vec!["n1".to_string()], &shutdown_rx);
         let request = Command::request(request_code::RAFT_APPEND).with_body(
             serde_json::to_vec(&AppendRequest {
                 term: 5,

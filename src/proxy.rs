@@ -243,7 +243,11 @@ type TelemetrySender = mpsc::Sender<std::result::Result<pb::TelemetryCommand, St
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn next_nonce() -> String {
-    format!("rmq-{}-{}", std::process::id(), NONCE_COUNTER.fetch_add(1, Ordering::SeqCst))
+    format!(
+        "rmq-{}-{}",
+        std::process::id(),
+        NONCE_COUNTER.fetch_add(1, Ordering::SeqCst)
+    )
 }
 
 /// Outcome a waiting Admin RPC expects back from a client telemetry reply.
@@ -499,7 +503,9 @@ impl ClientRegistry {
             let by_id = self.by_id.lock().unwrap();
             by_id
                 .iter()
-                .filter(|(_, state)| state.last_heartbeat.elapsed().as_secs() > CHANNEL_EXPIRED_SECS)
+                .filter(|(_, state)| {
+                    state.last_heartbeat.elapsed().as_secs() > CHANNEL_EXPIRED_SECS
+                })
                 .map(|(id, _)| id.clone())
                 .collect()
         };
@@ -628,14 +634,16 @@ impl ClientRegistry {
     /// there, so the proxy needs the name to pull from.
     fn lite_bind_topic(&self, client_id: &str) -> Option<String> {
         let by_id = self.by_id.lock().unwrap();
-        by_id.get(client_id)
+        by_id
+            .get(client_id)
             .and_then(|state| state.lite_topics.keys().next().cloned())
     }
 
     /// The bind (parent) topic of any client registered under `group`.
     fn lite_bind_topic_of_group(&self, group: &str) -> Option<String> {
         let by_id = self.by_id.lock().unwrap();
-        by_id.values()
+        by_id
+            .values()
             .filter(|state| state.group == group)
             .find_map(|state| state.lite_topics.keys().next().cloned())
     }
@@ -651,9 +659,9 @@ impl ClientRegistry {
                 return true;
             }
         }
-        by_id.values().any(|state| {
-            state.group == group && LITE_TYPES.contains(&state.client_type)
-        })
+        by_id
+            .values()
+            .any(|state| state.group == group && LITE_TYPES.contains(&state.client_type))
     }
 
     /// Apply a `SyncLiteSubscription` action to a client's lite topic sets and return
@@ -694,12 +702,15 @@ impl ClientRegistry {
                         }
                         // COMPLETE_ADD: replace the bind topic's set wholesale.
                         2 => {
-                            state.lite_topics.insert(bind_topic.to_string(), topics.to_vec());
+                            state
+                                .lite_topics
+                                .insert(bind_topic.to_string(), topics.to_vec());
                             Vec::new()
                         }
                         // PARTIAL_ADD (default): union with the existing set.
                         _ => {
-                            let entry = state.lite_topics.entry(bind_topic.to_string()).or_default();
+                            let entry =
+                                state.lite_topics.entry(bind_topic.to_string()).or_default();
                             for t in topics {
                                 if !entry.contains(t) {
                                     entry.push(t.clone());
@@ -716,7 +727,9 @@ impl ClientRegistry {
                     state.last_heartbeat = Instant::now();
                     // Nothing to remove from a brand-new client; seed the set on add.
                     if action == 2 || action == 0 {
-                        state.lite_topics.insert(bind_topic.to_string(), topics.to_vec());
+                        state
+                            .lite_topics
+                            .insert(bind_topic.to_string(), topics.to_vec());
                     }
                     by_id.insert(client_id.to_string(), state);
                     Vec::new()
@@ -745,12 +758,14 @@ impl ClientRegistry {
                     continue;
                 }
                 let command = pb::TelemetryCommand {
-                    command: Some(pb::telemetry_command::Command::NotifyUnsubscribeLiteCommand(
-                        pb::NotifyUnsubscribeLiteCommand {
-                            lite_topic: topic.to_string(),
-                            ..Default::default()
-                        },
-                    )),
+                    command: Some(
+                        pb::telemetry_command::Command::NotifyUnsubscribeLiteCommand(
+                            pb::NotifyUnsubscribeLiteCommand {
+                                lite_topic: topic.to_string(),
+                                ..Default::default()
+                            },
+                        ),
+                    ),
                     ..Default::default()
                 };
                 self.push_command(id, command);
@@ -853,10 +868,9 @@ fn apply_settings(registry: &ClientRegistry, client_id: &str, settings: &pb::Set
                 }
                 for entry in &s.subscriptions {
                     if let Some(t) = &entry.topic {
-                        state.subscriptions.insert(
-                            t.name.clone(),
-                            entry.expression.clone().unwrap_or_default(),
-                        );
+                        state
+                            .subscriptions
+                            .insert(t.name.clone(), entry.expression.clone().unwrap_or_default());
                     }
                 }
             }
@@ -886,8 +900,12 @@ fn merge_producer_settings(settings: &pb::Settings, config: &ProxyConfig) -> pb:
     backoff.max_attempts = config.grpc_client_producer_max_attempts;
     backoff.strategy = Some(pb::retry_policy::Strategy::ExponentialBackoff(
         pb::ExponentialBackoff {
-            initial: Some(duration_millis(config.grpc_client_producer_backoff_initial_millis)),
-            max: Some(duration_millis(config.grpc_client_producer_backoff_max_millis)),
+            initial: Some(duration_millis(
+                config.grpc_client_producer_backoff_initial_millis,
+            )),
+            max: Some(duration_millis(
+                config.grpc_client_producer_backoff_max_millis,
+            )),
             multiplier: config.grpc_client_producer_backoff_multiplier,
         },
     ));
@@ -913,8 +931,9 @@ fn merge_subscription_settings(
     if let Some(pb::settings::PubSub::Subscription(subscription)) = merged.pub_sub.as_mut() {
         subscription.fifo = Some(group.consume_message_orderly);
         subscription.receive_batch_size = Some(config.grpc_client_consumer_long_polling_batch_size);
-        subscription.long_polling_timeout =
-            Some(duration_millis(config.grpc_client_consumer_max_long_polling_timeout_millis));
+        subscription.long_polling_timeout = Some(duration_millis(
+            config.grpc_client_consumer_max_long_polling_timeout_millis,
+        ));
         subscription.lite_subscription_quota = Some(group.lite_sub_client_quota());
         subscription.max_lite_topic_size = Some(config.max_lite_topic_size);
     }
@@ -999,9 +1018,7 @@ fn bind_topic_of(registry: &ClientRegistry, client_id: &str, group: &str) -> Str
             return bind_topic;
         }
     }
-    registry
-        .lite_bind_topic_of_group(group)
-        .unwrap_or_default()
+    registry.lite_bind_topic_of_group(group).unwrap_or_default()
 }
 
 /// Periodic orphaned-transaction recovery (Java `TransactionalMessageCheckService`).
@@ -1055,9 +1072,8 @@ async fn run_transaction_recovery(context: Arc<ProxyContext>) {
                     Ok((record, consumed)) if consumed > 0 => {
                         rest = &rest[consumed..];
                         if record.body.len() == 8 {
-                            resolved.insert(u64::from_be_bytes(
-                                record.body[..8].try_into().unwrap(),
-                            ));
+                            resolved
+                                .insert(u64::from_be_bytes(record.body[..8].try_into().unwrap()));
                         }
                     }
                     _ => break,
@@ -1163,7 +1179,9 @@ async fn run_transaction_recovery(context: Arc<ProxyContext>) {
         }
         if scanned > 0 || !resolved.is_empty() {
             info!(
-                scanned, pushed, resolved = resolved.len(),
+                scanned,
+                pushed,
+                resolved = resolved.len(),
                 "transaction recovery round finished"
             );
         }
@@ -1342,7 +1360,11 @@ impl PooledRemotingClient {
         let mut lease = match tokio::time::timeout(timeout, self.checkout(addr)).await {
             Ok(Ok(lease)) => lease,
             Ok(Err(error)) => return Err(error),
-            Err(_) => return Err(Error::Timeout(format!("pool checkout timed out for {addr}"))),
+            Err(_) => {
+                return Err(Error::Timeout(format!(
+                    "pool checkout timed out for {addr}"
+                )));
+            }
         };
         let opaque = request.opaque;
         let exchange = async {
@@ -1358,7 +1380,9 @@ impl PooledRemotingClient {
             if response.flag & remoting::RESPONSE_FLAG == 0
                 || response.flag & remoting::ONEWAY_FLAG != 0
             {
-                return Err(Error::Invalid("pooled RPC response has invalid flags".into()));
+                return Err(Error::Invalid(
+                    "pooled RPC response has invalid flags".into(),
+                ));
             }
             if response.opaque != opaque {
                 return Err(Error::Invalid("pooled RPC response opaque mismatch".into()));
@@ -1483,7 +1507,11 @@ impl ProxyBackend {
         let mut last: Option<Error> = None;
         for offset in 0..self.nameservers.len() {
             let addr = &self.nameservers[(start + offset) % self.nameservers.len()];
-            match self.client.invoke(addr, request.clone(), self.timeout).await {
+            match self
+                .client
+                .invoke(addr, request.clone(), self.timeout)
+                .await
+            {
                 Ok(response) => return Ok(response),
                 Err(error) => {
                     warn!(nameserver = %addr, %error, "namesrv invoke failed, trying next");
@@ -1589,7 +1617,9 @@ impl ProxyBackend {
                 }
             }
         }
-        Err(Error::NotFound(format!("no master broker for topic {topic}")))
+        Err(Error::NotFound(format!(
+            "no master broker for topic {topic}"
+        )))
     }
 
     /// Java `ClusterMetadataService.findOneBroker`: pick one broker of the cluster.
@@ -1630,7 +1660,10 @@ impl ProxyBackend {
                 return Ok(addr.to_string());
             }
             if fallback.is_none() {
-                fallback = addrs.values().find_map(|value| value.as_str()).map(str::to_owned);
+                fallback = addrs
+                    .values()
+                    .find_map(|value| value.as_str())
+                    .map(str::to_owned);
             }
         }
         fallback.ok_or_else(|| Error::NotFound("no broker registered in the cluster".into()))
@@ -1661,7 +1694,11 @@ impl ProxyBackend {
         }
         let addr = self.one_broker_addr(cluster).await.ok()?;
         let request = Command::request(352).with_ext("group", group.to_string());
-        let response = self.client.invoke(&addr, request, self.timeout).await.ok()?;
+        let response = self
+            .client
+            .invoke(&addr, request, self.timeout)
+            .await
+            .ok()?;
         if response.code != 0 {
             warn!(
                 group,
@@ -1999,7 +2036,14 @@ fn endpoints_from_addr(addr: &str) -> Option<pb::Endpoints> {
     })
 }
 
-const PROPERTIES: [&str; 6] = ["TAGS", "KEYS", "UNIQ_KEY", "SHARDING_KEY", "RECONSUME_TIMES", "PRIORITY"];
+const PROPERTIES: [&str; 6] = [
+    "TAGS",
+    "KEYS",
+    "UNIQ_KEY",
+    "SHARDING_KEY",
+    "RECONSUME_TIMES",
+    "PRIORITY",
+];
 
 /// Java `MessageConst.PROPERTY_LITE_TOPIC`: the lite topic a message belongs to.
 /// A lite message is stored in its bind (parent) topic and carries the lite
@@ -2334,12 +2378,11 @@ impl AclGuard {
             .as_deref()
             .ok_or_else(|| Status::unauthenticated("missing Authorization metadata"))?;
         let _ = rpc_code; // per-RPC authorization lands with the policy evaluator
-        let (access_key, signature) =
-            Self::parse_authorization(header).ok_or_else(|| {
-                Status::unauthenticated(
-                    "Authorization must carry Credential=<accessKey> and Signature=<signature>",
-                )
-            })?;
+        let (access_key, signature) = Self::parse_authorization(header).ok_or_else(|| {
+            Status::unauthenticated(
+                "Authorization must carry Credential=<accessKey> and Signature=<signature>",
+            )
+        })?;
         let user = self
             .metadata
             .get_user(&access_key)
@@ -2489,7 +2532,9 @@ impl MessagingProcessor {
         self.backend
             .subscription_group_config("", group)
             .await
-            .ok_or_else(|| Error::NotFound(format!("subscription group [{group}] does not exist")))?;
+            .ok_or_else(|| {
+                Error::NotFound(format!("subscription group [{group}] does not exist"))
+            })?;
         let mut fields = vec![
             ("topic", topic.to_string()),
             ("consumerGroup", group.to_string()),
@@ -2513,7 +2558,9 @@ impl MessagingProcessor {
         }
         // The broker holds the pop for the whole long-poll window; the transport needs
         // the suspend plus a margin instead of the default backend timeout.
-        let timeout = Duration::from_millis(u64::try_from(long_polling_ms.clamp(0, 30_000)).unwrap_or(30_000) + 3_000);
+        let timeout = Duration::from_millis(
+            u64::try_from(long_polling_ms.clamp(0, 30_000)).unwrap_or(30_000) + 3_000,
+        );
         let response = self
             .backend
             .invoke_broker_with_timeout(topic, 200050, &fields, Vec::new(), timeout)
@@ -2563,7 +2610,9 @@ impl MessagingProcessor {
         invisible_time: i64,
         long_polling_ms: i64,
     ) -> Result<Vec<common::Message>> {
-        let timeout = Duration::from_millis(u64::try_from(long_polling_ms.clamp(0, 30_000)).unwrap_or(30_000) + 3_000);
+        let timeout = Duration::from_millis(
+            u64::try_from(long_polling_ms.clamp(0, 30_000)).unwrap_or(30_000) + 3_000,
+        );
         let response = self
             .backend
             .invoke_broker_with_timeout(
@@ -2666,7 +2715,9 @@ impl MessagingProcessor {
                 )
                 .await?
         } else {
-            self.backend.invoke_broker(topic, 11, &fields, Vec::new()).await?
+            self.backend
+                .invoke_broker(topic, 11, &fields, Vec::new())
+                .await?
         };
         let next_begin = response
             .ext_fields
@@ -2703,7 +2754,7 @@ impl MessagingProcessor {
                     "pull failed (code {}): {}",
                     code,
                     response.remark.as_deref().unwrap_or("")
-                )))
+                )));
             }
         }
         // The pull body is a sequence of RocketMQ message records (broker's
@@ -2734,11 +2785,7 @@ impl MessagingProcessor {
     /// order; a lite message falls back to its lite topic as the key. A message
     /// without either has no queue of its own and is left to the broker's round
     /// robin.
-    async fn select_write_queue(
-        &self,
-        topic: &str,
-        message: &pb::Message,
-    ) -> Option<WriteQueue> {
+    async fn select_write_queue(&self, topic: &str, message: &pb::Message) -> Option<WriteQueue> {
         let system = message.system_properties.as_ref()?;
         let sharding_key = system
             .message_group
@@ -3058,7 +3105,9 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .filter(|queue| queue.perm & PERM_READ != 0 && queue.read_queues > 0)
             .flat_map(|queue| {
                 if fifo && !lite {
-                    (0..queue.read_queues).map(move |id| (queue, id)).collect::<Vec<_>>()
+                    (0..queue.read_queues)
+                        .map(move |id| (queue, id))
+                        .collect::<Vec<_>>()
                 } else {
                     vec![(queue, -1)]
                 }
@@ -3120,7 +3169,10 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .as_ref()
             .map(|mq| {
                 (
-                    mq.topic.as_ref().map(|t| t.name.clone()).unwrap_or_default(),
+                    mq.topic
+                        .as_ref()
+                        .map(|t| t.name.clone())
+                        .unwrap_or_default(),
                     mq.id,
                 )
             })
@@ -3128,7 +3180,9 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         // LITE push consumers fan out across their registered lite topic set, which may
         // leave the explicit `messageQueue` empty, so only the group is strictly required.
         if group.is_empty() {
-            return Err(Status::invalid_argument("group and messageQueue are required"));
+            return Err(Status::invalid_argument(
+                "group and messageQueue are required",
+            ));
         }
         let batch = request.batch_size.max(1);
         let invisible_time = request
@@ -3156,8 +3210,16 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             };
             return Err(Status::invalid_argument(remark));
         }
-        let min_poll = self.context.config.grpc_client_consumer_min_long_polling_timeout_millis.max(0);
-        let max_poll = self.context.config.grpc_client_consumer_max_long_polling_timeout_millis.max(0);
+        let min_poll = self
+            .context
+            .config
+            .grpc_client_consumer_min_long_polling_timeout_millis
+            .max(0);
+        let max_poll = self
+            .context
+            .config
+            .grpc_client_consumer_max_long_polling_timeout_millis
+            .max(0);
         if long_polling_ms > 0 {
             long_polling_ms = long_polling_ms.clamp(min_poll, min_poll.max(max_poll));
         }
@@ -3179,14 +3241,13 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             // A lite consumer whose lite set is currently empty must get nothing: falling
             // back to a plain pull of the bind topic would hand it the dual-dispatched
             // lite messages anyway (Java `LitePushConsumerImpl` pops only light queues).
-            if lite_topics.is_empty()
-                && this.context.clients.is_lite_consumer(&client_id, &group)
-            {
+            if lite_topics.is_empty() && this.context.clients.is_lite_consumer(&client_id, &group) {
                 let _ = tx
                     .send(Ok(pb::ReceiveMessageResponse {
-                        content: Some(pb::receive_message_response::Content::Status(
-                            pb_status(pb::Code::Ok, ""),
-                        )),
+                        content: Some(pb::receive_message_response::Content::Status(pb_status(
+                            pb::Code::Ok,
+                            "",
+                        ))),
                     }))
                     .await;
                 return;
@@ -3223,9 +3284,9 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                             let pb_message = to_pb_message(message, Some(handle));
                             if tx
                                 .send(Ok(pb::ReceiveMessageResponse {
-                                    content: Some(
-                                        pb::receive_message_response::Content::Message(pb_message),
-                                    ),
+                                    content: Some(pb::receive_message_response::Content::Message(
+                                        pb_message,
+                                    )),
                                 }))
                                 .await
                                 .is_err()
@@ -3414,8 +3475,7 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         }
     }
 
-    type PullMessageStream =
-        ReceiverStream<std::result::Result<pb::PullMessageResponse, Status>>;
+    type PullMessageStream = ReceiverStream<std::result::Result<pb::PullMessageResponse, Status>>;
 
     async fn pull_message(
         &self,
@@ -3433,20 +3493,28 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .as_ref()
             .map(|mq| {
                 (
-                    mq.topic.as_ref().map(|t| t.name.clone()).unwrap_or_default(),
+                    mq.topic
+                        .as_ref()
+                        .map(|t| t.name.clone())
+                        .unwrap_or_default(),
                     mq.id,
                 )
             })
             .unwrap_or_default();
         if topic.is_empty() || group.is_empty() {
-            return Err(Status::invalid_argument("group and messageQueue are required"));
+            return Err(Status::invalid_argument(
+                "group and messageQueue are required",
+            ));
         }
         let offset = request.offset;
         let batch = request.batch_size.max(1);
         let (tx, rx) = mpsc::channel::<std::result::Result<pb::PullMessageResponse, Status>>(16);
         let this = Arc::new(self.clone_for_stream());
         tokio::spawn(async move {
-            match this.pull_once(&topic, &group, queue_id, offset, batch, None, 0).await {
+            match this
+                .pull_once(&topic, &group, queue_id, offset, batch, None, 0)
+                .await
+            {
                 Ok((messages, next, max)) => {
                     for message in &messages {
                         if tx
@@ -3471,7 +3539,9 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                         .await;
                     let _ = tx
                         .send(Ok(pb::PullMessageResponse {
-                            content: Some(pb::pull_message_response::Content::NextOffset(next.max(max))),
+                            content: Some(pb::pull_message_response::Content::NextOffset(
+                                next.max(max),
+                            )),
                         }))
                         .await;
                 }
@@ -3499,7 +3569,10 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .as_ref()
             .map(|mq| {
                 (
-                    mq.topic.as_ref().map(|t| t.name.clone()).unwrap_or_default(),
+                    mq.topic
+                        .as_ref()
+                        .map(|t| t.name.clone())
+                        .unwrap_or_default(),
                     mq.id,
                 )
             })
@@ -3539,7 +3612,10 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .as_ref()
             .map(|mq| {
                 (
-                    mq.topic.as_ref().map(|t| t.name.clone()).unwrap_or_default(),
+                    mq.topic
+                        .as_ref()
+                        .map(|t| t.name.clone())
+                        .unwrap_or_default(),
                     mq.id,
                 )
             })
@@ -3565,7 +3641,10 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .as_ref()
             .map(|mq| {
                 (
-                    mq.topic.as_ref().map(|t| t.name.clone()).unwrap_or_default(),
+                    mq.topic
+                        .as_ref()
+                        .map(|t| t.name.clone())
+                        .unwrap_or_default(),
                     mq.id,
                 )
             })
@@ -3664,7 +3743,10 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             Ok(response) => Ok(Response::new(pb::EndTransactionResponse {
                 status: Some(pb_status(
                     pb::Code::InternalError,
-                    response.remark.as_deref().unwrap_or("end transaction failed"),
+                    response
+                        .remark
+                        .as_deref()
+                        .unwrap_or("end transaction failed"),
                 )),
                 ..Default::default()
             })),
@@ -3724,17 +3806,11 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
                             // telemetry stream. The merged `Settings` is what carries
                             // the consumer group's retry policy — without it a 5.x
                             // push consumer never starts scanning for assignments.
-                            let merged = merge_client_settings(
-                                &backend,
-                                &proxy_config,
-                                &settings,
-                            )
-                            .await;
+                            let merged =
+                                merge_client_settings(&backend, &proxy_config, &settings).await;
                             let _ = tx
                                 .send(Ok(pb::TelemetryCommand {
-                                    command: Some(pb::telemetry_command::Command::Settings(
-                                        merged,
-                                    )),
+                                    command: Some(pb::telemetry_command::Command::Settings(merged)),
                                     ..Default::default()
                                 }))
                                 .await;
@@ -3809,7 +3885,9 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
         let duration_ms = request
             .invisible_duration
             .as_ref()
-            .map(|duration| duration.seconds.saturating_mul(1000) + (duration.nanos / 1_000_000) as i64)
+            .map(|duration| {
+                duration.seconds.saturating_mul(1000) + (duration.nanos / 1_000_000) as i64
+            })
             .unwrap_or(0);
         // Java `GrpcValidator.validateInvisibleTime` (the single-arg overload, min 0)
         // plus `ProxyConfig.maxInvisibleTimeMills` (default 12h): a negative or
@@ -3884,17 +3962,22 @@ impl pb::messaging_service_server::MessagingService for MessagingProcessor {
             .invoke_broker(
                 &topic,
                 370,
-                &[("topic", topic.clone()), ("recallHandle", request.recall_handle)],
+                &[
+                    ("topic", topic.clone()),
+                    ("recallHandle", request.recall_handle),
+                ],
                 Vec::new(),
             )
             .await;
         match result {
-            Ok(response) if response.code == 0 => {
-                Ok(Response::new(pb::RecallMessageResponse {
-                    status: Some(pb_status(pb::Code::Ok, "")),
-                    message_id: response.ext_fields.get("msgId").cloned().unwrap_or_default(),
-                }))
-            }
+            Ok(response) if response.code == 0 => Ok(Response::new(pb::RecallMessageResponse {
+                status: Some(pb_status(pb::Code::Ok, "")),
+                message_id: response
+                    .ext_fields
+                    .get("msgId")
+                    .cloned()
+                    .unwrap_or_default(),
+            })),
             Ok(response) => Ok(Response::new(pb::RecallMessageResponse {
                 status: Some(pb_status(
                     map_response_code(response.code),
@@ -4166,9 +4249,7 @@ impl pb::admin_server::Admin for AdminProcessor {
                     .find(|broker| broker.name == queue.broker_name)
                     .and_then(|broker| broker.addrs.get(&0))
                     .cloned()
-                    .ok_or_else(|| {
-                        Status::not_found(format!("no master for queue of {topic}"))
-                    })?;
+                    .ok_or_else(|| Status::not_found(format!("no master for queue of {topic}")))?;
                 // A route entry carries the queue count per broker, not per-queue ids;
                 // enumerate the readable positions like every other route consumer.
                 for id in 0..queue.read_queues.max(0) {
@@ -4302,10 +4383,7 @@ impl pb::admin_server::Admin for AdminProcessor {
                     return Ok(Response::new(pb::ResetGroupOffsetResponse {
                         status: Some(pb_status(
                             map_response_code(searched.code),
-                            searched
-                                .remark
-                                .as_deref()
-                                .unwrap_or("offset search failed"),
+                            searched.remark.as_deref().unwrap_or("offset search failed"),
                         )),
                     }));
                 }
@@ -4487,11 +4565,13 @@ impl pb::admin_server::Admin for AdminProcessor {
         let nonce = next_nonce();
         let mut rx = self.context.clients.register_pending(&nonce);
         let command = pb::TelemetryCommand {
-            command: Some(pb::telemetry_command::Command::PrintThreadStackTraceCommand(
-                pb::PrintThreadStackTraceCommand {
-                    nonce: nonce.clone(),
-                },
-            )),
+            command: Some(
+                pb::telemetry_command::Command::PrintThreadStackTraceCommand(
+                    pb::PrintThreadStackTraceCommand {
+                        nonce: nonce.clone(),
+                    },
+                ),
+            ),
             ..Default::default()
         };
         if !self.context.clients.push_command(&target, command) {
@@ -4623,7 +4703,7 @@ impl pb::admin_server::Admin for AdminProcessor {
                 return Ok(Response::new(pb::AdminSendMessageResponse {
                     status: Some(pb_status(pb::Code::BadRequest, error.to_string())),
                     ..Default::default()
-                }))
+                }));
             }
         };
         let born = now_millis();
@@ -4648,16 +4728,14 @@ impl pb::admin_server::Admin for AdminProcessor {
             )
             .await;
         match response {
-            Ok(response) if response.code == 0 => {
-                Ok(Response::new(pb::AdminSendMessageResponse {
-                    status: Some(pb_status(pb::Code::Ok, "")),
-                    message_id: response
-                        .ext_fields
-                        .get("msgId")
-                        .cloned()
-                        .unwrap_or_default(),
-                }))
-            }
+            Ok(response) if response.code == 0 => Ok(Response::new(pb::AdminSendMessageResponse {
+                status: Some(pb_status(pb::Code::Ok, "")),
+                message_id: response
+                    .ext_fields
+                    .get("msgId")
+                    .cloned()
+                    .unwrap_or_default(),
+            })),
             Ok(response) => Ok(Response::new(pb::AdminSendMessageResponse {
                 status: Some(pb_status(
                     map_response_code(response.code),
@@ -4943,7 +5021,9 @@ impl pb::admin_server::Admin for AdminProcessor {
 /// Background sweep (Java `GrpcChannelManager` cleanup + `MessageReceiptHandleManager` TTL):
 /// periodically drops expired receipt handles and clients idle beyond `CHANNEL_EXPIRED_SECS`.
 async fn run_registry_reaper(context: Arc<ProxyContext>) {
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(REGISTRY_REAPER_INTERVAL_SECS));
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+        REGISTRY_REAPER_INTERVAL_SECS,
+    ));
     loop {
         interval.tick().await;
         context.clients.reap_expired();
@@ -4970,13 +5050,10 @@ pub async fn serve_proxy(
     tonic::transport::Server::builder()
         .add_service(messaging)
         .add_service(admin)
-        .serve_with_incoming_shutdown(
-            TcpListenerStream::new(listener),
-            async move {
-                let mut shutdown = shutdown;
-                let _ = shutdown.changed().await;
-            },
-        )
+        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+            let mut shutdown = shutdown;
+            let _ = shutdown.changed().await;
+        })
         .await
         .map_err(|error| Error::Io(std::io::Error::other(error)))?;
     Ok(())
@@ -5198,13 +5275,12 @@ mod tests {
     fn exponential_group_policy_becomes_an_exponential_backoff() {
         let mut group = crate::schedule::GroupConfig::new("fifo-group");
         group.group_retry_policy.policy_type = crate::schedule::GroupRetryPolicyType::EXPONENTIAL;
-        group.group_retry_policy.exponential_retry_policy = Some(
-            crate::schedule::ExponentialRetryPolicy {
+        group.group_retry_policy.exponential_retry_policy =
+            Some(crate::schedule::ExponentialRetryPolicy {
                 initial: 5_000,
                 max: 7_200_000,
                 multiplier: 2,
-            },
-        );
+            });
         let settings = pb::Settings {
             pub_sub: Some(pb::settings::PubSub::Subscription(pb::Subscription {
                 group: Some(pb::Resource {
@@ -5216,7 +5292,12 @@ mod tests {
             ..Default::default()
         };
         let merged = merge_subscription_settings(&settings, &group, &ProxyConfig::default());
-        match merged.backoff_policy.expect("backoff").strategy.expect("strategy") {
+        match merged
+            .backoff_policy
+            .expect("backoff")
+            .strategy
+            .expect("strategy")
+        {
             pb::retry_policy::Strategy::ExponentialBackoff(strategy) => {
                 assert_eq!(strategy.initial, Some(duration_millis(5_000)));
                 assert_eq!(strategy.max, Some(duration_millis(7_200_000)));
@@ -5313,7 +5394,10 @@ mod tests {
         assert_eq!(queues.len(), 2);
         assert_eq!(brokers[0].addrs.get(&0).unwrap(), "127.0.0.1:10911");
         assert_eq!(queues[0].read_queues, 8);
-        assert_eq!(perm_to_permission(queues[0].perm), pb::Permission::ReadWrite);
+        assert_eq!(
+            perm_to_permission(queues[0].perm),
+            pb::Permission::ReadWrite
+        );
         assert_eq!(perm_to_permission(queues[1].perm), pb::Permission::Read);
     }
 
@@ -5378,8 +5462,7 @@ mod tests {
         assert_eq!(parsed.0, "rocketmq");
         assert_eq!(parsed.1, "abc+123==");
         // Java spelling `AccessKey=` is tolerated too.
-        let parsed = AclGuard::parse_authorization("AccessKey=ak,Signature=sig")
-            .unwrap();
+        let parsed = AclGuard::parse_authorization("AccessKey=ak,Signature=sig").unwrap();
         assert_eq!(parsed.0, "ak");
         assert_eq!(parsed.1, "sig");
         assert!(AclGuard::parse_authorization("Credential=only-key").is_none());
@@ -5395,8 +5478,7 @@ mod tests {
         let signature = auth::cal_signature(&[], "secret-1");
         let header = format!("Credential=alice, Signature={signature}");
         assert!(AclGuard::parse_authorization(&header).is_some());
-        let (access_key, parsed_signature) =
-            AclGuard::parse_authorization(&header).unwrap();
+        let (access_key, parsed_signature) = AclGuard::parse_authorization(&header).unwrap();
         let user = guard.metadata.get_user(&access_key).await.unwrap().unwrap();
         let expected = auth::cal_signature(&[], user.password.as_deref().unwrap_or(""));
         assert!(AclGuard::signature_matches(&expected, &parsed_signature));

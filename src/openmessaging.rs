@@ -28,10 +28,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{
-    Message as RocketMqMessage, Result, encode_properties, now_millis,
-    Error,
-};
+use crate::common::{Error, Message as RocketMqMessage, Result, encode_properties, now_millis};
 use crate::remoting::{self, Command};
 use serde::{Deserialize, Serialize};
 
@@ -132,7 +129,10 @@ impl KeyValue {
     }
 
     pub fn get_string_or(&self, key: &str, default: &str) -> String {
-        self.map.get(key).cloned().unwrap_or_else(|| default.to_string())
+        self.map
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| default.to_string())
     }
 
     pub fn get_i32(&self, key: &str) -> Option<i32> {
@@ -289,7 +289,10 @@ impl SendResult {
             topic: message.topic.clone(),
             queue_id: message.queue_id,
             queue_offset: message.queue_offset as i64,
-            region_id: message.properties.get(rmq_msg_keys::MSG_REGION).map(|s| s.to_string()),
+            region_id: message
+                .properties
+                .get(rmq_msg_keys::MSG_REGION)
+                .map(|s| s.to_string()),
             trace_id: None,
             properties: KeyValue::new(),
         }
@@ -365,7 +368,10 @@ impl FutureState {
     }
     /// Java: `isDoneState` — a terminal state (success, failure, or cancel).
     pub fn is_done(self) -> bool {
-        matches!(self, FutureState::Success | FutureState::Failure | FutureState::Cancel)
+        matches!(
+            self,
+            FutureState::Success | FutureState::Failure | FutureState::Cancel
+        )
     }
     pub fn is_success(self) -> bool {
         self == FutureState::Success
@@ -524,12 +530,7 @@ impl<T> DefaultPromise<T> {
 
     // --- internal helpers ---
 
-    fn finish(
-        &self,
-        state: FutureState,
-        result: Option<T>,
-        exception: Option<String>,
-    ) -> bool {
+    fn finish(&self, state: FutureState, result: Option<T>, exception: Option<String>) -> bool {
         let mut guard = self.inner.state.lock().unwrap();
         if guard.future_state.is_done() {
             return false;
@@ -645,7 +646,12 @@ impl Default for ClientConfig {
 impl ClientConfig {
     /// Validate that a consumer group is present (RocketMQ requires it).
     pub fn check_consumer_group(&self) -> Result<()> {
-        if self.consumer_id.as_ref().map(String::is_empty).unwrap_or(true) {
+        if self
+            .consumer_id
+            .as_ref()
+            .map(String::is_empty)
+            .unwrap_or(true)
+        {
             return Err(Error::Invalid(
                 "Consumer Group is necessary for RocketMQ, please set it.".into(),
             ));
@@ -706,9 +712,10 @@ impl OmsUtil {
 
         if let Some(start_time) = oms.sys_headers.get_i64(oms_keys::START_TIME) {
             if start_time > 0 {
-                message
-                    .properties
-                    .insert(rmq_constants::START_DELIVER_TIME.to_string(), start_time.to_string());
+                message.properties.insert(
+                    rmq_constants::START_DELIVER_TIME.to_string(),
+                    start_time.to_string(),
+                );
             }
         }
 
@@ -777,7 +784,11 @@ impl BeanUtils {
 
     fn apply(config: &mut ClientConfig, key: &str, value: &str) {
         // Normalize: lowercase, drop every non-alphanumeric char (collapses `.`/`_`/camelCase).
-        let normalized: String = key.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+        let normalized: String = key
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
         let set_str = |slot: &mut Option<String>| *slot = Some(value.to_string());
         match normalized.as_str() {
             "driverimpl" => set_str(&mut config.driver_impl),
@@ -961,10 +972,13 @@ impl RemotingProducerClient {
     /// Try each access point in turn; the first reachable broker wins (the Java OMS bridge
     /// likewise sends straight to the configured access points).
     async fn invoke(&self, request: Command) -> Result<Command> {
-        let mut last =
-            Error::Invalid("no access points configured (set accessPoints)".into());
+        let mut last = Error::Invalid("no access points configured (set accessPoints)".into());
         for addr in &self.addrs {
-            match self.transport.invoke(addr, request.clone(), self.timeout).await {
+            match self
+                .transport
+                .invoke(addr, request.clone(), self.timeout)
+                .await
+            {
                 Ok(response) => return Ok(response),
                 Err(error) => last = error,
             }
@@ -1013,8 +1027,7 @@ impl RemotingProducerClient {
 
     pub async fn send_oneway(&self, message: &RocketMqMessage) -> Result<()> {
         let request = Self::build_send(message, &self.producer_group)?;
-        let mut last =
-            Error::Invalid("no access points configured (set accessPoints)".into());
+        let mut last = Error::Invalid("no access points configured (set accessPoints)".into());
         for addr in &self.addrs {
             match self.transport.send_oneway(addr, request.clone()).await {
                 Ok(()) => return Ok(()),
@@ -1052,10 +1065,13 @@ impl RemotingConsumerClient {
     }
 
     async fn invoke(&self, request: Command) -> Result<Command> {
-        let mut last =
-            Error::Invalid("no access points configured (set accessPoints)".into());
+        let mut last = Error::Invalid("no access points configured (set accessPoints)".into());
         for addr in &self.addrs {
-            match self.transport.invoke(addr, request.clone(), self.timeout).await {
+            match self
+                .transport
+                .invoke(addr, request.clone(), self.timeout)
+                .await
+            {
                 Ok(response) => return Ok(response),
                 Err(error) => last = error,
             }
@@ -1065,11 +1081,7 @@ impl RemotingConsumerClient {
 
     /// QUERY_CONSUMER_OFFSET (code 14); `None` when the broker answers 22 — nothing has been
     /// committed for this queue yet and consumption starts from offset 0.
-    pub async fn query_consumer_offset(
-        &self,
-        topic: &str,
-        queue_id: i32,
-    ) -> Result<Option<i64>> {
+    pub async fn query_consumer_offset(&self, topic: &str, queue_id: i32) -> Result<Option<i64>> {
         let request = Command::request(remoting_codes::QUERY_CONSUMER_OFFSET)
             .with_ext("topic", topic)
             .with_ext("consumerGroup", self.consumer_group.clone())
@@ -1426,7 +1438,9 @@ impl LocalMessageCache {
 
     /// Java: `nextPullBatchNums` — never ask for more than the cache can currently hold.
     pub fn next_pull_batch_nums(&self) -> i32 {
-        let remaining = self.capacity.saturating_sub(self.cache.lock().unwrap().len());
+        let remaining = self
+            .capacity
+            .saturating_sub(self.cache.lock().unwrap().len());
         self.batch_nums.min(remaining as i32)
     }
 
@@ -1476,10 +1490,7 @@ struct CtxInner {
 impl MessageContext {
     pub fn new() -> Self {
         let mut properties = KeyValue::new();
-        properties.put(
-            non_standard_keys::MESSAGE_CONSUME_STATUS,
-            "RECONSUME_LATER",
-        );
+        properties.put(non_standard_keys::MESSAGE_CONSUME_STATUS, "RECONSUME_LATER");
         Self {
             inner: Mutex::new(CtxInner {
                 properties,
@@ -1581,8 +1592,13 @@ impl PushConsumerImpl {
     }
 
     /// Java: `attachQueue(queueName, listener)` — register a listener for a topic/queue.
-    pub fn attach_queue(&mut self, queue_name: &str, listener: Arc<dyn MessageListener>) -> &mut Self {
-        self.subscribe_table.insert(queue_name.to_string(), listener);
+    pub fn attach_queue(
+        &mut self,
+        queue_name: &str,
+        listener: Arc<dyn MessageListener>,
+    ) -> &mut Self {
+        self.subscribe_table
+            .insert(queue_name.to_string(), listener);
         self
     }
 
@@ -1601,10 +1617,9 @@ impl PushConsumerImpl {
             .or_else(|| message.sys_headers.get(oms_keys::TOPIC))
             .ok_or_else(|| Error::Invalid("message has no DESTINATION/TOPIC".into()))?
             .to_string();
-        let listener = self
-            .subscribe_table
-            .get(&topic)
-            .ok_or_else(|| Error::NotFound(format!("topic {topic} is not attached to this consumer")))?;
+        let listener = self.subscribe_table.get(&topic).ok_or_else(|| {
+            Error::NotFound(format!("topic {topic} is not attached to this consumer"))
+        })?;
         let context = MessageContext::new();
         listener.on_received(message, &context);
         if context.is_acked() {
@@ -1629,7 +1644,10 @@ impl PushConsumerImpl {
     /// attached topic into the local cache (`pull_batch_into_cache`) and dispatches every
     /// cached message to its listener. Runs until [`PushConsumerImpl::shutdown`].
     pub async fn run(&self) -> Result<()> {
-        while self.started {
+        loop {
+            if !self.started {
+                break;
+            }
             if self.paused {
                 tokio::time::sleep(PUSH_IDLE_INTERVAL).await;
                 continue;
@@ -1753,19 +1771,16 @@ impl PullConsumerImpl {
     /// use, PULL_MESSAGE (code 11) a batch into the local cache, and commit advanced offsets
     /// (code 15). Exposed for driving single rounds without the loop.
     pub async fn pull_once(&self, topic: &str) -> Result<usize> {
-        pull_batch_into_cache(
-            &self.consumer_client,
-            &self.local_message_cache,
-            topic,
-            0,
-        )
-        .await
+        pull_batch_into_cache(&self.consumer_client, &self.local_message_cache, topic, 0).await
     }
 
     /// Java: `registerPullTaskCallback` / `doPullTask` — pull every attached queue in a loop
     /// until [`PullConsumerImpl::shutdown`].
     pub async fn pull_loop(&self) -> Result<()> {
-        while self.started {
+        loop {
+            if !self.started {
+                break;
+            }
             let mut delivered = 0usize;
             for topic in &self.attached_queues {
                 match self.pull_once(topic).await {
@@ -1860,8 +1875,16 @@ mod tests {
         assert_eq!(rmq.topic, "TestTopic");
         assert_eq!(rmq.body, b"hello-oms");
         // System header wins; START_TIME mapped to the scheduled-delivery property.
-        assert_eq!(rmq.properties.get(rmq_constants::START_DELIVER_TIME).unwrap(), "1700000000000");
-        assert_eq!(rmq.properties.get(oms_keys::SHARDING_KEY).unwrap(), "shard-1");
+        assert_eq!(
+            rmq.properties
+                .get(rmq_constants::START_DELIVER_TIME)
+                .unwrap(),
+            "1700000000000"
+        );
+        assert_eq!(
+            rmq.properties.get(oms_keys::SHARDING_KEY).unwrap(),
+            "shard-1"
+        );
         assert_eq!(rmq.properties.get(rmq_msg_keys::TAGS).unwrap(), "tagA");
         assert_eq!(rmq.properties.get(rmq_msg_keys::KEYS).unwrap(), "k1");
 
@@ -1869,12 +1892,17 @@ mod tests {
         let back = OmsUtil::msg_convert_from_ext(&rmq);
         assert_eq!(back.body(), b"hello-oms");
         // OMS-builtin keys land in sys-headers; RocketMQ tags/keys land in user-headers.
-        assert_eq!(back.sys_headers.get(oms_keys::DESTINATION).unwrap(), "TestTopic");
+        assert_eq!(
+            back.sys_headers.get(oms_keys::DESTINATION).unwrap(),
+            "TestTopic"
+        );
         assert_eq!(back.user_headers.get(rmq_msg_keys::TAGS).unwrap(), "tagA");
         assert_eq!(back.user_headers.get(rmq_msg_keys::KEYS).unwrap(), "k1");
         // The scheduled-delivery key is a RocketMQ property, not an OMS header -> user header.
         assert_eq!(
-            back.user_headers.get(rmq_constants::START_DELIVER_TIME).unwrap(),
+            back.user_headers
+                .get(rmq_constants::START_DELIVER_TIME)
+                .unwrap(),
             "1700000000000"
         );
 
@@ -2032,10 +2060,16 @@ mod tests {
 
         let producer = ap.create_producer();
         let msg = producer.inner.create_bytes_message("TopicA", b"x".to_vec());
-        assert_eq!(msg.sys_headers.get(oms_keys::DESTINATION).unwrap(), "TopicA");
+        assert_eq!(
+            msg.sys_headers.get(oms_keys::DESTINATION).unwrap(),
+            "TopicA"
+        );
 
         let consumer = ap.create_pull_consumer().expect("pull consumer");
-        assert_eq!(consumer.client_config().consumer_id.as_deref(), Some("group-1"));
+        assert_eq!(
+            consumer.client_config().consumer_id.as_deref(),
+            Some("group-1")
+        );
     }
 
     // --- remoting bridge (send / pull over a mock transport) ---
@@ -2071,10 +2105,7 @@ mod tests {
                 self.requests.lock().unwrap().push(request.clone());
                 let mut queues = self.responses.lock().unwrap();
                 let queue = queues.get_mut(&request.code).ok_or_else(|| {
-                    Error::Invalid(format!(
-                        "no canned response for code {}",
-                        request.code
-                    ))
+                    Error::Invalid(format!("no canned response for code {}", request.code))
                 })?;
                 if queue.is_empty() {
                     return Err(Error::Invalid(format!(
@@ -2150,14 +2181,30 @@ mod tests {
         // The request must match the broker's `send` ext field names exactly (wire compat).
         let request = mock.request(0);
         assert_eq!(request.code, remoting_codes::SEND_MESSAGE);
-        assert_eq!(request.ext_fields.get("topic").map(String::as_str), Some("TopicA"));
+        assert_eq!(
+            request.ext_fields.get("topic").map(String::as_str),
+            Some("TopicA")
+        );
         assert_eq!(
             request.ext_fields.get("producerGroup").map(String::as_str),
             Some("oms-producer")
         );
-        assert_eq!(request.ext_fields.get("queueId").map(String::as_str), Some("-1"));
-        assert_eq!(request.ext_fields.get("sysFlag").map(String::as_str), Some("0"));
-        assert!(request.ext_fields.get("flag").unwrap().parse::<i32>().is_ok());
+        assert_eq!(
+            request.ext_fields.get("queueId").map(String::as_str),
+            Some("-1")
+        );
+        assert_eq!(
+            request.ext_fields.get("sysFlag").map(String::as_str),
+            Some("0")
+        );
+        assert!(
+            request
+                .ext_fields
+                .get("flag")
+                .unwrap()
+                .parse::<i32>()
+                .is_ok()
+        );
         assert!(
             request
                 .ext_fields
@@ -2194,22 +2241,27 @@ mod tests {
         // Nothing committed yet -> the broker answers 22 and consumption starts at 0.
         responses.insert(
             remoting_codes::QUERY_CONSUMER_OFFSET,
-            vec![response_stub(remoting_codes::CONSUMER_OFFSET_NOT_EXIST, &[])],
+            vec![response_stub(
+                remoting_codes::CONSUMER_OFFSET_NOT_EXIST,
+                &[],
+            )],
         );
         // Ext fields mirror `pull_response` (broker.rs).
         responses.insert(
             remoting_codes::PULL_MESSAGE,
-            vec![response_stub(
-                remoting_codes::PULL_FOUND,
-                &[
-                    ("suggestWhichBrokerId", "0".to_string()),
-                    ("nextBeginOffset", "4".to_string()),
-                    ("minOffset", "0".to_string()),
-                    ("maxOffset", "4".to_string()),
-                    ("offsetDelta", "0".to_string()),
-                ],
-            )
-            .with_body(body)],
+            vec![
+                response_stub(
+                    remoting_codes::PULL_FOUND,
+                    &[
+                        ("suggestWhichBrokerId", "0".to_string()),
+                        ("nextBeginOffset", "4".to_string()),
+                        ("minOffset", "0".to_string()),
+                        ("maxOffset", "4".to_string()),
+                        ("offsetDelta", "0".to_string()),
+                    ],
+                )
+                .with_body(body),
+            ],
         );
         responses.insert(
             remoting_codes::UPDATE_CONSUMER_OFFSET,
@@ -2217,50 +2269,72 @@ mod tests {
         );
         let mock = Arc::new(MockTransport::new(responses));
 
-        let mut consumer =
-            PullConsumerImpl::with_transport(props, mock.clone()).expect("consumer");
+        let mut consumer = PullConsumerImpl::with_transport(props, mock.clone()).expect("consumer");
         consumer.attach_queue("TopicA");
         assert_eq!(consumer.pull_once("TopicA").await.expect("pull once"), 1);
 
         // The pulled record became an OMS message in the local cache.
         let oms = consumer.receive().expect("receive");
         assert_eq!(oms.body(), b"m1");
-        assert_eq!(
-            oms.user_headers.get(rmq_msg_keys::TAGS),
-            Some("tagA")
-        );
-        assert_eq!(
-            oms.sys_headers
-                .get(oms_keys::DESTINATION),
-            Some("TopicA")
-        );
+        assert_eq!(oms.user_headers.get(rmq_msg_keys::TAGS), Some("tagA"));
+        assert_eq!(oms.sys_headers.get(oms_keys::DESTINATION), Some("TopicA"));
 
         // Wire order: offset query (code 14) -> pull (code 11) -> offset commit (code 15).
         let requests = mock.requests.lock().unwrap();
         assert_eq!(requests[0].code, remoting_codes::QUERY_CONSUMER_OFFSET);
-        assert_eq!(requests[0].ext_fields.get("topic").map(String::as_str), Some("TopicA"));
         assert_eq!(
-            requests[0].ext_fields.get("consumerGroup").map(String::as_str),
+            requests[0].ext_fields.get("topic").map(String::as_str),
+            Some("TopicA")
+        );
+        assert_eq!(
+            requests[0]
+                .ext_fields
+                .get("consumerGroup")
+                .map(String::as_str),
             Some("oms-group")
         );
-        assert_eq!(requests[0].ext_fields.get("queueId").map(String::as_str), Some("0"));
+        assert_eq!(
+            requests[0].ext_fields.get("queueId").map(String::as_str),
+            Some("0")
+        );
 
         assert_eq!(requests[1].code, remoting_codes::PULL_MESSAGE);
-        assert_eq!(requests[1].ext_fields.get("queueOffset").map(String::as_str), Some("0"));
-        assert_eq!(requests[1].ext_fields.get("maxMsgNums").map(String::as_str), Some("32"));
-        assert_eq!(requests[1].ext_fields.get("sysFlag").map(String::as_str), Some("4"));
         assert_eq!(
-            requests[1].ext_fields.get("expressionType").map(String::as_str),
+            requests[1]
+                .ext_fields
+                .get("queueOffset")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            requests[1].ext_fields.get("maxMsgNums").map(String::as_str),
+            Some("32")
+        );
+        assert_eq!(
+            requests[1].ext_fields.get("sysFlag").map(String::as_str),
+            Some("4")
+        );
+        assert_eq!(
+            requests[1]
+                .ext_fields
+                .get("expressionType")
+                .map(String::as_str),
             Some("TAG")
         );
         assert_eq!(
-            requests[1].ext_fields.get("subscription").map(String::as_str),
+            requests[1]
+                .ext_fields
+                .get("subscription")
+                .map(String::as_str),
             Some("*")
         );
 
         assert_eq!(requests[2].code, remoting_codes::UPDATE_CONSUMER_OFFSET);
         assert_eq!(
-            requests[2].ext_fields.get("commitOffset").map(String::as_str),
+            requests[2]
+                .ext_fields
+                .get("commitOffset")
+                .map(String::as_str),
             Some("4")
         );
         drop(requests);

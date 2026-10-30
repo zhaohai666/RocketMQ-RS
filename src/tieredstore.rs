@@ -149,27 +149,18 @@ mod size_format {
                 formatter.write_str("byte size as integer or string like \"1g\"")
             }
 
-            fn visit_u64<E: serde::de::Error>(
-                self,
-                value: u64,
-            ) -> core::result::Result<u64, E> {
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> core::result::Result<u64, E> {
                 Ok(value)
             }
 
-            fn visit_i64<E: serde::de::Error>(
-                self,
-                value: i64,
-            ) -> core::result::Result<u64, E> {
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> core::result::Result<u64, E> {
                 if value < 0 {
                     return Err(E::custom(format!("negative size: {value}")));
                 }
                 Ok(value as u64)
             }
 
-            fn visit_str<E: serde::de::Error>(
-                self,
-                value: &str,
-            ) -> core::result::Result<u64, E> {
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> core::result::Result<u64, E> {
                 parse_size(value).map_err(E::custom)
             }
         }
@@ -416,7 +407,9 @@ fn decode_message(payload: &[u8]) -> Result<Message> {
         message.properties.insert(key, value);
     }
     if cursor.pos != cursor.data.len() {
-        return Err(Error::Invalid("trailing bytes in message record".to_string()));
+        return Err(Error::Invalid(
+            "trailing bytes in message record".to_string(),
+        ));
     }
     Ok(message)
 }
@@ -765,7 +758,13 @@ struct SegmentInner {
 }
 
 impl TieredFileSegment {
-    pub fn new(root: PathBuf, topic: String, queue_id: i32, base_offset: u64, max_size: u64) -> Self {
+    pub fn new(
+        root: PathBuf,
+        topic: String,
+        queue_id: i32,
+        base_offset: u64,
+        max_size: u64,
+    ) -> Self {
         Self {
             root,
             topic,
@@ -1095,7 +1094,12 @@ impl TieredFileStore {
         Ok(())
     }
 
-    fn create_segment(&self, topic: &str, queue_id: i32, base_offset: u64) -> Arc<TieredFileSegment> {
+    fn create_segment(
+        &self,
+        topic: &str,
+        queue_id: i32,
+        base_offset: u64,
+    ) -> Arc<TieredFileSegment> {
         let segment = Arc::new(TieredFileSegment::new(
             self.root.clone(),
             topic.to_string(),
@@ -1138,9 +1142,7 @@ impl TieredFileStore {
         // The guard is held for the whole append loop; nothing inside the
         // loop re-locks `self.queues`, so this cannot deadlock.
         let mut queue_table = self.queues.lock().unwrap();
-        let entry = queue_table
-            .entry((topic.clone(), queue_id))
-            .or_default();
+        let entry = queue_table.entry((topic.clone(), queue_id)).or_default();
         loop {
             if entry.segments.is_empty() {
                 let segment = self.create_segment(&topic, queue_id, message.queue_offset);
@@ -1220,7 +1222,13 @@ impl TieredFileStore {
     /// Read up to `max_count` committed messages starting at queue `offset`,
     /// transparently crossing segment boundaries (Java
     /// `FlatAppendFile.readAsync`). Only committed data is visible.
-    pub fn read(&self, topic: &str, queue_id: i32, offset: u64, max_count: usize) -> Result<Vec<Message>> {
+    pub fn read(
+        &self,
+        topic: &str,
+        queue_id: i32,
+        offset: u64,
+        max_count: usize,
+    ) -> Result<Vec<Message>> {
         if max_count == 0 {
             return Ok(Vec::new());
         }
@@ -1492,7 +1500,13 @@ pub trait HotStoreReader: Send + Sync {
     /// Read up to `max_count` messages of a queue starting at `offset`.
     /// Implementations should return `Error::NotFound` when the requested
     /// offset is out of the hot range.
-    fn read(&self, topic: &str, queue_id: i32, offset: u64, max_count: usize) -> Result<Vec<Message>>;
+    fn read(
+        &self,
+        topic: &str,
+        queue_id: i32,
+        offset: u64,
+        max_count: usize,
+    ) -> Result<Vec<Message>>;
 
     /// Next offset after the last message of the queue (0 when empty).
     fn max_offset(&self, topic: &str, queue_id: i32) -> u64;
@@ -1547,7 +1561,13 @@ impl TieredMessageStore {
     /// because [`HotStoreReader`] cannot report page-cache residency, so both
     /// levels treat any offset outside the hot `[min, max)` range as "not in
     /// store".
-    pub fn fetch_from_cold(&self, topic: &str, queue_id: i32, offset: u64, batch_size: usize) -> bool {
+    pub fn fetch_from_cold(
+        &self,
+        topic: &str,
+        queue_id: i32,
+        offset: u64,
+        batch_size: usize,
+    ) -> bool {
         let level = self.config.storage_level;
         if level.check(TieredStorageLevel::Force) {
             return true;
@@ -1572,7 +1592,13 @@ impl TieredMessageStore {
     /// the level says so, falling back to the hot store on miss or error
     /// (Java falls back on `OFFSET_FOUND_NULL` / `NO_MATCHED_LOGIC_QUEUE` and
     /// on fetcher exceptions).
-    pub fn get_message(&self, topic: &str, queue_id: i32, offset: u64, max_count: usize) -> Result<Vec<Message>> {
+    pub fn get_message(
+        &self,
+        topic: &str,
+        queue_id: i32,
+        offset: u64,
+        max_count: usize,
+    ) -> Result<Vec<Message>> {
         if !self.fetch_from_cold(topic, queue_id, offset, max_count) {
             return self.hot.read(topic, queue_id, offset, max_count);
         }
@@ -1773,18 +1799,38 @@ mod tests {
         assert!(cache.is_empty());
 
         let mut content = String::new();
-        cache.get_or_open(&path_a).unwrap().read_to_string(&mut content).unwrap();
-        cache.get_or_open(&path_b).unwrap().read_to_string(&mut content).unwrap();
+        cache
+            .get_or_open(&path_a)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        cache
+            .get_or_open(&path_b)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
         assert_eq!(cache.len(), 2);
 
         // Touch `a` so `b` becomes the LRU entry, then insert `c`.
-        cache.get_or_open(&path_a).unwrap().read_to_string(&mut content).unwrap();
-        cache.get_or_open(&path_c).unwrap().read_to_string(&mut content).unwrap();
+        cache
+            .get_or_open(&path_a)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        cache
+            .get_or_open(&path_c)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
         assert_eq!(cache.len(), 2);
 
         // Evicted entries can be reopened; contents stay readable.
         cache.invalidate(&path_a);
-        cache.get_or_open(&path_b).unwrap().read_to_string(&mut content).unwrap();
+        cache
+            .get_or_open(&path_b)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
         assert!(content.contains("alpha") && content.contains("beta") && content.contains("gamma"));
     }
 
@@ -1855,7 +1901,10 @@ mod tests {
         assert_eq!(recovered.committed_records(), 5);
         assert!(recovered.is_sealed());
         let mut cache = FileHandleCache::new(4);
-        assert_eq!(recovered.read(&mut cache, 102, 2).unwrap()[0].queue_offset, 102);
+        assert_eq!(
+            recovered.read(&mut cache, 102, 2).unwrap()[0].queue_offset,
+            102
+        );
     }
 
     // -- file store -----------------------------------------------------------
@@ -1875,13 +1924,21 @@ mod tests {
 
         for offset in 0..32u64 {
             store
-                .append_message(&make_message("rolling-topic", 0, offset, 10_000 + offset as i64 * 10))
+                .append_message(&make_message(
+                    "rolling-topic",
+                    0,
+                    offset,
+                    10_000 + offset as i64 * 10,
+                ))
                 .unwrap();
         }
         store.flush().unwrap();
 
         let segment_count = store.metrics().segment_count;
-        assert!(segment_count >= 2, "expected rolling across segments, got {segment_count}");
+        assert!(
+            segment_count >= 2,
+            "expected rolling across segments, got {segment_count}"
+        );
         assert_eq!(store.metrics().message_count, 32);
         assert_eq!(store.max_offset("rolling-topic", 0), Some(32));
         assert_eq!(store.min_offset("rolling-topic", 0), Some(0));
@@ -1935,7 +1992,13 @@ mod tests {
     }
 
     impl HotStoreReader for MockHotStore {
-        fn read(&self, topic: &str, queue_id: i32, offset: u64, max_count: usize) -> Result<Vec<Message>> {
+        fn read(
+            &self,
+            topic: &str,
+            queue_id: i32,
+            offset: u64,
+            max_count: usize,
+        ) -> Result<Vec<Message>> {
             self.read_calls.fetch_add(1, Ordering::SeqCst);
             let matched: Vec<Message> = self
                 .messages
@@ -1945,7 +2008,9 @@ mod tests {
                 .cloned()
                 .collect();
             if matched.is_empty() {
-                Err(Error::NotFound(format!("hot miss {topic}/{queue_id}@{offset}")))
+                Err(Error::NotFound(format!(
+                    "hot miss {topic}/{queue_id}@{offset}"
+                )))
             } else {
                 Ok(matched)
             }
@@ -1984,14 +2049,13 @@ mod tests {
             storage_level: TieredStorageLevel::Force,
             ..TieredStoreConfig::default()
         };
-        let cold = TieredFileStore::open(
-            dir.path().join("cold"),
-            config.clone(),
-            memory_metadata(),
-        )
-        .unwrap();
+        let cold =
+            TieredFileStore::open(dir.path().join("cold"), config.clone(), memory_metadata())
+                .unwrap();
         let hot = Arc::new(MockHotStore::new(
-            (0..6u64).map(|i| make_message("fb-topic", 0, i, 100 + i as i64)).collect(),
+            (0..6u64)
+                .map(|i| make_message("fb-topic", 0, i, 100 + i as i64))
+                .collect(),
         ));
         let store = TieredMessageStore::new(config, hot.clone(), cold.clone());
 
@@ -2042,19 +2106,18 @@ mod tests {
             storage_level: TieredStorageLevel::NotInDisk,
             ..TieredStoreConfig::default()
         };
-        let cold = TieredFileStore::open(
-            dir.path().join("cold"),
-            config.clone(),
-            memory_metadata(),
-        )
-        .unwrap();
+        let cold =
+            TieredFileStore::open(dir.path().join("cold"), config.clone(), memory_metadata())
+                .unwrap();
         for offset in 0..4u64 {
             cold.append_message(&make_message("lv-topic", 0, offset, 200 + offset as i64))
                 .unwrap();
         }
         cold.flush().unwrap();
         let hot = Arc::new(MockHotStore::new(
-            (2..6u64).map(|i| make_message("lv-topic", 0, i, 200 + i as i64)).collect(),
+            (2..6u64)
+                .map(|i| make_message("lv-topic", 0, i, 200 + i as i64))
+                .collect(),
         ));
 
         // NOT_IN_DISK: offset 0 is outside the hot range -> cold read.
@@ -2090,12 +2153,9 @@ mod tests {
             group_commit_count: 4,
             ..TieredStoreConfig::default()
         };
-        let cold = TieredFileStore::open(
-            dir.path().join("cold"),
-            config.clone(),
-            memory_metadata(),
-        )
-        .unwrap();
+        let cold =
+            TieredFileStore::open(dir.path().join("cold"), config.clone(), memory_metadata())
+                .unwrap();
         let manager = MessageBufferManager::new(config, cold.clone());
 
         for offset in 0..3u64 {
@@ -2125,15 +2185,18 @@ mod tests {
             max_pending_limit: 2,
             ..TieredStoreConfig::default()
         };
-        let cold = TieredFileStore::open(
-            dir.path().join("cold2"),
-            config.clone(),
-            memory_metadata(),
-        )
-        .unwrap();
+        let cold =
+            TieredFileStore::open(dir.path().join("cold2"), config.clone(), memory_metadata())
+                .unwrap();
         let manager = MessageBufferManager::new(config, cold);
-        manager.dispatch(make_message("bp-topic", 0, 0, 0)).await.unwrap();
-        manager.dispatch(make_message("bp-topic", 0, 1, 0)).await.unwrap();
+        manager
+            .dispatch(make_message("bp-topic", 0, 0, 0))
+            .await
+            .unwrap();
+        manager
+            .dispatch(make_message("bp-topic", 0, 1, 0))
+            .await
+            .unwrap();
         assert!(matches!(
             manager.dispatch(make_message("bp-topic", 0, 2, 0)).await,
             Err(Error::Timeout(_))
@@ -2148,23 +2211,19 @@ mod tests {
             group_commit_count: 4,
             ..TieredStoreConfig::default()
         };
-        let cold = TieredFileStore::open(
-            dir.path().join("cold"),
-            config.clone(),
-            memory_metadata(),
-        )
-        .unwrap();
+        let cold =
+            TieredFileStore::open(dir.path().join("cold"), config.clone(), memory_metadata())
+                .unwrap();
         let hot = Arc::new(MockHotStore::new(
-            (0..8u64).map(|i| make_message("pull-topic", 0, i, 400 + i as i64)).collect(),
+            (0..8u64)
+                .map(|i| make_message("pull-topic", 0, i, 400 + i as i64))
+                .collect(),
         ));
         let store = TieredMessageStore::new(config, hot.clone(), cold.clone());
 
         let moved = store.dispatch_from_hot("pull-topic", 0).await.unwrap();
         assert_eq!(moved, 8);
-        let read = store
-            .cold_store()
-            .read("pull-topic", 0, 0, 8)
-            .unwrap();
+        let read = store.cold_store().read("pull-topic", 0, 0, 8).unwrap();
         assert_eq!(read.len(), 8);
         assert_eq!(read[7].queue_offset, 7);
 
@@ -2173,10 +2232,7 @@ mod tests {
         assert_eq!(moved, 0);
 
         // Timestamp lookups are served from the cold store (Force level).
-        assert_eq!(
-            store.message_store_timestamp("pull-topic", 0, 5),
-            Some(405)
-        );
+        assert_eq!(store.message_store_timestamp("pull-topic", 0, 5), Some(405));
         assert_eq!(store.min_offset_in_queue("pull-topic", 0), 0);
         assert_eq!(store.max_offset_in_queue("pull-topic", 0), 8);
         assert_eq!(store.metrics().message_count, 8);

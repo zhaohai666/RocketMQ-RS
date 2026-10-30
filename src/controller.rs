@@ -283,7 +283,12 @@ impl BrokerReplicaInfo {
         }
     }
 
-    pub fn add_broker(&mut self, broker_id: i64, address: impl Into<String>, check_code: impl Into<String>) {
+    pub fn add_broker(
+        &mut self,
+        broker_id: i64,
+        address: impl Into<String>,
+        check_code: impl Into<String>,
+    ) {
         self.broker_id_info
             .insert(broker_id, (address.into(), check_code.into()));
         if broker_id >= self.next_assign_broker_id {
@@ -446,18 +451,26 @@ impl DefaultElectPolicy {
             return None;
         }
         if let Some(old) = old_master {
-            if alive.contains(&old) && (prefer_broker_id.is_none() || prefer_broker_id == Some(old)) {
+            if alive.contains(&old) && (prefer_broker_id.is_none() || prefer_broker_id == Some(old))
+            {
                 return Some(old);
             }
         }
         if let Some(prefer) = prefer_broker_id {
-            return if alive.contains(&prefer) { Some(prefer) } else { None };
+            return if alive.contains(&prefer) {
+                Some(prefer)
+            } else {
+                None
+            };
         }
         // Rank by (epoch desc, maxOffset desc, electionPriority asc).
         alive
             .iter()
             .map(|id| {
-                let info = self.getter.get(cluster, broker_name, *id).unwrap_or_default();
+                let info = self
+                    .getter
+                    .get(cluster, broker_name, *id)
+                    .unwrap_or_default();
                 (*id, info)
             })
             .max_by(|a, b| {
@@ -480,7 +493,13 @@ impl ElectPolicy for DefaultElectPolicy {
         old_master: Option<i64>,
         prefer_broker_id: Option<i64>,
     ) -> Option<i64> {
-        if let Some(new) = self.try_elect(cluster, broker_name, sync_state_brokers, old_master, prefer_broker_id) {
+        if let Some(new) = self.try_elect(
+            cluster,
+            broker_name,
+            sync_state_brokers,
+            old_master,
+            prefer_broker_id,
+        ) {
             return Some(new);
         }
         if let Some(all) = all_replica_brokers {
@@ -564,7 +583,8 @@ impl ReplicasInfoManager {
         let existing = self.replica_info_table.get(broker_name);
         if let Some(info) = existing {
             if !info.is_broker_exist(broker_id)
-                || info.broker_register_check_code(broker_id).as_deref() == Some(register_check_code)
+                || info.broker_register_check_code(broker_id).as_deref()
+                    == Some(register_check_code)
             {
                 return ControllerResult {
                     events: vec![Box::new(ApplyBrokerIdEvent {
@@ -599,7 +619,9 @@ impl ReplicasInfoManager {
         ControllerResult::failed(
             (),
             response_code::CONTROLLER_BROKER_ID_INVALID,
-            format!("Broker-set: {broker_name} hasn't been registered, but broker tries to apply brokerId: {broker_id}"),
+            format!(
+                "Broker-set: {broker_name} hasn't been registered, but broker tries to apply brokerId: {broker_id}"
+            ),
         )
     }
 
@@ -636,7 +658,9 @@ impl ReplicasInfoManager {
             return ControllerResult::failed(
                 (),
                 response_code::CONTROLLER_BROKER_NEED_TO_BE_REGISTERED,
-                format!("BrokerId: {broker_id} hasn't been registered in broker-set: {broker_name}"),
+                format!(
+                    "BrokerId: {broker_id} hasn't been registered in broker-set: {broker_name}"
+                ),
             );
         }
         let mut result = ControllerResult::ok(());
@@ -792,21 +816,30 @@ impl ReplicasInfoManager {
             return ControllerResult::failed(
                 (),
                 response_code::CONTROLLER_INVALID_MASTER,
-                format!("Rejecting alter syncStateSet because the current leader is {sync_master:?}, not {master_broker_id:?}", sync_master = sync.master_broker_id),
+                format!(
+                    "Rejecting alter syncStateSet because the current leader is {sync_master:?}, not {master_broker_id:?}",
+                    sync_master = sync.master_broker_id
+                ),
             );
         }
         if master_epoch != sync.master_epoch {
             return ControllerResult::failed(
                 (),
                 response_code::CONTROLLER_FENCED_MASTER_EPOCH,
-                format!("Rejecting alter syncStateSet because the current master epoch is {}, not {master_epoch}", sync.master_epoch),
+                format!(
+                    "Rejecting alter syncStateSet because the current master epoch is {}, not {master_epoch}",
+                    sync.master_epoch
+                ),
             );
         }
         if sync_state_set_epoch != sync.sync_state_set_epoch {
             return ControllerResult::failed(
                 (),
                 response_code::CONTROLLER_FENCED_SYNC_STATE_SET_EPOCH,
-                format!("Rejecting alter syncStateSet because the current syncStateSet epoch is {}, not {sync_state_set_epoch}", sync.sync_state_set_epoch),
+                format!(
+                    "Rejecting alter syncStateSet because the current syncStateSet epoch is {}, not {sync_state_set_epoch}",
+                    sync.sync_state_set_epoch
+                ),
             );
         }
         for replica in &new_sync_state_set {
@@ -814,14 +847,18 @@ impl ReplicasInfoManager {
                 return ControllerResult::failed(
                     (),
                     response_code::CONTROLLER_INVALID_REPLICAS,
-                    format!("Rejecting alter syncStateSet because the replicas {replica} don't exist"),
+                    format!(
+                        "Rejecting alter syncStateSet because the replicas {replica} don't exist"
+                    ),
                 );
             }
             if !alive.check(&info.cluster_name, broker_name, *replica) {
                 return ControllerResult::failed(
                     (),
                     response_code::CONTROLLER_BROKER_NOT_ALIVE,
-                    format!("Rejecting alter syncStateSet because the replicas {replica} don't alive"),
+                    format!(
+                        "Rejecting alter syncStateSet because the replicas {replica} don't alive"
+                    ),
                 );
             }
         }
@@ -829,7 +866,10 @@ impl ReplicasInfoManager {
             return ControllerResult::failed(
                 (),
                 response_code::CONTROLLER_ALTER_SYNC_STATE_SET_FAILED,
-                format!("Rejecting alter syncStateSet because the newSyncStateSet doesn't contain origin leader {:?}", sync.master_broker_id),
+                format!(
+                    "Rejecting alter syncStateSet because the newSyncStateSet doesn't contain origin leader {:?}",
+                    sync.master_broker_id
+                ),
             );
         }
         let mut result = ControllerResult::ok(());
@@ -847,7 +887,10 @@ impl ReplicasInfoManager {
     }
 
     /// Java `getReplicaInfo`.
-    pub fn get_replica_info(&self, broker_name: &str) -> ControllerResult<GetReplicaInfoResponseHeader> {
+    pub fn get_replica_info(
+        &self,
+        broker_name: &str,
+    ) -> ControllerResult<GetReplicaInfoResponseHeader> {
         if self.contains_broker(broker_name) {
             let sync = &self.sync_state_set_info_table[broker_name];
             let info = &self.replica_info_table[broker_name];
@@ -941,7 +984,9 @@ impl ReplicasInfoManager {
                             return ControllerResult::failed(
                                 (),
                                 response_code::CONTROLLER_INVALID_CLEAN_BROKER_METADATA,
-                                format!("Broker [{broker_name}, {id}] is still alive, clean up failure"),
+                                format!(
+                                    "Broker [{broker_name}, {id}] is still alive, clean up failure"
+                                ),
                             );
                         }
                     }
@@ -998,13 +1043,23 @@ impl ReplicasInfoManager {
             EventType::ApplyBrokerId => {
                 if let Some(ev) = event.as_any().downcast_ref::<ApplyBrokerIdEvent>() {
                     if let Some(info) = self.replica_info_table.get_mut(&ev.broker_name) {
-                        info.add_broker(ev.new_broker_id, ev.broker_address.clone(), ev.register_check_code.clone());
+                        info.add_broker(
+                            ev.new_broker_id,
+                            ev.broker_address.clone(),
+                            ev.register_check_code.clone(),
+                        );
                     } else {
                         let mut info = BrokerReplicaInfo::new(&ev.cluster_name, &ev.broker_name);
-                        info.add_broker(ev.new_broker_id, ev.broker_address.clone(), ev.register_check_code.clone());
+                        info.add_broker(
+                            ev.new_broker_id,
+                            ev.broker_address.clone(),
+                            ev.register_check_code.clone(),
+                        );
                         self.replica_info_table.insert(ev.broker_name.clone(), info);
-                        self.sync_state_set_info_table
-                            .insert(ev.broker_name.clone(), SyncStateInfo::new(&ev.cluster_name, &ev.broker_name));
+                        self.sync_state_set_info_table.insert(
+                            ev.broker_name.clone(),
+                            SyncStateInfo::new(&ev.cluster_name, &ev.broker_name),
+                        );
                     }
                 }
             }
@@ -1105,12 +1160,9 @@ impl DefaultBrokerHeartbeatManager {
 impl BrokerAlive for DefaultBrokerHeartbeatManager {
     fn check(&self, _cluster: &str, broker_name: &str, broker_id: i64) -> bool {
         let map = self.heartbeats.lock().unwrap();
-        map.iter()
-            .any(|((_, name, id), info)| {
-                name == broker_name
-                    && *id == broker_id
-                    && info.last_seen.elapsed() < self.timeout
-            })
+        map.iter().any(|((_, name, id), info)| {
+            name == broker_name && *id == broker_id && info.last_seen.elapsed() < self.timeout
+        })
     }
 }
 
@@ -1184,7 +1236,10 @@ impl Controller {
             let applier_manager = manager.clone();
             let applier: Arc<dyn Fn(SerdeEvent) + Send + Sync> =
                 Arc::new(move |event: SerdeEvent| {
-                    applier_manager.lock().unwrap().apply_event(event.into_event());
+                    applier_manager
+                        .lock()
+                        .unwrap()
+                        .apply_event(event.into_event());
                 });
             Some(Arc::new(RaftNode::new(
                 config.node_id.clone(),
@@ -1209,7 +1264,10 @@ impl Controller {
     /// Apply the events produced by a manager read. Single-node mode applies them straight into
     /// the state machine; Raft mode commits them through the replicated log first — the applier
     /// callback applies them on commit, so the caller must not apply them again.
-    async fn apply<T>(&self, result: ControllerResult<T>) -> (i32, Option<String>, Option<Vec<u8>>) {
+    async fn apply<T>(
+        &self,
+        result: ControllerResult<T>,
+    ) -> (i32, Option<String>, Option<Vec<u8>>) {
         let ControllerResult {
             code,
             remark,
@@ -1256,14 +1314,21 @@ impl Controller {
         check_code: &str,
     ) -> (i32, Option<String>) {
         let result = self.manager.lock().unwrap().apply_broker_id(
-            cluster, broker_name, broker_address, broker_id, check_code,
+            cluster,
+            broker_name,
+            broker_address,
+            broker_id,
+            check_code,
         );
         let (code, remark, _) = self.apply(result).await;
         (code, remark)
     }
 
     pub fn get_next_broker_id(&self, cluster: &str, broker_name: &str) -> (i64, i32) {
-        self.manager.lock().unwrap().get_next_broker_id(cluster, broker_name)
+        self.manager
+            .lock()
+            .unwrap()
+            .get_next_broker_id(cluster, broker_name)
     }
 
     pub async fn register_broker(
@@ -1274,7 +1339,11 @@ impl Controller {
         broker_id: i64,
     ) -> (i32, Option<String>, Option<Vec<u8>>) {
         let result = self.manager.lock().unwrap().register_broker(
-            cluster, broker_name, broker_address, broker_id, &*self.heartbeat,
+            cluster,
+            broker_name,
+            broker_address,
+            broker_id,
+            &*self.heartbeat,
         );
         self.apply(result).await
     }
@@ -1314,12 +1383,18 @@ impl Controller {
         (code, remark)
     }
 
-    pub async fn get_replica_info(&self, broker_name: &str) -> (i32, Option<String>, Option<Vec<u8>>) {
+    pub async fn get_replica_info(
+        &self,
+        broker_name: &str,
+    ) -> (i32, Option<String>, Option<Vec<u8>>) {
         let result = self.manager.lock().unwrap().get_replica_info(broker_name);
         self.apply(result).await
     }
 
-    pub async fn get_sync_state_data(&self, broker_names: &[String]) -> (i32, Option<String>, Option<Vec<u8>>) {
+    pub async fn get_sync_state_data(
+        &self,
+        broker_names: &[String],
+    ) -> (i32, Option<String>, Option<Vec<u8>>) {
         let result = self
             .manager
             .lock()
@@ -1382,7 +1457,11 @@ impl ControllerRequestProcessor {
 }
 
 impl Handler for ControllerRequestProcessor {
-    fn handle(&self, request: Command, _peer: std::net::SocketAddr) -> std::pin::Pin<Box<dyn std::future::Future<Output = Command> + Send + '_>> {
+    fn handle(
+        &self,
+        request: Command,
+        _peer: std::net::SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Command> + Send + '_>> {
         let controller = self.controller.clone();
         Box::pin(async move { process(controller, request).await })
     }
@@ -1392,23 +1471,54 @@ async fn process(controller: Arc<Controller>, request: Command) -> Command {
     let code = request.code;
     let response = match code {
         request_code::BROKER_HEARTBEAT => {
-            let broker_id: Option<i64> = request.ext_fields.get("brokerId").and_then(|v| v.parse().ok());
+            let broker_id: Option<i64> = request
+                .ext_fields
+                .get("brokerId")
+                .and_then(|v| v.parse().ok());
             match broker_id {
                 Some(id) => {
                     controller.heartbeat().on_broker_heartbeat(
-                        request.ext_fields.get("clusterName").map(String::as_str).unwrap_or(""),
-                        request.ext_fields.get("brokerName").map(String::as_str).unwrap_or(""),
-                        request.ext_fields.get("brokerAddr").map(String::as_str).unwrap_or(""),
+                        request
+                            .ext_fields
+                            .get("clusterName")
+                            .map(String::as_str)
+                            .unwrap_or(""),
+                        request
+                            .ext_fields
+                            .get("brokerName")
+                            .map(String::as_str)
+                            .unwrap_or(""),
+                        request
+                            .ext_fields
+                            .get("brokerAddr")
+                            .map(String::as_str)
+                            .unwrap_or(""),
                         id,
                         request
                             .ext_fields
                             .get("heartbeatTimeoutMills")
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(controller.heartbeat().timeout.as_millis() as u64),
-                        request.ext_fields.get("epoch").and_then(|v| v.parse().ok()).unwrap_or(0),
-                        request.ext_fields.get("maxOffset").and_then(|v| v.parse().ok()).unwrap_or(0),
-                        request.ext_fields.get("confirmOffset").and_then(|v| v.parse().ok()).unwrap_or(0),
-                        request.ext_fields.get("electionPriority").and_then(|v| v.parse().ok()).unwrap_or(0),
+                        request
+                            .ext_fields
+                            .get("epoch")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0),
+                        request
+                            .ext_fields
+                            .get("maxOffset")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0),
+                        request
+                            .ext_fields
+                            .get("confirmOffset")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0),
+                        request
+                            .ext_fields
+                            .get("electionPriority")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0),
                     );
                     Command::response(&request, response_code::SUCCESS)
                         .with_body(b"Heart beat success".to_vec())
@@ -1425,7 +1535,11 @@ async fn process(controller: Arc<Controller>, request: Command) -> Command {
             Command::response(&request, response_code::SUCCESS).with_body(json)
         }
         request_code::CONTROLLER_GET_REPLICA_INFO => {
-            let broker_name = request.ext_fields.get("brokerName").cloned().unwrap_or_default();
+            let broker_name = request
+                .ext_fields
+                .get("brokerName")
+                .cloned()
+                .unwrap_or_default();
             let (code, _, body) = controller.get_replica_info(&broker_name).await;
             Command::response(&request, code).with_body(body.unwrap_or_default())
         }
@@ -1439,20 +1553,40 @@ async fn process(controller: Arc<Controller>, request: Command) -> Command {
             Command::response(&request, code).with_body(body.unwrap_or_default())
         }
         request_code::CONTROLLER_ELECT_MASTER => {
-            let broker_name = request.ext_fields.get("brokerName").cloned().unwrap_or_default();
-            let broker_id: Option<i64> = request.ext_fields.get("brokerId").and_then(|v| v.parse().ok());
+            let broker_name = request
+                .ext_fields
+                .get("brokerName")
+                .cloned()
+                .unwrap_or_default();
+            let broker_id: Option<i64> = request
+                .ext_fields
+                .get("brokerId")
+                .and_then(|v| v.parse().ok());
             let designate = request
                 .ext_fields
                 .get("designateElect")
                 .and_then(|v| v.parse::<bool>().ok())
                 .unwrap_or(false);
-            let (code, _, body) = controller.elect_master(&broker_name, broker_id, designate).await;
+            let (code, _, body) = controller
+                .elect_master(&broker_name, broker_id, designate)
+                .await;
             Command::response(&request, code).with_body(body.unwrap_or_default())
         }
         request_code::CONTROLLER_ALTER_SYNC_STATE_SET => {
-            let broker_name = request.ext_fields.get("brokerName").cloned().unwrap_or_default();
-            let master_broker_id: Option<i64> = request.ext_fields.get("masterBrokerId").and_then(|v| v.parse().ok());
-            let master_epoch: i32 = request.ext_fields.get("masterEpoch").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let broker_name = request
+                .ext_fields
+                .get("brokerName")
+                .cloned()
+                .unwrap_or_default();
+            let master_broker_id: Option<i64> = request
+                .ext_fields
+                .get("masterBrokerId")
+                .and_then(|v| v.parse().ok());
+            let master_epoch: i32 = request
+                .ext_fields
+                .get("masterEpoch")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let sync_epoch: i32 = request
                 .ext_fields
                 .get("syncStateSetEpoch")
@@ -1469,7 +1603,11 @@ async fn process(controller: Arc<Controller>, request: Command) -> Command {
                 });
             let (code, remark) = controller
                 .alter_sync_state_set(
-                    &broker_name, new_set, master_broker_id, master_epoch, sync_epoch,
+                    &broker_name,
+                    new_set,
+                    master_broker_id,
+                    master_epoch,
+                    sync_epoch,
                 )
                 .await;
             let mut resp = Command::response(&request, code);
@@ -1479,22 +1617,56 @@ async fn process(controller: Arc<Controller>, request: Command) -> Command {
             resp
         }
         request_code::CONTROLLER_GET_NEXT_BROKER_ID => {
-            let cluster = request.ext_fields.get("clusterName").cloned().unwrap_or_default();
-            let broker_name = request.ext_fields.get("brokerName").cloned().unwrap_or_default();
+            let cluster = request
+                .ext_fields
+                .get("clusterName")
+                .cloned()
+                .unwrap_or_default();
+            let broker_name = request
+                .ext_fields
+                .get("brokerName")
+                .cloned()
+                .unwrap_or_default();
             let (next, code) = controller.get_next_broker_id(&cluster, &broker_name);
-            let mut resp = Command::response(&request, code)
-                .with_ext("nextBrokerId", next);
-            resp.body = serde_json::to_vec(&serde_json::json!({"nextBrokerId": next})).unwrap_or_default();
+            let mut resp = Command::response(&request, code).with_ext("nextBrokerId", next);
+            resp.body =
+                serde_json::to_vec(&serde_json::json!({"nextBrokerId": next})).unwrap_or_default();
             resp
         }
         request_code::CONTROLLER_APPLY_BROKER_ID => {
-            let cluster = request.ext_fields.get("clusterName").cloned().unwrap_or_default();
-            let broker_name = request.ext_fields.get("brokerName").cloned().unwrap_or_default();
-            let broker_address = request.ext_fields.get("brokerAddress").cloned().unwrap_or_default();
-            let broker_id: i64 = request.ext_fields.get("appliedBrokerId").and_then(|v| v.parse().ok()).unwrap_or(0);
-            let check_code = request.ext_fields.get("registerCheckCode").cloned().unwrap_or_default();
+            let cluster = request
+                .ext_fields
+                .get("clusterName")
+                .cloned()
+                .unwrap_or_default();
+            let broker_name = request
+                .ext_fields
+                .get("brokerName")
+                .cloned()
+                .unwrap_or_default();
+            let broker_address = request
+                .ext_fields
+                .get("brokerAddress")
+                .cloned()
+                .unwrap_or_default();
+            let broker_id: i64 = request
+                .ext_fields
+                .get("appliedBrokerId")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let check_code = request
+                .ext_fields
+                .get("registerCheckCode")
+                .cloned()
+                .unwrap_or_default();
             let (code, remark) = controller
-                .apply_broker_id(&cluster, &broker_name, &broker_address, broker_id, &check_code)
+                .apply_broker_id(
+                    &cluster,
+                    &broker_name,
+                    &broker_address,
+                    broker_id,
+                    &check_code,
+                )
                 .await;
             let mut resp = Command::response(&request, code);
             if let Some(remark) = remark {
@@ -1503,10 +1675,26 @@ async fn process(controller: Arc<Controller>, request: Command) -> Command {
             resp
         }
         request_code::CONTROLLER_REGISTER_BROKER => {
-            let cluster = request.ext_fields.get("clusterName").cloned().unwrap_or_default();
-            let broker_name = request.ext_fields.get("brokerName").cloned().unwrap_or_default();
-            let broker_address = request.ext_fields.get("brokerAddress").cloned().unwrap_or_default();
-            let broker_id: i64 = request.ext_fields.get("brokerId").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let cluster = request
+                .ext_fields
+                .get("clusterName")
+                .cloned()
+                .unwrap_or_default();
+            let broker_name = request
+                .ext_fields
+                .get("brokerName")
+                .cloned()
+                .unwrap_or_default();
+            let broker_address = request
+                .ext_fields
+                .get("brokerAddress")
+                .cloned()
+                .unwrap_or_default();
+            let broker_id: i64 = request
+                .ext_fields
+                .get("brokerId")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let (code, remark, body) = controller
                 .register_broker(&cluster, &broker_name, &broker_address, broker_id)
                 .await;
@@ -1517,8 +1705,16 @@ async fn process(controller: Arc<Controller>, request: Command) -> Command {
             resp
         }
         request_code::CLEAN_BROKER_DATA => {
-            let cluster = request.ext_fields.get("clusterName").cloned().unwrap_or_default();
-            let broker_name = request.ext_fields.get("brokerName").cloned().unwrap_or_default();
+            let cluster = request
+                .ext_fields
+                .get("clusterName")
+                .cloned()
+                .unwrap_or_default();
+            let broker_name = request
+                .ext_fields
+                .get("brokerName")
+                .cloned()
+                .unwrap_or_default();
             let clean_living: bool = request
                 .ext_fields
                 .get("cleanLivingBroker")
@@ -1567,7 +1763,11 @@ impl ControllerManager {
     }
 
     /// Bind the controller listener and serve until `shutdown`.
-    pub async fn run(self: Arc<Self>, listener: tokio::net::TcpListener, shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    pub async fn run(
+        self: Arc<Self>,
+        listener: tokio::net::TcpListener,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         // Drive raft elections/heartbeats (multi-node mode only; single-node has no raft node).
         if let Some(raft) = &self.controller.raft {
             tokio::spawn(raft.clone().run(shutdown.clone()));
@@ -1581,7 +1781,10 @@ impl ControllerManager {
         }
     }
 
-    async fn reelection_loop(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    async fn reelection_loop(
+        self: Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             tokio::select! {
@@ -1728,12 +1931,14 @@ mod tests {
             }
         }
         let checker = OnlyReplicaAlive;
-        assert!(mgr
-            .scan_need_reelect_broker_sets(&checker)
-            .contains(&"b".to_string()));
-        assert!(!mgr
-            .scan_need_reelect_broker_sets(&AllAlive)
-            .contains(&"b".to_string()));
+        assert!(
+            mgr.scan_need_reelect_broker_sets(&checker)
+                .contains(&"b".to_string())
+        );
+        assert!(
+            !mgr.scan_need_reelect_broker_sets(&AllAlive)
+                .contains(&"b".to_string())
+        );
     }
 
     struct NopGetter;

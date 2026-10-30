@@ -361,9 +361,9 @@ impl Namesrv {
             // Java sets enableActingMaster on every registration (isOldVersionBroker -> false).
             group.enable_acting_master = registration.enable_acting_master;
             // Address migration / slave promotion: one address has exactly one ID.
-            group
-                .instances
-                .retain(|id, instance| *id == registration.id || instance.addr != registration.addr);
+            group.instances.retain(|id, instance| {
+                *id == registration.id || instance.addr != registration.addr
+            });
             group.instances.insert(
                 registration.id,
                 BrokerInstance {
@@ -1852,14 +1852,20 @@ mod tests {
         // A valid compressed mapping trailer registers the broker and its mapping.
         let mut plain = java_registration(false);
         plain.extend_from_slice(&1i32.to_be_bytes());
-        framed(&mut plain, br#"{"topic":"t","bname":"a","totalQueues":8,"epoch":1}"#);
+        framed(
+            &mut plain,
+            br#"{"topic":"t","bname":"a","totalQueues":8,"epoch":1}"#,
+        );
         let request = register("c", "a", 0, "a:10911", &[])
             .with_ext("compressed", true)
             .with_body(compressed_bytes(&plain));
         assert_eq!(ns.process(&request).code, 0);
         assert_eq!(ns.broker_count(), 1);
         // Malformed mapping infos never register anything.
-        for info in [br#"{"topic":"t"}"#.as_slice(), br#"{"bname":"a"}"#.as_slice()] {
+        for info in [
+            br#"{"topic":"t"}"#.as_slice(),
+            br#"{"bname":"a"}"#.as_slice(),
+        ] {
             let mut plain = java_registration(false);
             plain.extend_from_slice(&1i32.to_be_bytes());
             framed(&mut plain, info);
@@ -2188,9 +2194,6 @@ mod tests {
         );
         assert_eq!(member.code, 0);
         let value: Value = serde_json::from_slice(&member.body).unwrap();
-        assert_eq!(
-            value["brokerMemberGroup"]["brokerAddrs"],
-            json!({})
-        );
+        assert_eq!(value["brokerMemberGroup"]["brokerAddrs"], json!({}));
     }
 }

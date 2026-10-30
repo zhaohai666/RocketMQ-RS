@@ -11,12 +11,12 @@ use serde_json::json;
 use tokio::sync::{Notify, watch};
 use tracing::warn;
 
+use crate::common;
 use crate::common::{
     Error, LMQ_QUEUE_ID, Message, PROPERTY_INNER_MULTI_DISPATCH, PROPERTY_LITE_TOPIC, Result,
-    TopicConfig, decode_batch, decode_properties, get_parent_topic, is_lite_topic_queue, now_millis,
-    to_lmq_name,
+    TopicConfig, decode_batch, decode_properties, get_parent_topic, is_lite_topic_queue,
+    now_millis, to_lmq_name,
 };
-use crate::common as common;
 use crate::filter::{self, Subscription};
 use crate::remoting::{Command, Handler};
 use crate::schedule::{
@@ -919,7 +919,10 @@ impl Broker {
                 }
             }
             if split.is_empty() || split.len() > 4096 {
-                return Err(Failure::new(13, "an inner batch must carry 1..4096 messages"));
+                return Err(Failure::new(
+                    13,
+                    "an inner batch must carry 1..4096 messages",
+                ));
             }
             messages = split;
         }
@@ -950,7 +953,9 @@ impl Broker {
             // the producer parses the physical offset back out of it for `END_TRANSACTION`.
             .with_ext(
                 "transactionId",
-                transactional.then(|| saved[0].message_id()).unwrap_or_default(),
+                transactional
+                    .then(|| saved[0].message_id())
+                    .unwrap_or_default(),
             )
             .with_ext("MSG_REGION", "DefaultRegion")
             .with_ext("TRACE_ON", false);
@@ -1102,7 +1107,9 @@ impl Broker {
 
         let stored = {
             let mut groups = self.groups.lock().unwrap();
-            let info = groups.entry(group.to_owned()).or_insert_with(GroupInfo::new);
+            let info = groups
+                .entry(group.to_owned())
+                .or_insert_with(GroupInfo::new);
             info.last_seen = Instant::now();
             if let Some(sub) = info.subscriptions.get(topic) {
                 Some(sub.clone())
@@ -1574,9 +1581,9 @@ impl Broker {
         let group = request.required("consumerGroup")?.to_owned();
         let topic = request.required("topic")?.to_owned();
         let queue_id: i32 = request.field("queueId")?;
-        let max_nums = optional_field(request, "maxMsgNums", 1usize)?
-            .clamp(1, POP_MAX_NUMS);
-        let invisible_time = optional_field(request, "invisibleTime", 15_000i64)?.clamp(0, 3_600_000);
+        let max_nums = optional_field(request, "maxMsgNums", 1usize)?.clamp(1, POP_MAX_NUMS);
+        let invisible_time =
+            optional_field(request, "invisibleTime", 15_000i64)?.clamp(0, 3_600_000);
         validate_name(&group)?;
         validate_topic_name(&topic)?;
         let group_config = match self.group_config(&group).await? {
@@ -1590,8 +1597,7 @@ impl Broker {
         };
         if !group_config.consume_enable {
             return Err(
-                Failure::new(16, format!("subscription group no permission, {group}"))
-                    .forbidden(2),
+                Failure::new(16, format!("subscription group no permission, {group}")).forbidden(2),
             );
         }
         let config = self
@@ -1817,7 +1823,14 @@ impl Broker {
             let topic = topic.to_owned();
             let read = self
                 .storage(move |store| {
-                    store.read(&topic, queue_id, start, POP_SCAN_BATCH, MAX_PULL_BYTES, None)
+                    store.read(
+                        &topic,
+                        queue_id,
+                        start,
+                        POP_SCAN_BATCH,
+                        MAX_PULL_BYTES,
+                        None,
+                    )
                 })
                 .await?;
             for message in read.messages {
@@ -1856,7 +1869,8 @@ impl Broker {
         let parent_topic = request.required("topic")?.to_owned();
         let client_id = request.required("clientId")?.to_owned();
         let max_nums = optional_field(request, "maxMsgNum", 1usize)?.clamp(1, POP_MAX_NUMS);
-        let invisible_time = optional_field(request, "invisibleTime", 15_000i64)?.clamp(0, 3_600_000);
+        let invisible_time =
+            optional_field(request, "invisibleTime", 15_000i64)?.clamp(0, 3_600_000);
         validate_name(&group)?;
         validate_topic_name(&parent_topic)?;
         let group_config = match self.group_config(&group).await? {
@@ -1870,8 +1884,7 @@ impl Broker {
         };
         if !group_config.consume_enable {
             return Err(
-                Failure::new(16, format!("subscription group no permission, {group}"))
-                    .forbidden(2),
+                Failure::new(16, format!("subscription group no permission, {group}")).forbidden(2),
             );
         }
         let config = self
@@ -2170,7 +2183,9 @@ impl Broker {
                     .await
                 {
                     for message in read.messages {
-                        pending.entry(message.queue_offset).or_insert((message.store_timestamp, 0));
+                        pending
+                            .entry(message.queue_offset)
+                            .or_insert((message.store_timestamp, 0));
                     }
                 }
             }
@@ -2650,10 +2665,8 @@ impl Broker {
             })
             .await?
         } else {
-            self.storage(move |store| {
-                store.query_messages(&topic, &key, begin, end, max_num)
-            })
-            .await?
+            self.storage(move |store| store.query_messages(&topic, &key, begin, end, max_num))
+                .await?
         };
         let mut body = Vec::new();
         body.extend_from_slice(&(messages.len() as u32).to_be_bytes());
@@ -2723,8 +2736,13 @@ impl Broker {
             .ext_fields
             .get("originTopic")
             .map(String::as_str)
-            .filter(|topic| !topic.is_empty() && self.store.topics().is_ok_and(|topics| topics.contains_key(*topic)))
-        {
+            .filter(|topic| {
+                !topic.is_empty()
+                    && self
+                        .store
+                        .topics()
+                        .is_ok_and(|topics| topics.contains_key(*topic))
+            }) {
             // `SendMsgBackRequestHeader.originTopic` + `queueId`: the offset names a position in
             // the origin topic's queue, which is what the gRPC proxy's DLQ forward carries.
             let queue_id = optional_field(request, "queueId", 0i32)?;
@@ -3472,7 +3490,12 @@ mod tests {
     #[tokio::test]
     async fn transactional_messages_resolve_through_end_transaction() {
         let (_dir, broker) = test_broker().await;
-        let send = send_request("orders", b"payload", &encode_props(&[("TRAN_MSG", "true")]), 0);
+        let send = send_request(
+            "orders",
+            b"payload",
+            &encode_props(&[("TRAN_MSG", "true")]),
+            0,
+        );
         let response = broker.process(&send, peer()).await.unwrap();
         // The half record lands on the half topic, never on the real one.
         assert_eq!(broker.store.queue_max_offset(TRANS_HALF_TOPIC, 0), 1);
@@ -3507,8 +3530,12 @@ mod tests {
         assert!(!delivered.properties.contains_key(schedule::REAL_TOPIC));
         assert!(!delivered.properties.contains_key(TRAN_MSG));
         // ROLLBACK discards the record and appends the op marker only.
-        let second_send =
-            send_request("orders", b"payload2", &encode_props(&[("TRAN_MSG", "true")]), 0);
+        let second_send = send_request(
+            "orders",
+            b"payload2",
+            &encode_props(&[("TRAN_MSG", "true")]),
+            0,
+        );
         let second = broker.process(&second_send, peer()).await.unwrap();
         let second_half = broker
             .store
@@ -3516,7 +3543,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let rollback = Command::request(37)
-            .with_ext("commitLogOffset", physical_offset_from_msg_id(&second.ext_fields["msgId"]))
+            .with_ext(
+                "commitLogOffset",
+                physical_offset_from_msg_id(&second.ext_fields["msgId"]),
+            )
             .with_ext("commitOrRollback", 1)
             .with_ext("producerGroup", "g");
         broker.process(&rollback, peer()).await.unwrap();
@@ -3524,11 +3554,18 @@ mod tests {
         assert_eq!(broker.store.queue_max_offset(TRANS_OP_TOPIC, 0), 2);
         let _ = second_half;
         // The gRPC proxy sends END_TRANSACTION without a producer group.
-        let third_send =
-            send_request("orders", b"payload3", &encode_props(&[("TRAN_MSG", "true")]), 0);
+        let third_send = send_request(
+            "orders",
+            b"payload3",
+            &encode_props(&[("TRAN_MSG", "true")]),
+            0,
+        );
         let third = broker.process(&third_send, peer()).await.unwrap();
         let commit = Command::request(37)
-            .with_ext("commitLogOffset", physical_offset_from_msg_id(&third.ext_fields["msgId"]))
+            .with_ext(
+                "commitLogOffset",
+                physical_offset_from_msg_id(&third.ext_fields["msgId"]),
+            )
             .with_ext("commitOrRollback", 0);
         broker.process(&commit, peer()).await.unwrap();
         assert_eq!(broker.store.queue_max_offset("orders", 0), 2);

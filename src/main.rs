@@ -215,10 +215,7 @@ fn parse_message_type(value: &str) -> std::result::Result<String, String> {
     if KNOWN.contains(&upper.as_str()) {
         Ok(upper)
     } else {
-        Err(format!(
-            "expected one of {}",
-            KNOWN.join(", ")
-        ))
+        Err(format!("expected one of {}", KNOWN.join(", ")))
     }
 }
 
@@ -352,7 +349,11 @@ async fn run_proxy(args: ProxyArgs, mut signals: ShutdownSignals) -> Result<()> 
     info!(listen = %actual, nameservers = ?config.name_server_address, "gRPC proxy starting");
     let context = ProxyContext::new(config, actual);
     let (stop, shutdown) = watch::channel(false);
-    let mut task = tokio::spawn(rocketmq_rs::proxy::serve_proxy(listener, context, shutdown.clone()));
+    let mut task = tokio::spawn(rocketmq_rs::proxy::serve_proxy(
+        listener,
+        context,
+        shutdown.clone(),
+    ));
     tokio::select! {
         joined = &mut task => {
             joined.map_err(|error| Error::Io(io::Error::other(error)))?

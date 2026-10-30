@@ -348,7 +348,10 @@ impl Store {
                 for (lmq, queue_id) in &targets {
                     let lmq_key = (lmq.clone(), *queue_id);
                     let next = pending.entry(lmq_key.clone()).or_insert_with(|| {
-                        inner.queues.get(&lmq_key).map_or(0, |queue| queue.len() as u64)
+                        inner
+                            .queues
+                            .get(&lmq_key)
+                            .map_or(0, |queue| queue.len() as u64)
                     });
                     offsets.push(*next);
                     *next = next
@@ -599,13 +602,12 @@ impl Store {
             }
             let key = (topic.to_owned(), queue_id);
             // Skip the prefix that provably predates the window (running-max ceilings).
-            let mut offset = inner.queues[&key]
-                .partition_point(|entry| entry.timestamp_ceiling < begin) as u64;
+            let mut offset =
+                inner.queues[&key].partition_point(|entry| entry.timestamp_ceiling < begin) as u64;
             let max_offset = inner.queues[&key].len() as u64;
             while offset < max_offset && messages.len() < max_nums && scanned < MAX_SCAN_RECORDS {
                 let location = inner.queues[&key][offset as usize];
-                let message =
-                    read_record(&mut inner.log, location.physical, location.length)?;
+                let message = read_record(&mut inner.log, location.physical, location.length)?;
                 scanned += 1;
                 offset += 1;
                 if message.store_timestamp < begin || message.store_timestamp > end {
@@ -625,7 +627,8 @@ impl Store {
         Ok(messages)
     }
 
-    pub fn search_offset(&self, topic: &str, queue_id: i32, timestamp: i64) -> Result<u64> {        validate_name(topic, "topic")?;
+    pub fn search_offset(&self, topic: &str, queue_id: i32, timestamp: i64) -> Result<u64> {
+        validate_name(topic, "topic")?;
         validate_queue(queue_id)?;
         let inner = self.lock()?;
         Ok(inner
@@ -1010,13 +1013,7 @@ fn add_index(queues: &mut Queues, message: &Message, length: u32) {
     }
 }
 
-fn push_location(
-    queues: &mut Queues,
-    topic: &str,
-    queue_id: i32,
-    message: &Message,
-    length: u32,
-) {
+fn push_location(queues: &mut Queues, topic: &str, queue_id: i32, message: &Message, length: u32) {
     let queue = queues.entry((topic.to_owned(), queue_id)).or_default();
     let timestamp_ceiling = queue.last().map_or(message.store_timestamp, |previous| {
         previous.timestamp_ceiling.max(message.store_timestamp)
@@ -1400,7 +1397,10 @@ mod tests {
         let saved = store.append(lite).unwrap();
         // The broker names the light queue of a lite message.
         assert_eq!(
-            saved.properties.get(PROPERTY_INNER_MULTI_DISPATCH).map(String::as_str),
+            saved
+                .properties
+                .get(PROPERTY_INNER_MULTI_DISPATCH)
+                .map(String::as_str),
             Some("%LMQ%$bind$child")
         );
         assert_eq!(
@@ -1430,9 +1430,13 @@ mod tests {
         assert_eq!(store.queue_max_offset("%LMQ%$bind$second", 0), 1);
         assert_eq!(store.queue_max_offset("%LMQ%$bind$child", 0), 1);
         // The offsets of the light queue are committed against its own name.
-        store.commit_offset("group", "%LMQ%$bind$child", 0, 1).unwrap();
+        store
+            .commit_offset("group", "%LMQ%$bind$child", 0, 1)
+            .unwrap();
         assert_eq!(
-            store.consumer_offset("group", "%LMQ%$bind$child", 0).unwrap(),
+            store
+                .consumer_offset("group", "%LMQ%$bind$child", 0)
+                .unwrap(),
             Some(1)
         );
         assert_eq!(store.consumer_offset("group", "bind", 0).unwrap(), None);
@@ -1996,7 +2000,9 @@ mod tests {
 
     fn keyed(topic: &str, queue_id: i32, body: &[u8], keys: &str, tag: &str) -> Message {
         let mut message = message(topic, queue_id, body, tag);
-        message.properties.insert("KEYS".to_owned(), keys.to_owned());
+        message
+            .properties
+            .insert("KEYS".to_owned(), keys.to_owned());
         message
     }
 
@@ -2016,17 +2022,21 @@ mod tests {
             .query_messages("orders", "order-1", 0, i64::MAX, 32)
             .unwrap();
         assert_eq!(hits, vec![first.clone(), second.clone()]);
-        assert!(store
-            .query_messages("orders", "order-missing", 0, i64::MAX, 32)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .query_messages("orders", "order-missing", 0, i64::MAX, 32)
+                .unwrap()
+                .is_empty()
+        );
         // Time windows are inclusive bounds on the store timestamp.
         let window = store
             .query_messages("orders", "order-1", first.store_timestamp, i64::MAX, 32)
             .unwrap();
-        assert!(window
-            .iter()
-            .all(|message| message.store_timestamp >= first.store_timestamp));
+        assert!(
+            window
+                .iter()
+                .all(|message| message.store_timestamp >= first.store_timestamp)
+        );
 
         drop(store);
         // Recovery rebuilds the key index from the commitlog.
@@ -2069,18 +2079,24 @@ mod tests {
             1
         );
         // A begin past every store time and an inverted window are empty, not errors.
-        assert!(store
-            .scan_messages("topic", i64::MAX, i64::MAX, 32, None)
-            .unwrap()
-            .is_empty());
-        assert!(store
-            .scan_messages("topic", i64::MAX, 0, 32, None)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .scan_messages("topic", i64::MAX, i64::MAX, 32, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .scan_messages("topic", i64::MAX, 0, 32, None)
+                .unwrap()
+                .is_empty()
+        );
         // Empty topics scan to nothing.
-        assert!(store
-            .scan_messages("absent", 0, i64::MAX, 32, None)
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .scan_messages("absent", 0, i64::MAX, 32, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

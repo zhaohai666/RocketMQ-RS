@@ -707,7 +707,11 @@ async fn a_lite_message_is_read_from_the_light_queue_of_its_lite_topic() {
     );
 
     // The ack commits the offset of the light queue.
-    let receipt = response.ext_fields.get("popCk").cloned().unwrap_or_default();
+    let receipt = response
+        .ext_fields
+        .get("popCk")
+        .cloned()
+        .unwrap_or_default();
     assert!(!receipt.is_empty());
     let parts: Vec<&str> = receipt.split(',').collect();
     assert_eq!(parts[0], "%LMQ%$bind-topic$child");
