@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // imports via its built-in include path, so we only need to point at our `proto/` root.
     tonic_build::configure()
         .build_server(true)
-        .build_client(false)
+        .build_client(true)
         .compile_protos(&protos, &["proto"])?;
 
     Ok(())
