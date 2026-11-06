@@ -12,9 +12,24 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
+use std::time::UNIX_EPOCH;
+use tracing::warn;
 
 const LOG_FILE: &str = "commitlog";
 const LOCK_FILE: &str = ".store.lock";
+/// Java `DefaultMessageStore` creates an `abort` marker on startup and removes
+/// it on a clean `shutdown()`. Its presence at the next open means the previous
+/// process died without flushing, so recovery must take the abnormal branch.
+const ABORT_FILE: &str = "abort";
+/// Java `StoreCheckpoint` keeps the commitlog / consume-queue / index timestamps.
+const CHECKPOINT_FILE: &str = "storecheckpoint.json";
+/// Hard ceiling on the bytes this store will put in its data directory. Java
+/// refuses writes once `diskMaxUsedSpaceRatio` is exceeded; a directory quota
+/// gives the same protection without a platform-specific statvfs dependency.
+const DEFAULT_MAX_STORE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+/// Orphaned `.tmp` state files are only removed after this age, so a temp file
+/// belonging to a concurrent `replace_json` can never be swept away.
+const MIN_ORPHAN_AGE_MS: i64 = 60 * 60 * 1000;
 const TOPICS_FILE: &str = "topics.json";
 const OFFSETS_FILE: &str = "consumer_offsets.json";
 const FILTERS_FILE: &str = "consumerFilter.json";
@@ -91,6 +106,11 @@ struct Inner {
     delay_offsets: DelayOffsets,
     timer_checkpoint: TimerCheckpoint,
     fenced: bool,
+    limits: StoreLimits,
+    /// Sum of the regular files in the data directory, maintained on append so
+    /// the disk watermark check never has to walk the directory on the hot path.
+    directory_bytes: u64,
+    checkpoint: StoreCheckpoint,
     #[cfg(test)]
     fail_log_sync: bool,
     // Retaining the lock inode and handle prevents a second writer while idle.
@@ -99,6 +119,43 @@ struct Inner {
 
 pub struct Store {
     inner: Mutex<Inner>,
+}
+
+/// Java `StoreCheckpoint`: the three store timestamps plus the recovery state
+/// this port needs to tell a clean shutdown from a crash. Persisted with the
+/// same atomic replace as the other JSON state files.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StoreCheckpoint {
+    pub physic_msg_timestamp: i64,
+    pub logics_msg_timestamp: i64,
+    pub index_msg_timestamp: i64,
+    pub commitlog_len: u64,
+    pub last_clean_timestamp: i64,
+    pub clean_exit: bool,
+    pub abnormal_recoveries: u64,
+}
+
+/// Quotas for one store directory. `Store::open` uses conservative defaults;
+/// `Store::open_with_limits` lets tests and deployments tighten them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreLimits {
+    pub max_store_bytes: u64,
+}
+
+impl Default for StoreLimits {
+    fn default() -> Self {
+        Self {
+            max_store_bytes: DEFAULT_MAX_STORE_BYTES,
+        }
+    }
+}
+
+/// Result of one housekeeping sweep over the data directory.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CleanReport {
+    pub removed: Vec<String>,
+    pub freed_bytes: u64,
 }
 
 /// A persisted consumer filter, mirroring the JSON shape of `ConsumerFilterData`.
@@ -181,6 +238,13 @@ pub struct ReadResult {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_limits(path, StoreLimits::default())
+    }
+
+    pub fn open_with_limits(path: impl AsRef<Path>, limits: StoreLimits) -> Result<Self> {
+        if limits.max_store_bytes == 0 {
+            return Err(invalid("max_store_bytes must be positive"));
+        }
         let path = path.as_ref();
         if path.as_os_str().is_empty() {
             return Err(invalid("empty store directory"));
@@ -235,14 +299,48 @@ impl Store {
 
         let log_path = directory.join(LOG_FILE);
         reject_nonregular(&log_path)?;
+        let mut checkpoint: StoreCheckpoint =
+            load_json(&directory.join(CHECKPOINT_FILE))?.unwrap_or_default();
+        // Java `BrokerController.shutdown` removes `abort`. Its presence means
+        // the last process was killed, so recovery must take the abnormal path.
+        let abort_path = directory.join(ABORT_FILE);
+        let abnormal = abort_path.try_exists()?;
         let mut log = OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .open(&log_path)?;
         let (queues, physical, key_index, committed_len) = recover(&mut log, &mut topics)?;
+        if abnormal {
+            checkpoint.abnormal_recoveries = checkpoint.abnormal_recoveries.saturating_add(1);
+            warn!(
+                recoveries = checkpoint.abnormal_recoveries,
+                commitlog_len = committed_len,
+                "abnormal shutdown detected; commitlog tail revalidated before accepting writes"
+            );
+        }
+        // A killed process may have left an unflushed tail and state temp files.
+        // Force both the log and the directory entries to disk before serving.
         log.sync_all()?;
         sync_directory(&directory)?;
+        let now = now_millis();
+        checkpoint.clean_exit = false;
+        checkpoint.commitlog_len = committed_len;
+        checkpoint.physic_msg_timestamp = now;
+        checkpoint.logics_msg_timestamp = now;
+        checkpoint.index_msg_timestamp = now;
+        // Publish the checkpoint before creating the marker: a crash between the
+        // two still leaves a marker (or a checkpoint) for the next recovery.
+        // The checkpoint is advisory (recover() validates the tail on both
+        // branches), so one directory sync is enough; per-file fsync on every
+        // open doubled the test suite's startup time without adding safety.
+        let checkpoint_bytes = encode_json(&checkpoint)?;
+        replace_json(&directory, CHECKPOINT_FILE, &checkpoint_bytes, false)?;
+        fs::write(&abort_path, format!("{now}\n"))?;
+        sync_directory(&directory)?;
+        // Count after the checkpoint and the marker exist, otherwise the quota
+        // would start out under-reporting the directory by two files.
+        let directory_bytes = directory_size(&directory)?;
         Ok(Self {
             inner: Mutex::new(Inner {
                 directory,
@@ -258,11 +356,96 @@ impl Store {
                 delay_offsets,
                 timer_checkpoint,
                 fenced: false,
+                limits,
+                directory_bytes,
+                checkpoint,
                 #[cfg(test)]
                 fail_log_sync: false,
                 _lock: lock,
             }),
         })
+    }
+
+    /// `DefaultMessageStore.shutdown`: flush the log, publish a clean
+    /// checkpoint, then remove the abort marker. A process killed before this
+    /// point leaves the marker behind and the next open recovers abnormally.
+    pub fn shutdown(&self) -> Result<()> {
+        let mut inner = self.lock()?;
+        let now = now_millis();
+        inner.checkpoint.clean_exit = true;
+        inner.checkpoint.commitlog_len = inner.committed_len;
+        inner.checkpoint.physic_msg_timestamp = now;
+        inner.checkpoint.logics_msg_timestamp = now;
+        inner.checkpoint.index_msg_timestamp = now;
+        // Each append already calls sync_data on the commitlog, so a second
+        // fsync here is pure overhead. The checkpoint itself is advisory: if a
+        // power loss keeps `abort` alive, the next boot just revalidates the
+        // tail (a safe false positive), it does not lose data.
+        let bytes = encode_json(&inner.checkpoint)?;
+        inner.replace_state(CHECKPOINT_FILE, &bytes, false)?;
+        match fs::remove_file(inner.directory.join(ABORT_FILE)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    /// `StoreCheckpoint` is normally written by the background flush service.
+    /// Exposed so the broker can include it in its periodic checkpoint task.
+    pub fn flush_checkpoint(&self) -> Result<()> {
+        let mut inner = self.lock()?;
+        let bytes = encode_json(&inner.checkpoint)?;
+        inner.replace_state(CHECKPOINT_FILE, &bytes, true)
+    }
+
+    pub fn checkpoint(&self) -> Result<StoreCheckpoint> {
+        Ok(self.lock()?.checkpoint.clone())
+    }
+
+    /// (bytes in use, hard ceiling). Lets an operator see the watermark before
+    /// writes start being refused.
+    pub fn disk_usage(&self) -> Result<(u64, u64)> {
+        let inner = self.lock()?;
+        Ok((inner.directory_bytes, inner.limits.max_store_bytes))
+    }
+
+    /// Java `CleanCommitLogService`/`CleanConsumeQueueService` remove files a
+    /// previous run could not finish. Here those are the
+    /// `.<name>.<pid>.<sequence>.tmp` files left when `replace_json` was
+    /// interrupted between `create_new` and `rename`. The single-writer store
+    /// lock guarantees no other writer is active, and the minimum age protects
+    /// a temp file being written right now.
+    pub fn clean_expired_files(&self) -> Result<CleanReport> {
+        let mut inner = self.lock()?;
+        let now = now_millis();
+        let cutoff = now.saturating_sub(MIN_ORPHAN_AGE_MS);
+        let mut report = CleanReport::default();
+        for entry in fs::read_dir(&inner.directory)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".tmp") {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            if !metadata.is_file() || modified_ms(&metadata).is_none_or(|ms| ms > cutoff) {
+                continue;
+            }
+            let freed = metadata.len();
+            fs::remove_file(entry.path())?;
+            inner.directory_bytes = inner.directory_bytes.saturating_sub(freed);
+            report.freed_bytes = report.freed_bytes.saturating_add(freed);
+            report.removed.push(name);
+        }
+        report.removed.sort();
+        if !report.removed.is_empty() {
+            sync_directory(&inner.directory)?;
+        }
+        inner.checkpoint.last_clean_timestamp = now;
+        // The caller follows this with `flush_checkpoint`, so the clean result
+        // is published atomically with the other checkpoint fields.
+        inner.directory_bytes = directory_size(&inner.directory)?;
+        Ok(report)
     }
 
     pub fn append(&self, message: Message) -> Result<Message> {
@@ -394,10 +577,20 @@ impl Store {
             prepared.push((canonical, bytes.len() as u32));
             encoded.extend_from_slice(&bytes);
         }
+        let bytes_to_write = encoded.len() as u64;
         let new_len = inner
             .committed_len
-            .checked_add(encoded.len() as u64)
+            .checked_add(bytes_to_write)
             .ok_or_else(|| invalid("physical offset overflow"))?;
+        // Java `diskMaxUsedSpaceRatio`: refuse the write instead of letting the
+        // commitlog grow until the filesystem is full. This is a recoverable
+        // rejection (the store is not fenced), matching SERVICE_NOT_AVAILABLE.
+        if inner.directory_bytes.saturating_add(bytes_to_write) > inner.limits.max_store_bytes {
+            return Err(invalid(format!(
+                "store disk watermark exceeded: {} + {} > {} bytes",
+                inner.directory_bytes, bytes_to_write, inner.limits.max_store_bytes
+            )));
+        }
 
         let write_result = (|| -> Result<()> {
             if inner.log.metadata()?.len() != inner.committed_len {
@@ -424,6 +617,9 @@ impl Store {
                 .or_insert_with(|| TopicConfig::new(message.topic.clone(), 8));
             result.push(message);
         }
+        inner.directory_bytes = inner.directory_bytes.saturating_add(bytes_to_write);
+        inner.checkpoint.commitlog_len = new_len;
+        inner.checkpoint.physic_msg_timestamp = now_millis();
         inner.committed_len = new_len;
         Ok(result)
     }
@@ -859,7 +1055,7 @@ impl Store {
         // disk queue under concurrent consumers and made short invisible windows
         // expire before the next read; the atomic rename alone is enough to
         // survive a process restart, which is the failure this state guards.
-        if let Err(error) = replace_json(&inner.directory, name, &bytes, false) {
+        if let Err(error) = inner.replace_state(name, &bytes, false) {
             inner.fenced = true;
             return Err(error);
         }
@@ -900,12 +1096,38 @@ impl Inner {
         }
     }
 
+    /// Replace a state file while keeping the directory-size watermark exact.
+    /// State files are overwritten by rename, so the delta is just the size
+    /// change of that one file (no directory walk on the hot path).
+    fn replace_state(&mut self, name: &str, bytes: &[u8], durable: bool) -> Result<()> {
+        let path = self.directory.join(name);
+        let before = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let written = replace_json(&self.directory, name, bytes, durable);
+        if written.is_ok() {
+            let after = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            self.directory_bytes = self
+                .directory_bytes
+                .saturating_sub(before)
+                .saturating_add(after);
+        }
+        written
+    }
+
     fn persist(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
-        if let Err(error) = replace_json(&self.directory, name, bytes, true) {
+        if let Err(error) = self.replace_state(name, bytes, true) {
             self.fenced = true;
             return Err(error);
         }
         Ok(())
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        // SIGKILL never reaches this, which is exactly how the abort marker
+        // records an abnormal exit. Errors are ignored: a poisoned lock or a
+        // read-only directory must not turn teardown into a panic.
+        let _ = self.shutdown();
     }
 }
 
@@ -1312,6 +1534,29 @@ fn replace_json(directory: &Path, name: &str, bytes: &[u8], durable: bool) -> Re
 fn sync_directory(directory: &Path) -> Result<()> {
     File::open(directory)?.sync_all()?;
     Ok(())
+}
+
+/// Bytes currently occupied by regular files in the data directory. Used once
+/// at open and then maintained incrementally on every append.
+fn directory_size(directory: &Path) -> Result<u64> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(directory)? {
+        let metadata = entry?.metadata()?;
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
+}
+
+fn modified_ms(metadata: &fs::Metadata) -> Option<i64> {
+    let millis = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    i64::try_from(millis).ok()
 }
 
 fn create_directory_durably(path: &Path) -> Result<()> {
@@ -2150,5 +2395,113 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn clean_shutdown_removes_abort_marker_and_records_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.append(message("lifecycle", 0, b"one", "")).unwrap();
+        assert!(dir.path().join(ABORT_FILE).exists());
+        assert!(!store.checkpoint().unwrap().clean_exit);
+
+        store.shutdown().unwrap();
+        assert!(!dir.path().join(ABORT_FILE).exists());
+        let checkpoint: StoreCheckpoint =
+            serde_json::from_slice(&fs::read(dir.path().join(CHECKPOINT_FILE)).unwrap()).unwrap();
+        assert!(checkpoint.clean_exit);
+        assert_eq!(checkpoint.abnormal_recoveries, 0);
+        assert!(checkpoint.commitlog_len > 0);
+
+        // A clean exit must not be counted as an abnormal recovery on reopen.
+        drop(store);
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.checkpoint().unwrap().abnormal_recoveries, 0);
+        assert_eq!(reopened.queue_max_offset("lifecycle", 0), 1);
+    }
+
+    #[test]
+    fn leftover_abort_marker_triggers_abnormal_recovery() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.append(message("lifecycle", 0, b"one", "")).unwrap();
+        drop(store); // clean shutdown removes the marker
+        // Emulate the marker a SIGKILL would have left behind.
+        fs::write(dir.path().join(ABORT_FILE), "crashed\n").unwrap();
+
+        let reopened = Store::open(dir.path()).unwrap();
+        let checkpoint = reopened.checkpoint().unwrap();
+        assert_eq!(checkpoint.abnormal_recoveries, 1);
+        assert!(!checkpoint.clean_exit);
+        assert!(dir.path().join(ABORT_FILE).exists());
+        assert_eq!(reopened.queue_max_offset("lifecycle", 0), 1);
+        // The marker is re-armed for the lifetime of this process too.
+        drop(reopened);
+        let third = Store::open(dir.path()).unwrap();
+        assert_eq!(third.checkpoint().unwrap().abnormal_recoveries, 1);
+    }
+
+    #[test]
+    fn disk_watermark_refuses_writes_without_fencing_the_store() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (used, default_limit) = store.disk_usage().unwrap();
+        assert_eq!(default_limit, DEFAULT_MAX_STORE_BYTES);
+        drop(store);
+        // A deliberately tight but usable quota: a few records fit, then writes stop.
+        let store = Store::open_with_limits(
+            dir.path(),
+            StoreLimits {
+                max_store_bytes: used + 4096,
+            },
+        )
+        .unwrap();
+        let mut accepted = 0usize;
+        let mut rejected = false;
+        for index in 0..200 {
+            match store.append(message("quota", 0, format!("m{index}").as_bytes(), "")) {
+                Ok(_) => accepted += 1,
+                Err(error) => {
+                    assert!(
+                        error.to_string().contains("disk watermark exceeded"),
+                        "unexpected rejection: {error}"
+                    );
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+        assert!(accepted > 0, "quota was too tight to accept any record");
+        assert!(rejected, "the store never enforced its quota");
+        // Rejection is recoverable, not a fence: accepted records remain visible.
+        assert_eq!(store.queue_max_offset("quota", 0) as usize, accepted);
+        assert!(store.disk_usage().unwrap().0 <= used + 4096);
+    }
+
+    #[test]
+    fn clean_expired_files_removes_stale_orphans_but_keeps_fresh_ones() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let stale = dir.path().join(".topics.json.1.1.tmp");
+        let fresh = dir.path().join(".topics.json.1.2.tmp");
+        fs::write(&stale, b"orphan").unwrap();
+        fs::write(&fresh, b"active").unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let times = fs::FileTimes::new().set_modified(old);
+        File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+
+        let report = store.clean_expired_files().unwrap();
+        assert_eq!(report.removed, vec![".topics.json.1.1.tmp".to_owned()]);
+        assert_eq!(report.freed_bytes, 6);
+        assert!(!stale.exists());
+        assert!(fresh.exists(), "an in-flight temp file must be kept");
+        assert!(store.checkpoint().unwrap().last_clean_timestamp > 0);
     }
 }

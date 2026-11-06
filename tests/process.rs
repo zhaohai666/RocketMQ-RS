@@ -274,6 +274,42 @@ async fn pop_ack_and_invisible_state_survive_sigkill() {
     assert_eq!(resumed[0].body, b"p2");
 }
 
+/// Java `DefaultMessageStore` uses an `abort` marker to pick recoverAbnormally
+/// after a kill. Verify the whole process path: marker present while running,
+/// still present after SIGKILL, counted by the restarted store, message intact.
+#[tokio::test]
+async fn abnormal_shutdown_marker_survives_sigkill() {
+    let dir = TempDir::new().unwrap();
+    let (mut broker, address) = start(dir.path()).await;
+    rpc(&address, send(b"before-crash")).await;
+    // `standalone` keeps the broker store in <data-dir>/broker.
+    let broker_dir = dir.path().join("broker");
+    let marker = broker_dir.join("abort");
+    let checkpoint_path = broker_dir.join("storecheckpoint.json");
+    assert!(marker.exists(), "abort marker missing while store is running");
+    let running: Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    assert_eq!(running["cleanExit"], false);
+    assert_eq!(running["abnormalRecoveries"], 0);
+
+    broker.0.kill().unwrap();
+    let status = broker.0.wait().unwrap();
+    assert!(!status.success());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(9));
+    }
+    assert!(marker.exists(), "SIGKILL must leave the abort marker behind");
+
+    let (_restarted, address) = start(dir.path()).await;
+    let recovered: Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    assert_eq!(recovered["abnormalRecoveries"], 1);
+    assert_eq!(recovered["cleanExit"], false);
+    assert_eq!(pull(&address, 0).await.body, b"before-crash");
+}
+
 #[test]
 fn rejected_startup_does_not_touch_data_directory() {
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();

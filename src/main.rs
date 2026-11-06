@@ -831,7 +831,14 @@ async fn supervise(services: Services, mut signals: ShutdownSignals) -> Result<(
 
     if let Some(broker) = services.broker {
         let store = broker.store().clone();
-        let flushed = tokio::task::spawn_blocking(move || store.flush()).await;
+        // `DefaultMessageStore.shutdown`: flush, publish a clean checkpoint and
+        // remove the abort marker. Doing it explicitly matters because the
+        // process may exit without running destructors.
+        let flushed = tokio::task::spawn_blocking(move || {
+            store.flush()?;
+            store.shutdown()
+        })
+        .await;
         match flushed {
             Ok(Ok(())) => info!("Broker store flushed"),
             Ok(Err(error)) => record_failure(&mut result, error),
@@ -892,10 +899,31 @@ async fn maintain_expiry(
                 ticks = ticks.wrapping_add(1);
                 if ticks == 10 {
                     ticks = 0;
-                    if let Some(broker) = &broker
-                        && let Err(error) = broker.persist_filters().await
-                    {
-                        warn!(%error, "consumer filter persist failed");
+                    if let Some(broker) = &broker {
+                        if let Err(error) = broker.persist_filters().await {
+                            warn!(%error, "consumer filter persist failed");
+                        }
+                        // `CleanCommitLogService`: sweep orphaned state temp
+                        // files and publish the checkpoint on the same cadence
+                        // as the filter persist. Both are blocking file I/O.
+                        let store = broker.store().clone();
+                        let housekeeping =
+                            tokio::task::spawn_blocking(move || {
+                                let report = store.clean_expired_files()?;
+                                store.flush_checkpoint()?;
+                                Ok::<_, Error>(report)
+                            })
+                            .await;
+                        match housekeeping {
+                            Ok(Ok(report)) if !report.removed.is_empty() => info!(
+                                removed = report.removed.len(),
+                                freed = report.freed_bytes,
+                                "cleaned orphaned store state files"
+                            ),
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => warn!(%error, "store housekeeping failed"),
+                            Err(error) => warn!(%error, "store housekeeping task failed"),
+                        }
                     }
                 }
             }

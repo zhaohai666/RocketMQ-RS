@@ -17,7 +17,7 @@
 | gRPC v2 MessagingService | **17/17 方法全部实现**（QueryRoute … SyncLiteSubscription） |
 | gRPC v2 AdminService | **16/16 方法全部实现**，但多数是语义空壳（见 P1） |
 | Java 5.2.2 客户端缺陷猎杀 | **15/15 PASS**（`JAVA_CLIENT_PARITY_REPORT.md`） |
-| 服务端基础设施 | **大面积缺失**：HA/多副本、mmap 刷盘、文件生命周期、Raft 日志持久化；**POP/计时器状态持久化已于 §7.1 补齐** |
+| 服务端基础设施 | **大面积缺失**：HA/多副本、mmap 刷盘、commitlog 分段与过期回收、Raft 日志持久化；**POP/计时器状态持久化（§7.1）与 abort/checkpoint/磁盘水位/孤儿文件清理（§7.3）已补齐** |
 | broker remoting 请求码 | 约 30 个 vs Java `AdminBrokerProcessor` 约 70 个 case |
 | namesrv 请求码 | 13 个 vs Java `DefaultRequestProcessor` 数十个 |
 
@@ -94,7 +94,7 @@
 ## 5. 建议补齐顺序（按投入产出）
 
 1. ✅ **POP + Timer 状态落盘**（P0 #4/#5）：已完成，见 §7.1。
-2. **文件生命周期**（P0 #3）：过期删除 + 磁盘水位 + checkpoint/abort，避免磁盘无限增长。
+2. ◐ **文件生命周期**（P0 #3）：abort/checkpoint/水位/孤儿文件清理已完成（§7.3）；物理分段与过期 commitlog 回收并入第 5 项。
 3. **broker Admin 命令集 + controller config 空桩**（P1 #13）：运维可诊断性，属纯增量。
 4. **4.x remoting 协议 + RPCHook**（P1 #9/#10）：决定能否接入存量 4.x 客户端与 zone 路由。
 5. **HA / 多副本与 mmap 刷盘**（P0 #1/#2）：架构级改造，需独立规划，不宜与前面几项混做。
@@ -143,11 +143,30 @@ cargo clippy --all-targets         -> 76 warnings（与基线持平，无新增�
 
 **仍存的限制**（不属本项范围）：快照为全量 JSON、每次状态变更同步重写，未做 debounce/合并写；无 revive topic，也没有 check point 的过期清理，长期不 ack 的 invisible 条目会累积；`popTimeout>0` 的长轮询在循环内复用请求开始时的 `now`，等待期间到期的 invisible 条目要等下一次请求才会复活。这些留待文件生命周期（第 2 项）与 HA/mmap 架构改造（第 5 项）一并处理。
 
-### 7.2 待办
+### 7.3 ◐ 第 2 项：文件生命周期管理（P0 #3，物理分段部分除外）
+
+| 能力 | 落地位置 | 说明 |
+|---|---|---|
+| `abort` 标记 / 异常恢复分支 | `src/store.rs` `Store::open` / `Store::shutdown` / `impl Drop` | 启动时创建 `abort`；`main.rs` 的 `supervise` 正常关闭时显式 `flush()+shutdown()` 删除它，`Drop` 兜底；SIGKILL 不会执行两者，下次 open 检测残留 → `recoverAbnormally` 分支：记 `warn`、累加 `abnormalRecoveries`、强制校验 commitlog 尾部并 sync 目录 |
+| `StoreCheckpoint` | `storecheckpoint.json` | 三时间戳（physic/logics/index）+ `commitlogLen` + `cleanExit` + `abnormalRecoveries` + `lastCleanTimestamp`；`Store::flush_checkpoint()` 由 `maintain_expiry` 每 10s 落盘 |
+| 磁盘水位 | `StoreLimits::max_store_bytes`（默认 32 GiB）、`Store::open_with_limits`、`Store::disk_usage` | `append_records` 写盘前用增量维护的目录字节数做硬限制，超限返回 `store disk watermark exceeded` 且**不 fence**（可恢复，对齐 Java `SERVICE_NOT_AVAILABLE`）；状态文件覆盖写时按单文件 size delta 修正计数 |
+| 过期文件清理 | `Store::clean_expired_files() -> CleanReport` | 删除崩溃残留的 `.<name>.<pid>.<seq>.tmp`；单写者文件锁保证无并发写者，`MIN_ORPHAN_AGE_MS = 1h` 保护正在写的临时文件；由 `maintain_expiry` 每 10s 调用，结果记入 checkpoint |
+
+```text
+cargo build                   -> 0 error / 0 warning
+cargo test                    -> 238 passed / 0 failed（233 + 4 store 单测 + 1 进程级）
+cargo clippy --all-targets    -> 76 warnings（基线持平）
+新增 tests/process.rs::abnormal_shutdown_marker_survives_sigkill
+     （真实 SIGKILL(9)：运行期 abort 存在 → kill 后仍存在 → 重启 abnormalRecoveries==1、消息完好）
+```
+
+**明确未做、归入第 5 项（#30）**：commitlog 的**物理分段滚动与过期段删除**。当前 `LOG_FILE = "commitlog"` 是单文件，`Location.physical` 是文件内绝对字节偏移，读路径 6 处直接 `seek(physical)`。要做 Java `MappedFileQueue` 式的滚动/删除，必须同时改 recover、append、全部读路径与索引语义，属于存储物理布局重构；与 #30 的 mmap/刷盘/文件预分配共用同一套设计更合理，单独塞进本项会破坏已验证的崩溃恢复语义。在此之前，磁盘增长由 `max_store_bytes` 硬上限兜住，但**旧空间不可回收**，这是与 Java 仍存在的实际差距。
+
+### 7.4 待办
 
 | 顺序 | 项 | 状态 |
 |---|---|---|
-| 2 | 文件生命周期（过期删除 / 磁盘水位 / checkpoint / abort 异常恢复分支） | 未开始 |
+| 2 | 文件生命周期（abort / checkpoint / 水位 / 孤儿文件清理） | **已落地**；物理分段滚动 + 过期 commitlog 段删除并入第 5 项 |
 | 3 | broker Admin 命令集 + controller config 空桩 | 未开始 |
 | 4 | 4.x remoting 协议 + RPCHook / zone | 未开始 |
-| 5 | HA / 多副本 / mmap 刷盘（架构级） | 未开始 |
+| 5 | HA / 多副本 / mmap 刷盘 + commitlog 分段 | 未开始 |
