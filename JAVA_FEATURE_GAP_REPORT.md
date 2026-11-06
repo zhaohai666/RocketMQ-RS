@@ -4,6 +4,7 @@
 > Java 参考：`/Users/haizai/project/jingsai/roocketmq/zhaohai666-rocketmq`（11 个模块、1,034 个源文件）
 > Rust 复刻：`/Users/haizai/project/RocketMQ-RS/src`（16 个文件、32,594 行，单 crate）
 > 方法：4 路并行源码审计（broker / proxy / store+tieredstore / 辅助模块），再对关键结论逐条复核源码
+> 补齐进度：§7 按 §5 的顺序逐项记录落地情况；原表保留审计当时的现状，不回改结论。
 
 ---
 
@@ -16,7 +17,7 @@
 | gRPC v2 MessagingService | **17/17 方法全部实现**（QueryRoute … SyncLiteSubscription） |
 | gRPC v2 AdminService | **16/16 方法全部实现**，但多数是语义空壳（见 P1） |
 | Java 5.2.2 客户端缺陷猎杀 | **15/15 PASS**（`JAVA_CLIENT_PARITY_REPORT.md`） |
-| 服务端基础设施 | **大面积缺失**：HA/多副本、mmap 刷盘、文件生命周期、POP/计时器状态持久化、Raft 日志持久化 |
+| 服务端基础设施 | **大面积缺失**：HA/多副本、mmap 刷盘、文件生命周期、Raft 日志持久化；**POP/计时器状态持久化已于 §7.1 补齐** |
 | broker remoting 请求码 | 约 30 个 vs Java `AdminBrokerProcessor` 约 70 个 case |
 | namesrv 请求码 | 13 个 vs Java `DefaultRequestProcessor` 数十个 |
 
@@ -92,7 +93,7 @@
 
 ## 5. 建议补齐顺序（按投入产出）
 
-1. **POP + Timer 状态落盘**（P0 #4/#5）：改动局限于 `broker.rs`，能消除重启重复投递，收益最高。
+1. ✅ **POP + Timer 状态落盘**（P0 #4/#5）：已完成，见 §7.1。
 2. **文件生命周期**（P0 #3）：过期删除 + 磁盘水位 + checkpoint/abort，避免磁盘无限增长。
 3. **broker Admin 命令集 + controller config 空桩**（P1 #13）：运维可诊断性，属纯增量。
 4. **4.x remoting 协议 + RPCHook**（P1 #9/#10）：决定能否接入存量 4.x 客户端与 zone 路由。
@@ -109,3 +110,44 @@ cargo test   -> 225 passed / 0 failed
 ```
 
 > 本报告为只读审计结论（未改动各模块功能逻辑）；除上述一行文案外无代码变更。
+
+---
+
+## 7. 补齐进度（按 §5 顺序）
+
+### 7.1 ✅ 第 1 项：POP + Timer 状态落盘（P0 #4/#5）
+
+**目标**：消除进程重启后丢失 POP 的 ack / invisible 状态导致的重复投递，以及定时轮槽位依赖全量重放的问题。
+
+| 改动 | 文件 | 说明 |
+|---|---|---|
+| typed runtime snapshot API | `src/store.rs` | 新增 `Store::put_runtime_state<T: Serialize>` / `Store::runtime_state<T: DeserializeOwned>`；`validate_state_name` 阻止路径穿越；`replace_json(..., durable: bool)` 让热路径保留原子 rename 但跳过 `sync_all()` / `sync_directory()`（进程级崩溃恢复不受影响，机器掉电可能丢最后一次快照，与 Java 异步刷盘同级） |
+| POP 快照 | `src/broker.rs` | `pop_state.json` 保存 `(group,topic,queue,offset,invisible_until)` 与 `(group,topic,queue,next-scan-offset)`；`Broker::new` 启动时恢复 `pop_invisible` / `pop_offsets` |
+| Timer 快照 | `src/broker.rs` | `timer_wheel.json` 保存 `checkpoint.scan_offset` 与全部待投递 slot；启动时一起恢复，避免「游标已前进但消息还停在轮里」的空洞 |
+| 写入时机 | `src/broker.rs` | 每次 POP 请求（锁外、一次请求只写一次）、ack 命中、change-invisible 命中、scan_wheel 一批处理完、deliver_due 投递完；空长轮询与空 due 轮不写盘；`state_write: Mutex<()>` 串行化快照，防止旧快照覆盖新快照 |
+| 顺带修正 | `src/broker.rs` | broker 三处 `invisibleTime` 从硬截断 1h 统一到 Java `GrpcValidator` 的 12h，避免 gRPC 层放行 2h 却被 remoting 层静默改成 1h |
+
+**验证**
+
+```text
+cargo build                        -> 0 error / 0 warning
+cargo test                         -> 233 passed / 0 failed（基线 230 + 2 单元 + 1 进程级）
+cargo clippy --all-targets         -> 76 warnings（与基线持平，无新增）
+新增 broker::tests::pop_buffer_state_survives_restart
+新增 broker::tests::timer_wheel_slots_survive_restart
+新增 tests/process.rs::pop_ack_and_invisible_state_survive_sigkill
+     （真实进程 SIGKILL(9) → 重启 → 断言已 ack 与仍 invisible 的消息不再投递，仅未投递消息返回）
+```
+
+**并发 flake 修复**：初版在 `pop_queue` 内每队列写盘且持有队列锁，使 `invisibleTime=100ms` 的既有测试在并发负载下窗口过期、`second_batch.len()` 得到 2 而非 1。已把快照写入移到 `pop_queues` 末尾（锁外、每请求一次），并把该测试改为用 `change_invisible(invisibleTime=0)` 显式触发过期，不再依赖真实时钟的 100ms 窗口；`cargo test --lib` 连续 3 轮并发复跑均 188/188 通过。
+
+**仍存的限制**（不属本项范围）：快照为全量 JSON、每次状态变更同步重写，未做 debounce/合并写；无 revive topic，也没有 check point 的过期清理，长期不 ack 的 invisible 条目会累积；`popTimeout>0` 的长轮询在循环内复用请求开始时的 `now`，等待期间到期的 invisible 条目要等下一次请求才会复活。这些留待文件生命周期（第 2 项）与 HA/mmap 架构改造（第 5 项）一并处理。
+
+### 7.2 待办
+
+| 顺序 | 项 | 状态 |
+|---|---|---|
+| 2 | 文件生命周期（过期删除 / 磁盘水位 / checkpoint / abort 异常恢复分支） | 未开始 |
+| 3 | broker Admin 命令集 + controller config 空桩 | 未开始 |
+| 4 | 4.x remoting 协议 + RPCHook / zone | 未开始 |
+| 5 | HA / 多副本 / mmap 刷盘（架构级） | 未开始 |

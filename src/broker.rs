@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{Notify, watch};
 use tracing::warn;
@@ -48,6 +48,17 @@ const TIMER_PUT_RETRIES: usize = 3;
 const SCHEDULE_BATCH: usize = 32;
 /// `TopicValidator.GROUP_MAX_LENGTH`
 const GROUP_MAX_LENGTH: usize = 120;
+/// Java `GrpcValidator` allows up to 12h for invisible time. The remoting
+/// processors used to silently clamp at 1h, so a client that asked for 2h was
+/// told it succeeded while the broker only held the message for 1h.
+const MAX_INVISIBLE_TIME_MS: i64 = 12 * 60 * 60 * 1000;
+
+/// Java `PopReviveService` writes check points and acks to the revive topic; this
+/// port snapshots the same state to `pop_state.json` so an ack survives a restart.
+const POP_STATE_FILE: &str = "pop_state.json";
+/// Java `TimerWheel` keeps pending slots on disk; this port snapshots them (and
+/// the queue cursor they were built from) to `timer_wheel.json`.
+const TIMER_WHEEL_FILE: &str = "timer_wheel.json";
 
 /// `TransactionalMessageUtil.buildHalfTopic`: prepared messages land here, invisible to
 /// consumers, until the producer resolves them.
@@ -430,6 +441,25 @@ struct WheelEntry {
     enqueue_ms: i64,
 }
 
+/// Persisted POP buffer. Java reconstructs this from the revive topic; a flat
+/// Vec is used because JSON object keys cannot be `(String, String, i32)` tuples.
+#[derive(Serialize, Deserialize, Default)]
+struct PopState {
+    /// (group, topic, queue, offset, invisible-until epoch millis)
+    invisible: Vec<(String, String, i32, u64, u64)>,
+    /// (group, topic, queue, next scan offset)
+    offsets: Vec<(String, String, i32, u64)>,
+}
+
+/// Persisted timer wheel, stored together with the cursor it was built from so
+/// a restart never sees "cursor advanced past records that are still parked".
+#[derive(Serialize, Deserialize, Default)]
+struct WheelState {
+    scan_offset: u64,
+    /// (deliver_ms, [(queue_offset, enqueue_ms)])
+    slots: Vec<(i64, Vec<(u64, i64)>)>,
+}
+
 /// ACL engine wired into the broker's request path (Java: the broker's
 /// `AccessValidator` + `PlainAccessValidator`). Authentication always rejects
 /// commands whose `AccessKey`/`Signature` ext fields do not verify against a
@@ -536,6 +566,12 @@ pub struct Broker {
     /// around the whole read of a light queue, so two pops of the same lite topic
     /// never hand out the same record.
     lite_locks: Mutex<BTreeMap<(String, String), Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes "snapshot the in-memory state then write it" so two concurrent
+    /// POP/wheel updates cannot let an older snapshot land after a newer one.
+    /// A plain mutex is deliberate: the write is a small synchronous JSON
+    /// replace, and routing every POP through `spawn_blocking` saturates that
+    /// pool under load (and makes short invisible windows time out in tests).
+    state_write: Mutex<()>,
 }
 
 /// `LiteSubscriptionRegistry`'s entry for one client.
@@ -699,6 +735,46 @@ impl Broker {
         checkpoint.scan_offset = checkpoint
             .scan_offset
             .min(store.queue_max_offset(schedule::TIMER_TOPIC, 0));
+        // Java `PopReviveService` / `TimerWheel` recover their pending state on
+        // startup. Restore the persisted snapshots; an absent file means a fresh
+        // store (or an older data directory), which keeps the previous behaviour.
+        let pop_state: Option<PopState> = store.runtime_state(POP_STATE_FILE)?;
+        let mut pop_invisible: BTreeMap<(String, String, i32), BTreeMap<u64, u64>> =
+            BTreeMap::new();
+        let mut pop_offsets: BTreeMap<(String, String, i32), u64> = BTreeMap::new();
+        if let Some(state) = pop_state {
+            for (group, topic, queue, offset, until) in state.invisible {
+                pop_invisible
+                    .entry((group, topic, queue))
+                    .or_default()
+                    .insert(offset, until);
+            }
+            for (group, topic, queue, next) in state.offsets {
+                pop_offsets.insert((group, topic, queue), next);
+            }
+        }
+        let wheel_state: Option<WheelState> = store.runtime_state(TIMER_WHEEL_FILE)?;
+        let mut wheel_slots: BTreeMap<i64, Vec<WheelEntry>> = BTreeMap::new();
+        if let Some(state) = wheel_state {
+            // The wheel file and the cursor are written together, so restoring
+            // both keeps the enqueue head exactly where it was at shutdown. The
+            // queue still bounds it in case the log was truncated externally.
+            checkpoint.scan_offset = state
+                .scan_offset
+                .min(store.queue_max_offset(schedule::TIMER_TOPIC, 0));
+            for (deliver_ms, entries) in state.slots {
+                wheel_slots.insert(
+                    deliver_ms,
+                    entries
+                        .into_iter()
+                        .map(|(queue_offset, enqueue_ms)| WheelEntry {
+                            queue_offset,
+                            enqueue_ms,
+                        })
+                        .collect(),
+                );
+            }
+        }
         let (messages, _) = watch::channel(0);
         let mut filters = FilterRegistry::default();
         filters.hydrate(&store)?;
@@ -724,14 +800,15 @@ impl Broker {
             delay_offsets: Mutex::new(delay_offsets),
             wheel: Mutex::new(Wheel {
                 checkpoint,
-                slots: BTreeMap::new(),
+                slots: wheel_slots,
             }),
             reject_roll: AtomicU64::new(0),
-            pop_invisible: Mutex::new(BTreeMap::new()),
-            pop_offsets: Mutex::new(BTreeMap::new()),
+            pop_invisible: Mutex::new(pop_invisible),
+            pop_offsets: Mutex::new(pop_offsets),
             pop_locks: Mutex::new(BTreeMap::new()),
             lite_subscriptions: Mutex::new(BTreeMap::new()),
             lite_locks: Mutex::new(BTreeMap::new()),
+            state_write: Mutex::new(()),
         })
     }
 
@@ -1686,7 +1763,7 @@ impl Broker {
         let queue_id: i32 = request.field("queueId")?;
         let max_nums = optional_field(request, "maxMsgNums", 1usize)?.clamp(1, POP_MAX_NUMS);
         let invisible_time =
-            optional_field(request, "invisibleTime", 15_000i64)?.clamp(0, 3_600_000);
+            optional_field(request, "invisibleTime", 15_000i64)?.clamp(0, MAX_INVISIBLE_TIME_MS);
         validate_name(&group)?;
         validate_topic_name(&topic)?;
         let group_config = match self.group_config(&group).await? {
@@ -1849,6 +1926,13 @@ impl Broker {
                 .await?;
             delivered.append(&mut from_queue);
         }
+        // One snapshot per request, after every queue lock has been released.
+        // Writing inside `pop_queue` serialized unrelated queues behind a file
+        // write while still holding their queue locks, and rewrote the same
+        // state once per queue for a queueId < 0 request.
+        if !delivered.is_empty() {
+            self.persist_pop_state();
+        }
         Ok(delivered)
     }
 
@@ -1973,7 +2057,7 @@ impl Broker {
         let client_id = request.required("clientId")?.to_owned();
         let max_nums = optional_field(request, "maxMsgNum", 1usize)?.clamp(1, POP_MAX_NUMS);
         let invisible_time =
-            optional_field(request, "invisibleTime", 15_000i64)?.clamp(0, 3_600_000);
+            optional_field(request, "invisibleTime", 15_000i64)?.clamp(0, MAX_INVISIBLE_TIME_MS);
         validate_name(&group)?;
         validate_topic_name(&parent_topic)?;
         let group_config = match self.group_config(&group).await? {
@@ -2174,11 +2258,18 @@ impl Broker {
                 (topic, group, queue_id, offset)
             }
         };
-        self.pop_invisible
+        let removed = self
+            .pop_invisible
             .lock()
             .unwrap()
             .get_mut(&(group.clone(), topic.clone(), queue_id))
-            .map(|entries| entries.remove(&offset));
+            .map(|entries| entries.remove(&offset).is_some())
+            .unwrap_or(false);
+        // An ack for an unknown handle only advances the committed offset (which
+        // is durable on its own); no need to rewrite an unchanged snapshot.
+        if removed {
+            self.persist_pop_state();
+        }
         // `PopBufferMergeService`: an ack eventually becomes the group's committed offset so a
         // restart does not re-deliver records that were already consumed. Only advancing writes.
         let next = offset + 1;
@@ -2201,7 +2292,7 @@ impl Broker {
     /// `ChangeInvisibleTimeProcessor.processRequest`: replace the invisible span of one
     /// outstanding message, addressed the same way an ack is.
     async fn change_invisible(&self, request: &Command) -> BrokerResult<Command> {
-        let invisible_time = request.field::<i64>("invisibleTime")?.clamp(0, 3_600_000);
+        let invisible_time = request.field::<i64>("invisibleTime")?.clamp(0, MAX_INVISIBLE_TIME_MS);
         // parse_pop_ck yields (topic, group, queue, offset) — the map is keyed (group, topic).
         let (topic, group, queue_id, offset) = match request.ext_fields.get("extraInfo") {
             Some(ck) => parse_pop_ck(ck)
@@ -2215,11 +2306,16 @@ impl Broker {
             }
         };
         let until = now_millis() + invisible_time;
-        self.pop_invisible
+        let touched = self
+            .pop_invisible
             .lock()
             .unwrap()
             .get_mut(&(group, topic, queue_id))
-            .map(|entries| entries.insert(offset, until as u64));
+            .map(|entries| entries.insert(offset, until as u64))
+            .is_some();
+        if touched {
+            self.persist_pop_state();
+        }
         Ok(Command::response(request, 0))
     }
 
@@ -2459,6 +2555,10 @@ impl Broker {
                     delivered += 1;
                 }
             }
+            // Persist the slots and the cursor in one snapshot: if the process
+            // dies before this write, the cursor in the file is still behind and
+            // the queue replay rebuilds exactly the entries that were parked.
+            self.persist_wheel_state();
             if count < SCHEDULE_BATCH {
                 *wake = (*wake).min(TIMER_POLL_MS);
                 return Ok(delivered);
@@ -2470,7 +2570,12 @@ impl Broker {
     async fn deliver_due(&self, wake: &mut i64) -> BrokerResult<usize> {
         let now = now_millis();
         let mut delivered = 0usize;
-        for (deliver_ms, entries) in self.take_due_slots(now) {
+        let due = self.take_due_slots(now);
+        if due.is_empty() {
+            self.set_wheel_wake(wake);
+            return Ok(delivered);
+        }
+        for (deliver_ms, entries) in due {
             // The slot's records are not contiguous in the queue, so each one is read back by its
             // own offset, which is what following the reference's linked list amounts to.
             let mut deletes = BTreeSet::new();
@@ -2519,6 +2624,9 @@ impl Broker {
                 }
             }
         }
+        // Written after delivery, so a crash leaves the due slot in the snapshot
+        // and the message is delivered again rather than lost.
+        self.persist_wheel_state();
         self.set_wheel_wake(wake);
         Ok(delivered)
     }
@@ -2593,6 +2701,71 @@ impl Broker {
                 (self.timer.drain_ms(*deliver_ms) - now).max(1)
             });
         *wake = (*wake).min(next);
+    }
+
+    /// Snapshot the POP buffer (invisible entries + scan cursors). Called after
+    /// every mutation: without it an acked message would be handed out again
+    /// after a restart, which is what Java's revive topic prevents.
+    fn persist_pop_state(&self) {
+        // Serialize snapshot+write so an older snapshot cannot overwrite a newer
+        // one when two POP operations finish at the same time.
+        let _serial = self.state_write.lock().unwrap();
+        let snapshot = {
+            let invisible = self.pop_invisible.lock().unwrap();
+            let offsets = self.pop_offsets.lock().unwrap();
+            let mut state = PopState::default();
+            for ((group, topic, queue), entries) in invisible.iter() {
+                for (offset, until) in entries {
+                    state.invisible.push((
+                        group.clone(),
+                        topic.clone(),
+                        *queue,
+                        *offset,
+                        *until,
+                    ));
+                }
+            }
+            for ((group, topic, queue), next) in offsets.iter() {
+                state
+                    .offsets
+                    .push((group.clone(), topic.clone(), *queue, *next));
+            }
+            state
+        };
+        if let Err(error) = self.store.put_runtime_state(POP_STATE_FILE, &snapshot) {
+            warn!(%error, "failed to persist POP state");
+        }
+    }
+
+    /// Snapshot pending timer slots together with the cursor they were built
+    /// from, so neither a parked message nor a duplicate delivery is produced
+    /// by a restart. Deliberately written *after* a dequeue completes: a crash
+    /// then leaves the slot in the snapshot and the message is delivered twice
+    /// (at-least-once), never lost.
+    fn persist_wheel_state(&self) {
+        let _serial = self.state_write.lock().unwrap();
+        let snapshot = {
+            let wheel = self.wheel.lock().unwrap();
+            WheelState {
+                scan_offset: wheel.checkpoint.scan_offset,
+                slots: wheel
+                    .slots
+                    .iter()
+                    .map(|(deliver_ms, entries)| {
+                        (
+                            *deliver_ms,
+                            entries
+                                .iter()
+                                .map(|entry| (entry.queue_offset, entry.enqueue_ms))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            }
+        };
+        if let Err(error) = self.store.put_runtime_state(TIMER_WHEEL_FILE, &snapshot) {
+            warn!(%error, "failed to persist timer wheel state");
+        }
     }
 
     /// `TimerFlushService`: the queue cursor alone is enough to rebuild the wheel, so it is the
@@ -3784,8 +3957,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pop_delivers_stamps_receipts_and_revives_expired_entries() {
-        let (_dir, broker) = test_broker().await;
+    async fn pop_buffer_state_survives_restart() {
+        let dir = TempDir::new().unwrap();
+        let broker = Broker::new(
+            Arc::new(Store::open(dir.path()).unwrap()),
+            BrokerConfig::default(),
+        )
+        .unwrap();
         for index in 0..3 {
             let send = send_request("orders", format!("m{index}").as_bytes(), "", 0);
             broker.process(&send, peer()).await.unwrap();
@@ -3796,7 +3974,81 @@ mod tests {
                 .with_ext("topic", "orders")
                 .with_ext("queueId", 0)
                 .with_ext("maxMsgNums", 2)
-                .with_ext("invisibleTime", 100)
+                .with_ext("invisibleTime", 3_600_000)
+        };
+        let batch = decode_records(&broker.process(&pop(), peer()).await.unwrap().body);
+        assert_eq!(batch.len(), 2);
+        // m0 is acknowledged; m1 stays invisible across the restart.
+        let acked = batch.iter().find(|m| m.body == b"m0").unwrap();
+        let ack = Command::request(200051).with_ext("extraInfo", acked.properties[POP_CK].as_str());
+        broker.process(&ack, peer()).await.unwrap();
+        drop(broker);
+
+        let reopened = Broker::new(
+            Arc::new(Store::open(dir.path()).unwrap()),
+            BrokerConfig::default(),
+        )
+        .unwrap();
+        let after = decode_records(&reopened.process(&pop(), peer()).await.unwrap().body);
+        // Only the never-delivered m2 may come back: the ack and the invisible
+        // span survived, and the scan cursor resumed after both handed-out offsets.
+        assert_eq!(after.len(), 1, "acked or invisible message was re-delivered");
+        assert_eq!(after[0].body, b"m2");
+    }
+
+    #[tokio::test]
+    async fn timer_wheel_slots_survive_restart() {
+        let dir = TempDir::new().unwrap();
+        let broker = Broker::new(
+            Arc::new(Store::open(dir.path()).unwrap()),
+            BrokerConfig::default(),
+        )
+        .unwrap();
+        {
+            let mut wheel = broker.wheel.lock().unwrap();
+            wheel.slots.insert(
+                1_234_567,
+                vec![WheelEntry {
+                    queue_offset: 4,
+                    enqueue_ms: 99,
+                }],
+            );
+        }
+        broker.persist_wheel_state();
+        drop(broker);
+
+        let reopened = Broker::new(
+            Arc::new(Store::open(dir.path()).unwrap()),
+            BrokerConfig::default(),
+        )
+        .unwrap();
+        let wheel = reopened.wheel.lock().unwrap();
+        let parked = wheel
+            .slots
+            .get(&1_234_567)
+            .expect("a parked timer message was lost on restart");
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].queue_offset, 4);
+        assert_eq!(parked[0].enqueue_ms, 99);
+    }
+
+    #[tokio::test]
+    async fn pop_delivers_stamps_receipts_and_revives_expired_entries() {
+        let (_dir, broker) = test_broker().await;
+        for index in 0..3 {
+            let send = send_request("orders", format!("m{index}").as_bytes(), "", 0);
+            broker.process(&send, peer()).await.unwrap();
+        }
+        // A long, explicit span keeps the first two pops independent of wall
+        // clock elapsed between them. A 100ms span used to expire under a busy
+        // test runner and made the "next record" assertion flaky.
+        let pop = || {
+            Command::request(200050)
+                .with_ext("consumerGroup", "cg")
+                .with_ext("topic", "orders")
+                .with_ext("queueId", 0)
+                .with_ext("maxMsgNums", 2)
+                .with_ext("invisibleTime", 3_600_000)
         };
         let first = broker.process(&pop(), peer()).await.unwrap();
         let first_batch = decode_records(&first.body);
@@ -3815,7 +4067,8 @@ mod tests {
         // Everything outstanding sits inside its invisible span.
         let third = broker.process(&pop(), peer()).await.unwrap();
         assert!(decode_records(&third.body).is_empty());
-        // An ack clears one entry, a longer invisible span defers another.
+        // An ack clears one entry, an explicit span defers the third, and the
+        // second is expired on demand instead of waiting on a 100ms timer.
         let ack = Command::request(200051)
             .with_ext("extraInfo", first_batch[0].properties[POP_CK].as_str());
         broker.process(&ack, peer()).await.unwrap();
@@ -3823,7 +4076,12 @@ mod tests {
             .with_ext("extraInfo", second_batch[0].properties[POP_CK].as_str())
             .with_ext("invisibleTime", 3_600_000);
         broker.process(&change, peer()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let expire = Command::request(200053)
+            .with_ext("extraInfo", first_batch[1].properties[POP_CK].as_str())
+            .with_ext("invisibleTime", 0);
+        broker.process(&expire, peer()).await.unwrap();
+        // Only needed to make `now` strictly greater than the zero-length span.
+        tokio::time::sleep(Duration::from_millis(2)).await;
         let fourth = broker.process(&pop(), peer()).await.unwrap();
         let revived = decode_records(&fourth.body);
         // The acked offset stays consumed, the deferred one stays invisible, only the

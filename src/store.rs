@@ -846,6 +846,34 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically persist a typed runtime state snapshot next to the other JSON
+    /// state files. Java keeps POP check points in the revive topic and timer
+    /// slots in the TimerWheel files; this port uses a crash-safe JSON snapshot
+    /// so a restart can rebuild both without replaying the whole commit log.
+    pub fn put_runtime_state<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
+        validate_state_name(name)?;
+        let bytes = encode_json(value)?;
+        let mut inner = self.lock()?;
+        inner.ensure_writable()?;
+        // Hot path (one write per POP/ACK). Forcing an fsync here saturated the
+        // disk queue under concurrent consumers and made short invisible windows
+        // expire before the next read; the atomic rename alone is enough to
+        // survive a process restart, which is the failure this state guards.
+        if let Err(error) = replace_json(&inner.directory, name, &bytes, false) {
+            inner.fenced = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Load a snapshot written by [`Store::put_runtime_state`]. `None` means the
+    /// broker has never written that state (a fresh store or an older data dir).
+    pub fn runtime_state<T: DeserializeOwned>(&self, name: &str) -> Result<Option<T>> {
+        validate_state_name(name)?;
+        let inner = self.lock()?;
+        load_json(&inner.directory.join(name))
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, Inner>> {
         self.inner
             .lock()
@@ -873,7 +901,7 @@ impl Inner {
     }
 
     fn persist(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
-        if let Err(error) = replace_json(&self.directory, name, bytes) {
+        if let Err(error) = replace_json(&self.directory, name, bytes, true) {
             self.fenced = true;
             return Err(error);
         }
@@ -883,6 +911,21 @@ impl Inner {
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::Invalid(message.into())
+}
+
+/// State file names come from callers, so keep them inside the store directory
+/// instead of letting a crafted name escape it through `directory.join`.
+fn validate_state_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name.ends_with(".json")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+    {
+        return Err(invalid("invalid runtime state file name"));
+    }
+    Ok(())
 }
 
 fn validate_name(name: &str, kind: &str) -> Result<()> {
@@ -1225,7 +1268,12 @@ fn encode_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn replace_json(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+/// `durable = false` keeps the atomic rename but skips the fsyncs. A process
+/// restart (including SIGKILL) still sees the new file because the page cache
+/// is intact; only a machine power loss can lose the last snapshot. That is the
+/// same trade-off Java makes when it writes POP check points to the revive topic
+/// with the broker's asynchronous flush policy.
+fn replace_json(directory: &Path, name: &str, bytes: &[u8], durable: bool) -> Result<()> {
     let destination = directory.join(name);
     reject_nonregular(&destination)?;
     let mut temporary = None;
@@ -1245,9 +1293,13 @@ fn replace_json(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let (path, mut file) = temporary.ok_or_else(|| invalid("cannot reserve a state temp file"))?;
     let written = (|| -> Result<()> {
         file.write_all(bytes)?;
-        file.sync_all()?;
+        if durable {
+            file.sync_all()?;
+        }
         fs::rename(&path, &destination)?;
-        sync_directory(directory)?;
+        if durable {
+            sync_directory(directory)?;
+        }
         Ok(())
     })();
     if written.is_err() {

@@ -5,7 +5,7 @@ use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use rocketmq_rs::common::{Message, now_millis};
+use rocketmq_rs::common::{Message, PROPERTY_POP_CK, now_millis};
 use rocketmq_rs::remoting::{self, Command};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -207,6 +207,71 @@ async fn acknowledged_state_survives_sigkill_and_restart() {
     assert_eq!(second.ext_fields["queueOffset"], (offset + 1).to_string());
     assert_ne!(second.ext_fields["msgId"], msg_id);
     assert_eq!(pull(&address, offset + 1).await.body, b"after-restart");
+}
+
+fn pop_request(group: &str, invisible_time: i64) -> Command {
+    Command::request(200050)
+        .with_ext("consumerGroup", group)
+        .with_ext("topic", "ProcessTopic")
+        .with_ext("queueId", 0)
+        .with_ext("maxMsgNums", 2)
+        .with_ext("invisibleTime", invisible_time)
+        .with_ext("popTimeout", 0)
+}
+
+fn records(body: &[u8]) -> Vec<Message> {
+    let mut messages = Vec::new();
+    let mut rest = body;
+    while !rest.is_empty() {
+        let (message, consumed) = Message::decode(rest).unwrap();
+        rest = &rest[consumed..];
+        messages.push(message);
+    }
+    messages
+}
+
+/// Java reconstructs the POP buffer from the revive topic after a crash. This
+/// port restores `pop_state.json`: without it an acked message (or one still
+/// inside its invisible span) is handed out again after the process is killed.
+#[tokio::test]
+async fn pop_ack_and_invisible_state_survive_sigkill() {
+    let dir = TempDir::new().unwrap();
+    let (mut broker, address) = start(dir.path()).await;
+    let group = "pop-process-cg";
+    let group_config = serde_json::to_vec(&serde_json::json!({"groupName": group})).unwrap();
+    rpc(&address, Command::request(200).with_body(group_config)).await;
+    for body in [b"p0".as_slice(), b"p1".as_slice(), b"p2".as_slice()] {
+        rpc(&address, send(body)).await;
+    }
+    let first = rpc(&address, pop_request(group, 3_600_000)).await;
+    let batch = records(&first.body);
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch[0].body, b"p0");
+    assert_eq!(batch[1].body, b"p1");
+    // Ack only p0. p1 must stay invisible across the restart.
+    let ack = Command::request(200051)
+        .with_ext("extraInfo", batch[0].properties[PROPERTY_POP_CK].as_str());
+    rpc(&address, ack).await;
+
+    broker.0.kill().unwrap();
+    let status = broker.0.wait().unwrap();
+    assert!(!status.success());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(9));
+    }
+
+    let (_restarted, address) = start(dir.path()).await;
+    let second = rpc(&address, pop_request(group, 3_600_000)).await;
+    let resumed = records(&second.body);
+    // Only the never-delivered p2 may come back.
+    assert_eq!(
+        resumed.len(),
+        1,
+        "an acked or still-invisible message was re-delivered after a kill"
+    );
+    assert_eq!(resumed[0].body, b"p2");
 }
 
 #[test]
