@@ -5,6 +5,7 @@ use std::time::Duration;
 use rocketmq_rs::broker::{Broker, BrokerConfig};
 use rocketmq_rs::common::{Message, Result, TopicConfig, now_millis};
 use rocketmq_rs::namesrv::Namesrv;
+use rocketmq_rs::proxy::{ProxyConfig, ProxyContext, serve_remoting_front};
 use rocketmq_rs::remoting::{self, Command, Handler, SerializeType};
 use rocketmq_rs::store::Store;
 use serde_json::{Value, json};
@@ -778,4 +779,119 @@ async fn a_lite_message_is_read_from_the_light_queue_of_its_lite_topic() {
 
     drop(broker);
     server.stop().await;
+}
+
+async fn front_request(addr: SocketAddr, request: Command) -> Command {
+    remoting::invoke(&addr.to_string(), request, Duration::from_secs(5))
+        .await
+        .unwrap()
+}
+
+/// #29: the client-facing remoting port (Java `RemotingProtocolServer`) relays
+/// read-only namesrv metadata and the 4.x messaging commands — including ones
+/// with no `topic` header — while refusing to expose cluster-private namesrv
+/// codes and broker Admin commands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remoting_front_forwards_4x_commands_to_a_live_cluster() {
+    let ns_dir = TempDir::new().unwrap();
+    let ns = Arc::new(Namesrv::open(ns_dir.path(), Duration::from_secs(120)).unwrap());
+    let ns_server =
+        Running::start(TcpListener::bind("127.0.0.1:0").await.unwrap(), ns.clone()).await;
+
+    let dir = TempDir::new().unwrap();
+    let (broker, server) = start_broker(&dir).await;
+    // Register a topic with the namesrv so code 105 resolves a master for it.
+    broker
+        .store()
+        .put_topic(TopicConfig::new("FrontTopic", 1))
+        .unwrap();
+    assert_eq!(
+        ns_server.request(broker.registration().unwrap()).await.code,
+        0
+    );
+
+    let front_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front_addr = front_listener.local_addr().unwrap();
+    let config = ProxyConfig {
+        name_server_address: vec![ns_server.addr.to_string()],
+        listen_port: front_addr.port(),
+        remoting_listen_port: front_addr.port(),
+        ..ProxyConfig::default()
+    };
+    let (shutdown, rx) = watch::channel(false);
+    let front = tokio::spawn(serve_remoting_front(
+        front_listener,
+        ProxyContext::new(config, front_addr),
+        rx,
+    ));
+
+    // 105 GET_ROUTEINFO_BY_TOPIC: read-only namesrv metadata is relayed unchanged.
+    let route = front_request(
+        front_addr,
+        Command::request(105).with_ext("topic", "FrontTopic"),
+    )
+    .await;
+    assert_eq!(route.code, 0, "{:?}", route.remark);
+    let route: Value = serde_json::from_slice(&route.body).unwrap();
+    assert_eq!(
+        route["brokerDatas"][0]["brokerAddrs"]["0"],
+        server.addr.to_string()
+    );
+
+    // 46 CHECK_CLIENT_CONFIG has no `topic` header. Before this work the front
+    // end answered "missing the topic field"; now it selects one broker via the
+    // namesrv cluster info (`invoke_broker_command_any`).
+    let check = front_request(front_addr, Command::request(46)).await;
+    assert_eq!(check.code, 0, "{:?}", check.remark);
+
+    // 34 HEART_BEAT has no topic either, but carries a client body.
+    let heartbeat = Command::request(34).with_body(
+        serde_json::to_vec(&json!({
+            "clientID": "front-client",
+            "producerDataSet": [],
+            "consumerDataSet": []
+        }))
+        .unwrap(),
+    );
+    let heartbeat = front_request(front_addr, heartbeat).await;
+    assert_eq!(heartbeat.code, 0, "{:?}", heartbeat.remark);
+
+    // 41/42 carry their queues in the body; the front end derives the routing
+    // topic from the first message queue and forwards to that topic's master.
+    let lock_body = serde_json::to_vec(&json!({
+        "consumerGroup": "front-group",
+        "clientId": "front-client",
+        "mqSet": [{"topic": "FrontTopic", "brokerName": "broker-a", "queueId": 0}]
+    }))
+    .unwrap();
+    let locked = front_request(
+        front_addr,
+        Command::request(41).with_body(lock_body.clone()),
+    )
+    .await;
+    assert_eq!(locked.code, 0, "{:?}", locked.remark);
+    let locked: Value = serde_json::from_slice(&locked.body).unwrap();
+    assert_eq!(locked["lockOKMQSet"].as_array().unwrap().len(), 1);
+    let unlocked = front_request(front_addr, Command::request(42).with_body(lock_body)).await;
+    assert_eq!(unlocked.code, 0, "{:?}", unlocked.remark);
+
+    // Cluster-private namesrv codes, broker Admin codes and unknown codes are
+    // refused here, never relayed to a backend that would answer them.
+    for code in [100, 102, 103, 104, 205, 216, 318, 327, 904, 17, 28, 999_999] {
+        let response = front_request(front_addr, Command::request(code)).await;
+        assert_eq!(response.code, 3, "code {code}: {:?}", response.remark);
+    }
+    let internal = front_request(front_addr, Command::request(103)).await;
+    assert!(
+        internal
+            .remark
+            .as_deref()
+            .unwrap_or_default()
+            .contains("internal")
+    );
+
+    shutdown.send(true).unwrap();
+    front.await.unwrap().unwrap();
+    server.stop().await;
+    ns_server.stop().await;
 }

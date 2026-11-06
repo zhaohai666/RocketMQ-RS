@@ -1874,6 +1874,19 @@ impl ProxyBackend {
         self.client.invoke(&addr, request, self.timeout).await
     }
 
+    /// Java `ClusterMetadataService.findOneBroker`: 4.x client commands such as
+    /// HEART_BEAT (34), UNREGISTER_CLIENT (35), GET_CONSUMER_LIST_BY_GROUP (38)
+    /// and GET_CONSUMER_CONNECTION_LIST (203) carry no `topic` header, so they
+    /// cannot be routed by topic route lookup. Pick one master from the
+    /// namesrv's cluster info instead. A single-broker deployment is exact;
+    /// Java handles the multi-broker case with the proxy's own client registry
+    /// and fans some commands out, which remains a gap here.
+    pub async fn invoke_broker_command_any(&self, mut request: Command) -> Result<Command> {
+        self.apply_inner_credentials(&mut request);
+        let addr = self.one_broker_addr("").await?;
+        self.client.invoke(&addr, request, self.timeout).await
+    }
+
     /// Resolve the topic's declared message types from the broker's
     /// `GET_TOPIC_CONFIG_BY_TOPIC` (remoting code 351), which returns the
     /// `TopicConfig` JSON. Java declares a topic's message type through the
@@ -5226,15 +5239,81 @@ pub async fn serve_proxy_tls(
 // Remoting front end (Java `RemotingProtocolServer`)
 // ---------------------------------------------------------------------------
 
-/// Route/metadata queries that ride the pooled namesrv channels
-/// (GET_ROUTEINFO_BY_TOPIC=105, GET_ALL_TOPICLIST_FROM_NAMESERVER=106,
-/// GET_TOPIC_LIST_FROM_NS=219; "等" covers future additions to this list).
-const NAMESRV_FORWARD_CODES: [i32; 3] = [105, 106, 219];
-/// Message/offset commands forwarded to the broker master
-/// (SEND_MESSAGE=10, PULL_MESSAGE=11, QUERY_CONSUMER_OFFSET=14,
-/// UPDATE_CONSUMER_OFFSET=15, QUERY_OFFSET=29 and the v5 pop family
-/// POP_MESSAGE=200050, ACK_MESSAGE=200051, CHANGE_MESSAGE_INVISIBLE_TIME=200053).
-const BROKER_FORWARD_CODES: [i32; 8] = [10, 11, 14, 15, 29, 200050, 200051, 200053];
+/// Read-only namesrv metadata a 4.x client may ask the proxy for. Java's
+/// `RemotingProtocolServer.registerRemotingServer` registers only
+/// `GET_ROUTEINFO_BY_TOPIC` (105) on the namesrv side; this port also relays
+/// the other read-only tables clients and `mqadmin`-style tools need (cluster
+/// info, topic lists, KV lookups, namesrv properties, member group).
+const NAMESRV_FORWARD_CODES: &[i32] = &[101, 105, 106, 206, 219, 224, 319, 901];
+
+/// Namesrv codes that mutate cluster membership or configuration. They belong
+/// to the broker/operator path and are answered on the namesrv's own port by
+/// `namesrv.rs::dispatch`, but must never be reachable from the client-facing
+/// proxy front end: 103/104/904 would let a client register an arbitrary
+/// broker into the routing table, 100/102 rewrite KV config, 205/327 change
+/// write permissions, and 216/318 delete topics or update namesrv config.
+/// Java's proxy front end does not register any of them either.
+const NAMESRV_PRIVATE_CODES: &[i32] = &[100, 102, 103, 104, 205, 216, 318, 327, 904];
+
+/// Client-facing 4.x/5.x remoting commands the proxy forwards to a broker.
+/// This is the set Java registers through its remoting Activity handlers
+/// (send/pull/POP/ack/offset/heartbeat/transaction/recall/connection list),
+/// plus this port's own read-only query and LMQ extensions (12, 200070,
+/// 200071). Broker Admin codes (17/21/23/26/28/43/45/60/200/201/202/204/
+/// 207/208/305/351/352...) are deliberately absent: Java serves admin over
+/// gRPC AdminService, and forwarding them here would re-sign the request with
+/// the proxy's privileged inner credentials while `AclGuard::check_command`
+/// verifies only the signature, not the caller's permissions. They remain
+/// reachable on the broker's own remoting port, where `mqadmin` talks to a
+/// Java broker too.
+const BROKER_FORWARD_CODES: &[i32] = &[
+    10, 11, 12, 14, 15, 29, 30, 31, 32, 34, 35, 36, 37, 38, 41, 42, 46, 203, 310, 320, 361, 370,
+    200050, 200051, 200053, 200070, 200071,
+];
+
+/// Where the remoting front end sends one request code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardTarget {
+    Namesrv,
+    Broker,
+    /// Implemented by the backend, but private to the namesrv's own port.
+    Internal,
+    Unsupported,
+}
+
+fn forward_target(code: i32) -> ForwardTarget {
+    if NAMESRV_PRIVATE_CODES.contains(&code) {
+        ForwardTarget::Internal
+    } else if NAMESRV_FORWARD_CODES.contains(&code) {
+        ForwardTarget::Namesrv
+    } else if BROKER_FORWARD_CODES.contains(&code) {
+        ForwardTarget::Broker
+    } else {
+        ForwardTarget::Unsupported
+    }
+}
+
+/// The `topic` header drives broker routing when present. Java's
+/// `lockBatchMQ` / `unlockBatchMQ` (41/42) carry their queues in the JSON body
+/// instead of a header, so derive the topic from the first message queue.
+/// Commands with neither (heartbeats, connection lists, whole-broker tables)
+/// are routed to one broker of the cluster by `invoke_broker_command_any`.
+fn route_topic(request: &Command) -> Option<String> {
+    if let Some(topic) = request.ext_fields.get("topic").filter(|v| !v.is_empty()) {
+        return Some(topic.clone());
+    }
+    if !matches!(request.code, 41 | 42) {
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_slice(&request.body).ok()?;
+    body.get("mqSet")?
+        .as_array()?
+        .first()?
+        .get("topic")?
+        .as_str()
+        .filter(|topic| !topic.is_empty())
+        .map(str::to_owned)
+}
 
 /// Remoting response codes used when the front end itself answers.
 const RESPONSE_SYSTEM_ERROR: i32 = 1;
@@ -5285,38 +5364,37 @@ impl RemotingFrontProcessor {
                 return response;
             }
         }
-        if NAMESRV_FORWARD_CODES.contains(&request.code) {
-            return match self.backend.invoke_namesrv_command(request).await {
-                Ok(response) => response,
-                Err(error) => {
-                    let mut response = Command::response(&echo, RESPONSE_SYSTEM_ERROR);
-                    response.remark = Some(error.to_string());
-                    response
-                }
-            };
-        }
-        if BROKER_FORWARD_CODES.contains(&request.code) {
-            let topic = request.ext_fields.get("topic").cloned().unwrap_or_default();
-            if topic.is_empty() {
-                let mut response = Command::response(&echo, RESPONSE_SYSTEM_ERROR);
-                response.remark = Some("broker command is missing the topic field".into());
+        let forwarded = match forward_target(request.code) {
+            ForwardTarget::Namesrv => self.backend.invoke_namesrv_command(request).await,
+            ForwardTarget::Broker => match route_topic(&request) {
+                Some(topic) => self.backend.invoke_broker_command(&topic, request).await,
+                None => self.backend.invoke_broker_command_any(request).await,
+            },
+            ForwardTarget::Internal => {
+                let mut response = Command::response(&echo, RESPONSE_REQUEST_CODE_NOT_SUPPORTED);
+                response.remark = Some(format!(
+                    "request code {} is internal to the nameserver and is not exposed by the proxy front end",
+                    echo.code
+                ));
                 return response;
             }
-            return match self.backend.invoke_broker_command(&topic, request).await {
-                Ok(response) => response,
-                Err(error) => {
-                    let mut response = Command::response(&echo, RESPONSE_SYSTEM_ERROR);
-                    response.remark = Some(error.to_string());
-                    response
-                }
-            };
+            ForwardTarget::Unsupported => {
+                let mut response = Command::response(&echo, RESPONSE_REQUEST_CODE_NOT_SUPPORTED);
+                response.remark = Some(format!(
+                    "proxy remoting front end does not support request code {}",
+                    echo.code
+                ));
+                return response;
+            }
+        };
+        match forwarded {
+            Ok(response) => response,
+            Err(error) => {
+                let mut response = Command::response(&echo, RESPONSE_SYSTEM_ERROR);
+                response.remark = Some(error.to_string());
+                response
+            }
         }
-        let mut response = Command::response(&echo, RESPONSE_REQUEST_CODE_NOT_SUPPORTED);
-        response.remark = Some(format!(
-            "proxy remoting front end does not support request code {}",
-            echo.code
-        ));
-        response
     }
 }
 
@@ -5331,9 +5409,12 @@ impl remoting::Handler for RemotingFrontProcessor {
 }
 
 /// Bind the proxy's remoting-protocol front end (`ProxyConfig::remoting_listen_port`
-/// semantics): accept remoting connections, forward route queries (105/106/219) to
-/// the namesrv and message commands (10/11/14/15/29/200050/200051/200053) to the
-/// topic's broker master, and pass broker/namesrv responses back unmodified.
+/// semantics), the equivalent of Java's `RemotingProtocolServer`. Accept remoting
+/// connections, forward read-only namesrv metadata to the namesrv and the 4.x/5.x
+/// client messaging codes to a broker (by `topic` when present, otherwise one
+/// broker of the cluster), then pass the backend response back unmodified.
+/// Cluster-private namesrv codes and broker Admin codes are rejected here: they
+/// are reachable on the namesrv/broker's own ports, not through the client port.
 pub async fn serve_remoting_front(
     listener: tokio::net::TcpListener,
     context: Arc<ProxyContext>,
@@ -5662,5 +5743,109 @@ mod tests {
         assert!(!AclGuard::signature_matches(&expected, &wrong));
         let off = AclGuard::with_metadata(false, auth::LocalAuthenticationMetadataProvider::new());
         assert!(!off.enabled);
+    }
+
+    /// Every code Java `RemotingProtocolServer.registerRemotingServer` registers
+    /// through its Activity handlers must be forwardable to a broker, and the
+    /// cluster-private namesrv codes must stay off the client-facing port.
+    #[test]
+    fn remoting_front_classifies_4x_client_codes() {
+        for code in [
+            10, 310, 320, 36, 37, 370, // send / send-back / transaction / recall
+            34, 35, 46, // heartbeat / unregister / check-client-config
+            11, 361, 200050, // pull / lite pull / pop
+            15, 200051, 200053, // offset update / ack / change-invisible
+            203, 38, // consumer connection list / consumer list by group
+            30, 31, 14, 29, 32, // offsets
+            41, 42, // lock / unlock batch MQ
+        ] {
+            assert_eq!(forward_target(code), ForwardTarget::Broker, "code {code}");
+        }
+        // This port's own read-only query and LMQ extensions.
+        for code in [12, 200070, 200071] {
+            assert_eq!(forward_target(code), ForwardTarget::Broker, "code {code}");
+        }
+        for code in NAMESRV_FORWARD_CODES {
+            assert_eq!(forward_target(*code), ForwardTarget::Namesrv, "code {code}");
+        }
+        for code in NAMESRV_PRIVATE_CODES {
+            assert_eq!(
+                forward_target(*code),
+                ForwardTarget::Internal,
+                "code {code}"
+            );
+        }
+        // Broker Admin commands stay on the broker's own remoting port.
+        for code in [
+            17, 21, 23, 26, 28, 43, 45, 60, 200, 201, 202, 204, 207, 208, 305, 351, 352,
+        ] {
+            assert_eq!(
+                forward_target(code),
+                ForwardTarget::Unsupported,
+                "code {code}"
+            );
+        }
+        assert_eq!(forward_target(999_999), ForwardTarget::Unsupported);
+        // No code is accidentally claimed by both sides.
+        for code in NAMESRV_FORWARD_CODES {
+            assert!(!BROKER_FORWARD_CODES.contains(code));
+        }
+    }
+
+    #[test]
+    fn remoting_front_routes_lock_batches_by_body_topic() {
+        let request = Command::request(41).with_body(
+            serde_json::to_vec(&serde_json::json!({
+                "consumerGroup": "g",
+                "clientId": "c",
+                "mqSet": [{"topic": "orders", "brokerName": "broker-a", "queueId": 0}]
+            }))
+            .unwrap(),
+        );
+        assert_eq!(route_topic(&request).as_deref(), Some("orders"));
+        // An ordinary command with no topic goes to one broker of the cluster.
+        assert_eq!(route_topic(&Command::request(34)), None);
+        // A malformed 41 body must not invent a topic either.
+        assert_eq!(
+            route_topic(&Command::request(41).with_body(b"not json".to_vec())),
+            None
+        );
+        // The header wins when present.
+        let with_topic = Command::request(11).with_ext("topic", "orders");
+        assert_eq!(route_topic(&with_topic).as_deref(), Some("orders"));
+    }
+
+    #[tokio::test]
+    async fn remoting_front_rejects_cluster_private_and_admin_codes_locally() {
+        let context = ProxyContext::new(ProxyConfig::default(), "127.0.0.1:8081".parse().unwrap());
+        let processor = RemotingFrontProcessor::new(context);
+        // None of these may reach the backend: they are rejected before any
+        // network call, so the test needs no live namesrv/broker.
+        for code in [100, 102, 103, 104, 205, 216, 318, 327, 904, 17, 28, 999_999] {
+            let response = processor.route_and_forward(Command::request(code)).await;
+            assert_eq!(
+                response.code, RESPONSE_REQUEST_CODE_NOT_SUPPORTED,
+                "code {code}"
+            );
+            assert!(
+                response
+                    .remark
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("code"),
+                "code {code} should explain the rejection"
+            );
+        }
+        for code in [103, 104, 904] {
+            let response = processor.route_and_forward(Command::request(code)).await;
+            assert!(
+                response
+                    .remark
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("internal"),
+                "code {code} must be reported as namesrv-internal"
+            );
+        }
     }
 }

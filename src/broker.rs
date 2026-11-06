@@ -52,6 +52,11 @@ const GROUP_MAX_LENGTH: usize = 120;
 /// processors used to silently clamp at 1h, so a client that asked for 2h was
 /// told it succeeded while the broker only held the message for 1h.
 const MAX_INVISIBLE_TIME_MS: i64 = 12 * 60 * 60 * 1000;
+/// Java `RebalanceLockManager.REBALANCE_LOCK_MAX_LIVE_TIME` (60s): a queue
+/// lock left behind by a dead ordered consumer becomes stealable after this
+/// long. Java sweeps them on a timer; this port expires them lazily on the
+/// next lock/unlock of the same group.
+const REBALANCE_LOCK_MAX_LIVE_TIME: Duration = Duration::from_secs(60);
 
 /// Java `PopReviveService` writes check points and acks to the revive topic; this
 /// port snapshots the same state to `pop_state.json` so an ack survives a restart.
@@ -575,6 +580,39 @@ pub struct Broker {
     /// replace, and routing every POP through `spawn_blocking` saturates that
     /// pool under load (and makes short invisible windows time out in tests).
     state_write: Mutex<()>,
+    /// Java `RebalanceLockManager.mqLockTable`: group -> queue -> owner. An
+    /// ordered consumer locks its assigned queues during rebalance (codes
+    /// 41/42); the broker must refuse a second owner until the first unlocks
+    /// or its lock expires.
+    rebalance_locks: Mutex<BTreeMap<String, BTreeMap<LockQueue, LockOwner>>>,
+}
+
+/// Java `MessageQueue` as encoded in `LockBatchRequestBody` /
+/// `UnlockBatchRequestBody`. Ord/Hash-free BTreeMap keeps the response stable.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LockQueue {
+    topic: String,
+    broker_name: String,
+    queue_id: i32,
+}
+
+/// Java `RebalanceLockManager.LockEntry`.
+#[derive(Clone, Debug)]
+struct LockOwner {
+    client_id: String,
+    updated: Instant,
+}
+
+/// Both `LockBatchRequestBody` and `UnlockBatchRequestBody` carry the same
+/// group/client/queue fields; `onlyThisBroker` is ignored (single broker).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LockBatchBody {
+    consumer_group: String,
+    client_id: String,
+    #[serde(default)]
+    mq_set: Vec<LockQueue>,
 }
 
 /// `LiteSubscriptionRegistry`'s entry for one client.
@@ -813,6 +851,7 @@ impl Broker {
             lite_subscriptions: Mutex::new(BTreeMap::new()),
             lite_locks: Mutex::new(BTreeMap::new()),
             state_write: Mutex::new(()),
+            rebalance_locks: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -3241,6 +3280,11 @@ impl Broker {
                     None => Err(Failure::new(1, "the consumer's group info does not exist")),
                 }
             }
+            // Java `AdminBrokerProcessor` + `RebalanceLockManager`: ordered
+            // consumers lock their assigned queues during rebalance. The proxy
+            // forwards these two codes from its 4.x remoting front end.
+            41 => self.lock_batch(request),
+            42 => self.unlock_batch(request),
             14 | 15 => {
                 let topic = request.required("topic")?.to_owned();
                 let group = request.required("consumerGroup")?.to_owned();
@@ -3591,6 +3635,66 @@ impl Broker {
             }
             _ => Err(Failure::new(3, format!("request code {} is not implemented", request.code))),
         }
+    }
+
+    /// Java `AdminBrokerProcessor.lockBatchMQ` -> `RebalanceLockManager.tryLockBatch`.
+    /// Each queue is decided independently: one held by another live client is
+    /// simply omitted from `lockOKMQSet` (Java does not abort the whole batch).
+    /// Locks whose owner stopped renewing them expire after 60s and are stolen.
+    fn lock_batch(&self, request: &Command) -> BrokerResult<Command> {
+        let body: LockBatchBody = serde_json::from_slice(&request.body)
+            .map_err(|error| Failure::new(1, format!("invalid LockBatchRequestBody: {error}")))?;
+        if body.mq_set.is_empty() {
+            // Java echoes the request body and remarks on an empty set.
+            return Ok(Command::response(request, 0)
+                .with_body(request.body.clone())
+                .with_remark("MessageQueue set is empty"));
+        }
+        let now = Instant::now();
+        let mut table = self.rebalance_locks.lock().unwrap();
+        let group = table.entry(body.consumer_group).or_default();
+        group.retain(|_, owner| owner.updated.elapsed() <= REBALANCE_LOCK_MAX_LIVE_TIME);
+        let mut locked = Vec::new();
+        for mq in &body.mq_set {
+            match group.get_mut(mq) {
+                None => {
+                    group.insert(
+                        mq.clone(),
+                        LockOwner {
+                            client_id: body.client_id.clone(),
+                            updated: now,
+                        },
+                    );
+                    locked.push(mq.clone());
+                }
+                // Renewing its own lock also refreshes the expiry timestamp.
+                Some(owner) if owner.client_id == body.client_id => {
+                    owner.updated = now;
+                    locked.push(mq.clone());
+                }
+                Some(_) => {} // held by another live client
+            }
+        }
+        json_response(request, json!({ "lockOKMQSet": locked }))
+    }
+
+    /// Java `AdminBrokerProcessor.unlockBatchMQ` -> `RebalanceLockManager.unlockBatch`.
+    /// A client may only release queues it actually owns.
+    fn unlock_batch(&self, request: &Command) -> BrokerResult<Command> {
+        let body: LockBatchBody = serde_json::from_slice(&request.body)
+            .map_err(|error| Failure::new(1, format!("invalid UnlockBatchRequestBody: {error}")))?;
+        let mut table = self.rebalance_locks.lock().unwrap();
+        if let Some(group) = table.get_mut(&body.consumer_group) {
+            for mq in &body.mq_set {
+                if group
+                    .get(mq)
+                    .is_some_and(|owner| owner.client_id == body.client_id)
+                {
+                    group.remove(mq);
+                }
+            }
+        }
+        Ok(Command::response(request, 0))
     }
 
     fn check_queue(&self, topic: &str, queue_id: i32) -> BrokerResult<()> {
@@ -4465,6 +4569,100 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+    }
+
+    /// Java `LockBatchRequestBody` / `UnlockBatchRequestBody` wire shape.
+    fn lock_body(client_id: &str, queues: &[(&str, i32)]) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "consumerGroup": "cg",
+            "clientId": client_id,
+            "mqSet": queues
+                .iter()
+                .map(|(topic, queue_id)| json!({
+                    "topic": topic,
+                    "brokerName": "broker-a",
+                    "queueId": queue_id
+                }))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap()
+    }
+
+    async fn lock_ok_set(
+        broker: &Broker,
+        client_id: &str,
+        queues: &[(&str, i32)],
+    ) -> Vec<serde_json::Value> {
+        let response = broker
+            .process(
+                &Command::request(41).with_body(lock_body(client_id, queues)),
+                peer(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.code, 0, "{:?}", response.remark);
+        serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["lockOKMQSet"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    async fn unlock(broker: &Broker, client_id: &str, queues: &[(&str, i32)]) {
+        let response = broker
+            .process(
+                &Command::request(42).with_body(lock_body(client_id, queues)),
+                peer(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.code, 0, "{:?}", response.remark);
+    }
+
+    /// 4.x ordered consumers lock their assigned queues during rebalance;
+    /// the proxy's remoting front end forwards codes 41/42 to the broker.
+    #[tokio::test]
+    async fn rebalance_locks_follow_java_ownership_rules() {
+        let (_dir, broker) = test_broker().await;
+        let queue = ("orders", 0);
+
+        assert_eq!(lock_ok_set(&broker, "client-a", &[queue]).await.len(), 1);
+        // A second client cannot take the same live lock.
+        assert!(lock_ok_set(&broker, "client-b", &[queue]).await.is_empty());
+        // The owner renewing its own lock succeeds.
+        assert_eq!(lock_ok_set(&broker, "client-a", &[queue]).await.len(), 1);
+        // A batch is decided per queue: the free one is granted, the held one skipped.
+        let partial = lock_ok_set(&broker, "client-b", &[queue, ("orders", 1)]).await;
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial[0]["queueId"], 1);
+
+        // A non-owner cannot release someone else's queue.
+        unlock(&broker, "client-b", &[queue]).await;
+        assert!(lock_ok_set(&broker, "client-b", &[queue]).await.is_empty());
+        // The owner releases it, after which the other client can take it.
+        unlock(&broker, "client-a", &[queue]).await;
+        assert_eq!(lock_ok_set(&broker, "client-b", &[queue]).await.len(), 1);
+
+        // A lock whose owner stopped renewing expires and is stolen (Java's
+        // 60s `REBALANCE_LOCK_MAX_LIVE_TIME`, expired lazily here).
+        {
+            let mut table = broker.rebalance_locks.lock().unwrap();
+            let owner = table.get_mut("cg").unwrap().iter_mut().next().unwrap().1;
+            owner.updated = Instant::now() - REBALANCE_LOCK_MAX_LIVE_TIME - Duration::from_secs(1);
+        }
+        assert_eq!(lock_ok_set(&broker, "client-a", &[queue]).await.len(), 1);
+
+        // Java echoes the request body and remarks when the queue set is empty.
+        let empty = lock_body("client-a", &[]);
+        let response = broker
+            .process(&Command::request(41).with_body(empty.clone()), peer())
+            .await
+            .unwrap();
+        assert_eq!(response.code, 0);
+        assert_eq!(response.body, empty);
+        assert_eq!(
+            response.remark.as_deref(),
+            Some("MessageQueue set is empty")
         );
     }
 }

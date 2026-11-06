@@ -96,12 +96,12 @@
 1. ✅ **POP + Timer 状态落盘**（P0 #4/#5）：已完成，见 §7.1。
 2. ◐ **文件生命周期**（P0 #3）：abort/checkpoint/水位/孤儿文件清理已完成（§7.2）；物理分段与过期 commitlog 回收并入第 5 项。
 3. ◐ **broker Admin 命令集 + controller config 空桩**（P1 #13）：已完成高频只读诊断命令与 config 空桩（§7.3）；写操作类 Admin 仍缺。
-4. **4.x remoting 协议 + RPCHook**（P1 #9/#10）：决定能否接入存量 4.x 客户端与 zone 路由。
+4. ◐ **4.x remoting 协议 + RPCHook**（P1 #9/#10）：转发分类/白名单、无 topic 命令路由、顺序消费锁 41/42 已落地（§7.4）；RPCHook、zone 就近路由、同端口多协议协商、多 broker fan-out 仍缺。
 5. **HA / 多副本与 mmap 刷盘**（P0 #1/#2）：架构级改造，需独立规划，不宜与前面几项混做。
 
 ---
 
-## 6. 本轮代码改动与验证
+## 6. 审计当时的改动与验证
 
 ```text
 src/main.rs  SECURITY_NOTICE 文案修正（TLS/ACL 已实现但默认关闭，不再宣称"未实现"）
@@ -109,7 +109,7 @@ cargo build  -> 0 error / 0 warning
 cargo test   -> 225 passed / 0 failed
 ```
 
-> 本报告为只读审计结论（未改动各模块功能逻辑）；除上述一行文案外无代码变更。
+> 审计阶段本身是只读的（除上述一行文案外无代码变更）。**后续「按顺序补齐能力」的代码改动与验证见 §7 各小节**；当前基线为 `cargo test -> 245 passed / 0 failed`、`cargo clippy --all-targets -> 75 warnings`。
 
 ---
 
@@ -198,11 +198,46 @@ cargo clippy --all-targets    -> 75 warnings（比 76 基线少 1，顺手修掉
 
 **仍缺（写操作与更深的诊断）**：`UPDATE_BROKER_CONFIG(25)`（需把 `BrokerConfig` 从启动值改为共享可变配置，属配置模型重构）、`GET_CONSUMER_RUNNING_INFO(307)` 的 process-queue 明细、`RESET_CONSUMER_OFFSET_IN_BROKER(212)` / `CLONE_OFFSET` / `CONSUME_MESSAGE_DIRECTLY` / ACL CRUD / HA 状态 / epoch / RocksDB 进度，以及 AdminService 里仍为空表的 `get_consumer_running_info`、`scroll_id`、跨 proxy 转发。
 
-### 7.4 待办
+### 7.4 ◐ 第 4 项：4.x remoting 协议接入（P1 #9，RPCHook/zone 除外）
+
+**先纠正一处方向性误判**：本项最初按「把白名单扩到后端实现的全部 request code」推进，复核 Java `RemotingProtocolServer.registerRemotingServer` 后证明这是错的，而且有安全问题。
+
+| 复核结论 | 依据 |
+|---|---|
+| Java proxy 的前端只注册**客户端消息面**的 code | 源码注册了 send(10/310/320)/send-back(36)/end-transaction(37)/recall(370)/heartbeat(34)/unregister(35)/check-client-config(46)/pull(11/361)/pop(200050)/offset(15/14/29/30/31)/ack(200051)/change-invisible(200053)/connection-list(203)/consumer-list(38)/lock-unlock(41/42)，namesrv 侧**只有 105**；Admin 走 gRPC `AdminService` |
+| 把 namesrv 内部 code 放进公网前端是集群完整性漏洞 | 103/104/904 可让任意客户端注册/注销 broker、污染路由；100/102 改 KV；205/327 改写权限；216/318 删 topic/改配置 |
+| 把 broker Admin code 放进前端是**权限提升** | `ProxyBackend::apply_inner_credentials` 会用 proxy 的内部高权限 AK/SK 重签转发命令，而前端 `AclGuard::check_command` **只验签名、不做授权**（Java 有 `AuthorizationPipeline`）。任何能签名的用户都会变成管理员 |
+
+**落地内容**
+
+| 改动 | 文件 | 说明 |
+|---|---|---|
+| 三段式转发分类 | `src/proxy.rs` | `ForwardTarget = Namesrv / Broker / Internal / Unsupported` + `forward_target(code)`；`NAMESRV_FORWARD_CODES` 收敛为只读元数据（101/105/106/206/219/224/319/901），新增 `NAMESRV_PRIVATE_CODES` 显式拒绝 100/102/103/104/205/216/318/327/904；`BROKER_FORWARD_CODES` 收敛为 Java 注册的消息面 code + 本 port 的只读查询/LMQ 扩展（12/200070/200071） |
+| 无 topic 命令不再被拒 | `src/proxy.rs` | 原逻辑对所有 broker 命令强制 `topic` 字段，heartbeat(34)、unregister(35)、check-client-config(46)、consumer-list(38)、connection-list(203) 等全部被 `missing the topic field` 挡掉。新增 `ProxyBackend::invoke_broker_command_any()`，经 namesrv 106 `GET_BROKER_CLUSTER_INFO` 选一个 master（空 cluster 参数走全集群），由 `route_topic()` 决定走 topic 路由还是集群任选 |
+| 41/42 按 body 路由 | `src/proxy.rs` | `LOCK_BATCH_MQ` / `UNLOCK_BATCH_MQ` 的队列在 JSON body 的 `mqSet` 里而不是 `topic` 头；`route_topic()` 从第一条 MessageQueue 取 topic，保证路由到该 topic 的 master |
+| 顺序消费队列锁 | `src/broker.rs` | 新增 `RebalanceLockManager` 等价实现：`rebalance_locks: group -> LockQueue -> LockOwner(client_id, Instant)`；41 逐队列判定（空闲/自己持有→授予，他人持有→跳过，Java **不中断整批**），返回 `lockOKMQSet`；42 只有 owner 能释放；空 `mqSet` 回显 body + remark；`REBALANCE_LOCK_MAX_LIVE_TIME = 60s`，惰性过期（Java 定时扫描） |
+
+```text
+cargo build                   -> 0 error / 0 warning
+cargo test                    -> 245 passed / 0 failed（240 + 3 proxy 单测 + 1 broker 单测 + 1 联调）
+cargo clippy --all-targets    -> 75 warnings（基线持平，无新增）
+新增 proxy::tests::remoting_front_classifies_4x_client_codes
+新增 proxy::tests::remoting_front_routes_lock_batches_by_body_topic
+新增 proxy::tests::remoting_front_rejects_cluster_private_and_admin_codes_locally
+新增 broker::tests::rebalance_locks_follow_java_ownership_rules
+新增 tests/e2e.rs::remoting_front_forwards_4x_commands_to_a_live_cluster
+     （真实 namesrv + broker + remoting 前端：105 转发、46/34 无 topic 转发、41/42 按 body 路由，
+       以及 103/104/904/100/102/205/216/327/318/17/28/999999 全部在本地以 code 3 拒绝；
+       连续复跑 3 轮稳定）
+```
+
+**仍未做（P1 #9/#10 剩余）**：`RPCHook.doBeforeRequest` 钩子链、`ZoneRouteRPCHook` 就近路由（需 broker 注册携带 `zoneName`）、`MultiProtocolRemotingServer` 同端口协议协商 / HTTP/2 代理 / HAProxy PROXY protocol、TLS 证书热加载；多 broker 集群下无 topic 命令的 fan-out/merge（Java 的 heartbeat/unregister 由 proxy 自己的 `ClientManagerActivity` 本地处理，本 port 只转给一个 broker，`one_broker_addr` 取到的就是该 broker 的视图）；§7.3 记录的写操作类 Admin 仍缺。
+
+### 7.5 待办
 
 | 顺序 | 项 | 状态 |
 |---|---|---|
 | 2 | 文件生命周期（abort / checkpoint / 水位 / 孤儿文件清理） | **已落地**（§7.2）；物理分段滚动 + 过期 commitlog 段删除并入第 5 项 |
 | 3 | broker Admin 命令集 + controller config 空桩 | **高频只读诊断 + config 已落地**（§7.3）；写操作类 Admin 仍缺 |
-| 4 | 4.x remoting 协议 + RPCHook / zone | 未开始 |
+| 4 | 4.x remoting 协议 + RPCHook / zone | **转发分类 / 无 topic 路由 / 41/42 已落地**（§7.4）；RPCHook、zone、多协议协商、fan-out 未开始 |
 | 5 | HA / 多副本 / mmap 刷盘 + commitlog 分段 | 未开始 |
