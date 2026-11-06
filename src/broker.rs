@@ -533,6 +533,9 @@ pub struct Broker {
     acl: Option<BrokerAcl>,
     /// `consumerTable`: group -> subscription/connection state (Java `ConsumerManager`).
     groups: Mutex<BTreeMap<String, GroupInfo>>,
+    /// `ProducerManager`: producer group -> client ids, for the admin
+    /// GET_PRODUCER_CONNECTION_LIST command. Consumer groups live in `groups`.
+    producers: Mutex<BTreeMap<String, BTreeSet<String>>>,
     /// peer (TCP) -> client id, so `disconnected` can drop the channel marker.
     peer_channels: Mutex<BTreeMap<SocketAddr, String>>,
     filters: Mutex<FilterRegistry>,
@@ -788,6 +791,7 @@ impl Broker {
             config,
             acl,
             groups: Mutex::new(BTreeMap::new()),
+            producers: Mutex::new(BTreeMap::new()),
             peer_channels: Mutex::new(BTreeMap::new()),
             filters: Mutex::new(filters),
             group_heartbeats: Mutex::new(BTreeMap::new()),
@@ -1559,6 +1563,18 @@ impl Broker {
                             .or_insert_with(|| sub.clone());
                     }
                 }
+            }
+        }
+        // `ProducerManager.registerProducer`: a 4.x heartbeat may carry
+        // producer groups as well as consumer groups. Keep them separately so
+        // admin connection-list queries have real data to return.
+        {
+            let mut producers = self.producers.lock().unwrap();
+            for producer in &heartbeat.producer_data_set {
+                producers
+                    .entry(producer.group_name.clone())
+                    .or_default()
+                    .insert(heartbeat.client_id.clone());
             }
         }
         self.peer_channels
@@ -3195,6 +3211,13 @@ impl Broker {
                         info.clients.remove(client_id);
                     }
                 }
+                {
+                    let mut producers = self.producers.lock().unwrap();
+                    for ids in producers.values_mut() {
+                        ids.remove(client_id);
+                    }
+                    producers.retain(|_, ids| !ids.is_empty());
+                }
                 let mut peer_channels = self.peer_channels.lock().unwrap();
                 if peer_channels
                     .get(&peer)
@@ -3275,7 +3298,24 @@ impl Broker {
                 Ok(Command::response(request, 0))
             }
             21 => json_response(request, json!({"topicConfigTable":self.store.topics()?, "dataVersion":{"counter":0,"timestamp":self.started_at}})),
-            23 | 305 => json_response(request, json!({"topicList":self.store.topics()?.keys().collect::<Vec<_>>(),"brokerAddr":self.config.advertised_addr.to_string()})),
+            // 23 GET_TOPIC_NAME_LIST returns every topic, while 305
+            // GET_SYSTEM_TOPIC_LIST_FROM_BROKER only returns the system set.
+            23 | 305 => {
+                let topics: Vec<String> = self
+                    .store
+                    .topics()?
+                    .keys()
+                    .filter(|name| request.code == 23 || is_system_topic(name))
+                    .cloned()
+                    .collect();
+                json_response(
+                    request,
+                    json!({
+                        "topicList": topics,
+                        "brokerAddr": self.config.advertised_addr.to_string()
+                    }),
+                )
+            }
             351 => {
                 let topic = request.required("topic")?;
                 let configs = self.store.topics()?;
@@ -3361,14 +3401,35 @@ impl Broker {
                 "brokerName={}\nbrokerClusterName={}\nbrokerId=0\nbrokerIP1={}\nlistenPort={}\nautoCreateTopicEnable={}\nflushDiskType=SYNC_FLUSH\nbrokerRole=ASYNC_MASTER\n",
                 self.config.broker_name, self.config.cluster_name, self.config.advertised_addr.ip(),
                 self.config.advertised_addr.port(), self.config.auto_create_topic).into_bytes())),
-            28 => json_response(request, json!({"table":{
-                "brokerVersionDesc":"RocketMQ-RS-0.1.0",
-                "brokerName":self.config.broker_name,
-                "bootTimestamp":self.started_at.to_string(),
-                "commitLogMaxOffset":self.store.physical_len()?.to_string(),
-                "topicCount":self.store.topics()?.len().to_string(),
-                "clientCount":self.groups.lock().unwrap().len().to_string()
-            }})),
+            28 => {
+                // `getBrokerRuntimeInfo`: KVTable. Expose the recovery and
+                // housekeeping state added by the POP/Timer and store-lifecycle
+                // work so an operator can actually diagnose a restarted broker.
+                let checkpoint = self.store.checkpoint()?;
+                let (disk_used, disk_limit) = self.store.disk_usage()?;
+                let pop_entries: usize = self
+                    .pop_invisible
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .map(|entries| entries.len())
+                    .sum();
+                let timer_slots = self.wheel.lock().unwrap().slots.len();
+                json_response(request, json!({"table":{
+                    "brokerVersionDesc":"RocketMQ-RS-0.1.0",
+                    "brokerName":self.config.broker_name,
+                    "bootTimestamp":self.started_at.to_string(),
+                    "commitLogMaxOffset":self.store.physical_len()?.to_string(),
+                    "topicCount":self.store.topics()?.len().to_string(),
+                    "clientCount":self.groups.lock().unwrap().len().to_string(),
+                    "storeCleanExit":checkpoint.clean_exit.to_string(),
+                    "storeAbnormalRecoveries":checkpoint.abnormal_recoveries.to_string(),
+                    "storeDiskUsedBytes":disk_used.to_string(),
+                    "storeDiskLimitBytes":disk_limit.to_string(),
+                    "popInvisibleEntries":pop_entries.to_string(),
+                    "timerPendingSlots":timer_slots.to_string()
+                }}))
+            }
             46 => {
                 if request.body.is_empty() {
                     return Ok(Command::response(request, 0));
@@ -3396,6 +3457,137 @@ impl Broker {
                     return Err(Failure::new(23, error.to_string()));
                 }
                 Ok(Command::response(request, 0))
+            }
+            // ---- Java `AdminBrokerProcessor` read-only diagnostics ----
+            // 60 GET_TIMER_CHECK_POINT: TimerCheckpoint (this port persists
+            // only the timer queue cursor; the flush timestamps stay zero).
+            60 => {
+                let wheel = self.wheel.lock().unwrap();
+                json_response(
+                    request,
+                    json!({
+                        "scanOffset": wheel.checkpoint.scan_offset,
+                        "lastReadTimeMs": 0,
+                        "lastFlushTimeMs": 0
+                    }),
+                )
+            }
+            // 202 GET_TOPIC_STATS_INFO: TopicStatsTable.
+            202 => {
+                let topic = request.required("topic")?.to_owned();
+                validate_topic_name(&topic)?;
+                let config = self
+                    .topic_config_for(&topic)
+                    .ok_or_else(|| Failure::new(17, format!("topic[{topic}] not exist")))?;
+                let mut table = BTreeMap::new();
+                for queue_id in 0..config.read_queue_nums.max(config.write_queue_nums) {
+                    let max_offset = self.store.queue_max_offset(&topic, queue_id);
+                    let last_timestamp = if max_offset == 0 {
+                        0
+                    } else {
+                        self.store
+                            .message_by_queue_offset(&topic, queue_id, max_offset - 1)?
+                            .map_or(0, |message| message.store_timestamp)
+                    };
+                    table.insert(
+                        mq_key(&topic, &self.config.broker_name, queue_id),
+                        json!({
+                            "minOffset": 0,
+                            "maxOffset": max_offset,
+                            "lastUpdateTimestamp": last_timestamp
+                        }),
+                    );
+                }
+                json_response(request, json!({"offsetTable": table, "topicPutTps": 0}))
+            }
+            // 203 GET_CONSUMER_CONNECTION_LIST: ConsumerConnection.
+            203 => {
+                let group = request.required("consumerGroup")?.to_owned();
+                validate_name(&group)?;
+                let groups = self.groups.lock().unwrap();
+                let info = groups
+                    .get(&group)
+                    .ok_or_else(|| Failure::new(1, "the consumer's group info does not exist"))?;
+                let connections: Vec<serde_json::Value> = info
+                    .clients
+                    .iter()
+                    .map(|id| connection(id))
+                    .collect();
+                let subscriptions: BTreeMap<String, serde_json::Value> = info
+                    .subscriptions
+                    .iter()
+                    .map(|(topic, sub)| {
+                        (
+                            topic.clone(),
+                            json!({
+                                "subString": sub.sub_string,
+                                "expressionType": sub.expression_type,
+                                "subVersion": sub.sub_version,
+                                "classFilterMode": false
+                            }),
+                        )
+                    })
+                    .collect();
+                json_response(
+                    request,
+                    json!({
+                        "connectionSet": connections,
+                        "subscriptionTable": subscriptions,
+                        "consumeType": "CONSUME_PASSIVELY",
+                        "messageModel": "CLUSTERING",
+                        "consumeFromWhere": "CONSUME_FROM_LAST_OFFSET"
+                    }),
+                )
+            }
+            // 204 GET_PRODUCER_CONNECTION_LIST: ProducerConnection.
+            204 => {
+                let group = request.required("producerGroup")?.to_owned();
+                validate_name(&group)?;
+                let ids = self
+                    .producers
+                    .lock()
+                    .unwrap()
+                    .get(&group)
+                    .cloned()
+                    .unwrap_or_default();
+                let connections: Vec<serde_json::Value> =
+                    ids.iter().map(|id| connection(id)).collect();
+                json_response(request, json!({"connectionSet": connections}))
+            }
+            // 208 GET_CONSUME_STATS: ConsumeStats (single-topic form).
+            208 => {
+                let group = request.required("consumerGroup")?.to_owned();
+                let topic = request.required("topic")?.to_owned();
+                validate_name(&group)?;
+                validate_topic_name(&topic)?;
+                let config = self
+                    .topic_config_for(&topic)
+                    .ok_or_else(|| Failure::new(17, format!("topic[{topic}] not exist")))?;
+                let mut table = BTreeMap::new();
+                for queue_id in 0..config.read_queue_nums {
+                    let broker_offset = self.store.queue_max_offset(&topic, queue_id);
+                    let consumer_offset = self
+                        .store
+                        .consumer_offset(&group, &topic, queue_id)?
+                        .unwrap_or(0);
+                    let last_timestamp = if consumer_offset == 0 {
+                        0
+                    } else {
+                        self.store
+                            .message_by_queue_offset(&topic, queue_id, consumer_offset - 1)?
+                            .map_or(0, |message| message.store_timestamp)
+                    };
+                    table.insert(
+                        mq_key(&topic, &self.config.broker_name, queue_id),
+                        json!({
+                            "brokerOffset": broker_offset,
+                            "consumerOffset": consumer_offset,
+                            "pullOffset": consumer_offset,
+                            "lastTimestamp": last_timestamp
+                        }),
+                    );
+                }
+                json_response(request, json!({"offsetTable": table, "consumeTps": 0.0}))
             }
             _ => Err(Failure::new(3, format!("request code {} is not implemented", request.code))),
         }
@@ -3525,6 +3717,42 @@ fn parse_pop_ck(ck: &str) -> Option<(String, String, i32, u64)> {
 
 fn json_response(request: &Command, value: serde_json::Value) -> BrokerResult<Command> {
     Ok(Command::response(request, 0).with_body(serde_json::to_vec(&value).map_err(Error::from)?))
+}
+
+/// Java `MessageQueue.toString()`: Jackson uses it as the key when encoding
+/// `TopicStatsTable.offsetTable` and `ConsumeStats.offsetTable`.
+fn mq_key(topic: &str, broker: &str, queue_id: i32) -> String {
+    format!("MessageQueue [topic={topic}, brokerName={broker}, queueId={queue_id}]")
+}
+
+/// `ClientChannelInfo` as encoded by `ConsumerConnection` / `ProducerConnection`.
+fn connection(client_id: &str) -> serde_json::Value {
+    json!({
+        "clientId": client_id,
+        "clientAddr": "",
+        "language": "RUST",
+        "version": 0
+    })
+}
+
+/// `TopicValidator.getSystemTopicSet()` for GET_SYSTEM_TOPIC_LIST_FROM_BROKER.
+fn is_system_topic(topic: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "TBW102",
+        "SCHEDULE_TOPIC_XXXX",
+        "BenchmarkTest",
+        "SELF_TEST_TOPIC",
+        TRANS_HALF_TOPIC,
+        TRANS_OP_TOPIC,
+        "RMQ_SYS_SCH_HALF_TOPIC",
+        "RMQ_SYS_POP_REVIVE_TOPIC",
+        schedule::TIMER_TOPIC,
+    ];
+    EXACT.contains(&topic)
+        || topic.starts_with("%RETRY%")
+        || topic.starts_with("%DLQ%")
+        || topic.starts_with("%LMQ%")
+        || topic.starts_with("RMQ_SYS_")
 }
 
 /// `SendMessageProcessor.sendMessage`: a lite message is dispatched to the light
@@ -4119,5 +4347,124 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(second.body, b"second");
+    }
+
+    async fn admin_value(
+        broker: &Broker,
+        code: i32,
+        ext: &[(&str, &str)],
+    ) -> serde_json::Value {
+        let mut request = Command::request(code);
+        for (key, value) in ext {
+            request = request.with_ext(*key, *value);
+        }
+        let response = broker.process(&request, peer()).await.unwrap();
+        assert_eq!(response.code, 0, "code {code}: {:?}", response.remark);
+        serde_json::from_slice(&response.body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_diagnostics_report_real_broker_state() {
+        let (_dir, broker) = test_broker().await;
+        for index in 0..3 {
+            let send = send_request("orders", format!("m{index}").as_bytes(), "", 0);
+            broker.process(&send, peer()).await.unwrap();
+        }
+        let heartbeat = Command::request(34).with_body(
+            serde_json::to_vec(&serde_json::json!({
+                "clientID": "client-1",
+                "producerDataSet": [{"groupName": "pg"}],
+                "consumerDataSet": [{"groupName": "cg", "subscriptionDataSet": [{
+                    "topic": "orders", "subString": "*", "subVersion": 1
+                }]}]
+            }))
+            .unwrap(),
+        );
+        assert_eq!(broker.process(&heartbeat, peer()).await.unwrap().code, 0);
+        broker
+            .process(
+                &Command::request(15)
+                    .with_ext("topic", "orders")
+                    .with_ext("consumerGroup", "cg")
+                    .with_ext("queueId", 0)
+                    .with_ext("commitOffset", 2),
+                peer(),
+            )
+            .await
+            .unwrap();
+
+        let key = mq_key("orders", &broker.config.broker_name, 0);
+
+        // 28 GET_BROKER_RUNTIME_INFO exposes the store lifecycle state too.
+        let runtime = admin_value(&broker, 28, &[]).await;
+        assert_eq!(runtime["table"]["clientCount"], "1");
+        assert_eq!(runtime["table"]["storeCleanExit"], "false");
+        assert!(
+            runtime["table"]["storeDiskLimitBytes"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                > 0
+        );
+
+        // 43 GET_ALL_CONSUMER_OFFSET uses the persisted topic@group table.
+        let offsets = admin_value(&broker, 43, &[]).await;
+        assert_eq!(offsets["offsetTable"]["orders@cg"]["0"], 2);
+
+        // 202 GET_TOPIC_STATS_INFO / 208 GET_CONSUME_STATS use MessageQueue keys.
+        let stats = admin_value(&broker, 202, &[("topic", "orders")]).await;
+        assert_eq!(stats["offsetTable"][&key]["maxOffset"], 3);
+        assert!(
+            stats["offsetTable"][&key]["lastUpdateTimestamp"]
+                .as_i64()
+                .unwrap()
+                > 0
+        );
+        let consume = admin_value(&broker, 208, &[("consumerGroup", "cg"), ("topic", "orders")]).await;
+        assert_eq!(consume["offsetTable"][&key]["brokerOffset"], 3);
+        assert_eq!(consume["offsetTable"][&key]["consumerOffset"], 2);
+        // The consume-stats timestamp belongs to the last *consumed* record
+        // (offset 1), not the newest one (offset 2), so they differ but both
+        // must be real store timestamps.
+        assert!(
+            consume["offsetTable"][&key]["lastTimestamp"]
+                .as_i64()
+                .unwrap()
+                > 0
+        );
+
+        // 203 / 204 connection lists come from the real heartbeat registries.
+        let consumers = admin_value(&broker, 203, &[("consumerGroup", "cg")]).await;
+        assert_eq!(consumers["connectionSet"].as_array().unwrap().len(), 1);
+        assert_eq!(consumers["connectionSet"][0]["clientId"], "client-1");
+        assert_eq!(consumers["subscriptionTable"]["orders"]["subString"], "*");
+        let producers = admin_value(&broker, 204, &[("producerGroup", "pg")]).await;
+        assert_eq!(producers["connectionSet"].as_array().unwrap().len(), 1);
+
+        // 23 lists every topic, 305 only the system set.
+        let all = admin_value(&broker, 23, &[]).await;
+        assert!(all["topicList"].as_array().unwrap().contains(&serde_json::json!("orders")));
+        let system = admin_value(&broker, 305, &[]).await;
+        assert!(!system["topicList"].as_array().unwrap().contains(&serde_json::json!("orders")));
+
+        // 60 GET_TIMER_CHECK_POINT is a real cursor, not an empty stub.
+        assert!(admin_value(&broker, 60, &[]).await["scanOffset"].is_number());
+
+        // UNREGISTER_CLIENT also drops the producer registry entry.
+        broker
+            .process(
+                &Command::request(35).with_ext("clientID", "client-1"),
+                peer(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            admin_value(&broker, 204, &[("producerGroup", "pg")]).await["connectionSet"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 }

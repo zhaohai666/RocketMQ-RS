@@ -17,7 +17,7 @@
 | gRPC v2 MessagingService | **17/17 方法全部实现**（QueryRoute … SyncLiteSubscription） |
 | gRPC v2 AdminService | **16/16 方法全部实现**，但多数是语义空壳（见 P1） |
 | Java 5.2.2 客户端缺陷猎杀 | **15/15 PASS**（`JAVA_CLIENT_PARITY_REPORT.md`） |
-| 服务端基础设施 | **大面积缺失**：HA/多副本、mmap 刷盘、commitlog 分段与过期回收、Raft 日志持久化；**POP/计时器状态持久化（§7.1）与 abort/checkpoint/磁盘水位/孤儿文件清理（§7.3）已补齐** |
+| 服务端基础设施 | **大面积缺失**：HA/多副本、mmap 刷盘、commitlog 分段与过期回收、Raft 日志持久化；**POP/计时器状态持久化（§7.1）、abort/checkpoint/磁盘水位/孤儿文件清理（§7.2）、Admin 诊断命令与 controller 配置（§7.3）已补齐** |
 | broker remoting 请求码 | 约 30 个 vs Java `AdminBrokerProcessor` 约 70 个 case |
 | namesrv 请求码 | 13 个 vs Java `DefaultRequestProcessor` 数十个 |
 
@@ -94,8 +94,8 @@
 ## 5. 建议补齐顺序（按投入产出）
 
 1. ✅ **POP + Timer 状态落盘**（P0 #4/#5）：已完成，见 §7.1。
-2. ◐ **文件生命周期**（P0 #3）：abort/checkpoint/水位/孤儿文件清理已完成（§7.3）；物理分段与过期 commitlog 回收并入第 5 项。
-3. **broker Admin 命令集 + controller config 空桩**（P1 #13）：运维可诊断性，属纯增量。
+2. ◐ **文件生命周期**（P0 #3）：abort/checkpoint/水位/孤儿文件清理已完成（§7.2）；物理分段与过期 commitlog 回收并入第 5 项。
+3. ◐ **broker Admin 命令集 + controller config 空桩**（P1 #13）：已完成高频只读诊断命令与 config 空桩（§7.3）；写操作类 Admin 仍缺。
 4. **4.x remoting 协议 + RPCHook**（P1 #9/#10）：决定能否接入存量 4.x 客户端与 zone 路由。
 5. **HA / 多副本与 mmap 刷盘**（P0 #1/#2）：架构级改造，需独立规划，不宜与前面几项混做。
 
@@ -143,7 +143,7 @@ cargo clippy --all-targets         -> 76 warnings（与基线持平，无新增�
 
 **仍存的限制**（不属本项范围）：快照为全量 JSON、每次状态变更同步重写，未做 debounce/合并写；无 revive topic，也没有 check point 的过期清理，长期不 ack 的 invisible 条目会累积；`popTimeout>0` 的长轮询在循环内复用请求开始时的 `now`，等待期间到期的 invisible 条目要等下一次请求才会复活。这些留待文件生命周期（第 2 项）与 HA/mmap 架构改造（第 5 项）一并处理。
 
-### 7.3 ◐ 第 2 项：文件生命周期管理（P0 #3，物理分段部分除外）
+### 7.2 ◐ 第 2 项：文件生命周期管理（P0 #3，物理分段部分除外）
 
 | 能力 | 落地位置 | 说明 |
 |---|---|---|
@@ -162,11 +162,47 @@ cargo clippy --all-targets    -> 76 warnings（基线持平）
 
 **明确未做、归入第 5 项（#30）**：commitlog 的**物理分段滚动与过期段删除**。当前 `LOG_FILE = "commitlog"` 是单文件，`Location.physical` 是文件内绝对字节偏移，读路径 6 处直接 `seek(physical)`。要做 Java `MappedFileQueue` 式的滚动/删除，必须同时改 recover、append、全部读路径与索引语义，属于存储物理布局重构；与 #30 的 mmap/刷盘/文件预分配共用同一套设计更合理，单独塞进本项会破坏已验证的崩溃恢复语义。在此之前，磁盘增长由 `max_store_bytes` 硬上限兜住，但**旧空间不可回收**，这是与 Java 仍存在的实际差距。
 
+### 7.3 ◐ 第 3 项：broker Admin 命令集 + controller config 空桩（P1 #12/#13）
+
+**controller `GET/UPDATE_CONTROLLER_CONFIG`（原为返回空 SUCCESS 的桩）**
+
+| 改动 | 说明 |
+|---|---|
+| 配置所有权 | `Controller.config` 改为 `Arc<RwLock<ControllerConfig>>`，`ControllerManager` 不再持有会与运行态脱节的启动副本；`metadata()` 读实时值 |
+| GET (317) | 返回真实 `ControllerConfig` JSON，不再是空 SUCCESS |
+| UPDATE (318) | 解析 Java `Properties` 文本 / JSON 对象，先在候选副本上校验全部键再提交（拒绝时无部分更新）；黑名单包含 `configBlackList` 用户配置 + `enableRaft`/`nodeId`/`peers` 三个需重建 Raft 组的键；非法值返回 `CONTROLLER_INVALID_REQUEST(20014)` 并带 remark |
+| 动态生效 | 更新同步到 `ReplicasInfoManager.config`（选主逻辑读 `enableElectUncleanMaster`）与 `DefaultBrokerHeartbeatManager`（`timeout_ms` 改为 `AtomicU64`，心跳存活窗口立即变化）；`ControllerManager::config()` 返回实时快照 |
+
+**broker `AdminBrokerProcessor` 高频只读命令**
+
+| Code | 命令 | 落地 |
+|---|---|---|
+| 28 | GET_BROKER_RUNTIME_INFO | 原 6 项扩展为 12 项，新增 `storeCleanExit` / `storeAbnormalRecoveries` / `storeDiskUsedBytes` / `storeDiskLimitBytes` / `popInvisibleEntries` / `timerPendingSlots`，把 §7.1/§7.2 的状态暴露给运维 |
+| 60 | GET_TIMER_CHECK_POINT | 返回真实 `wheel.checkpoint.scanOffset` |
+| 202 | GET_TOPIC_STATS_INFO | `TopicStatsTable`：每队列 min/max offset + 最后一条的 store timestamp |
+| 203 | GET_CONSUMER_CONNECTION_LIST | `ConsumerConnection`：真实 client id / 订阅表（来自 heartbeat 注册表） |
+| 204 | GET_PRODUCER_CONNECTION_LIST | `ProducerConnection`：**新增 `Broker.producers` 注册表**（heartbeat 的 `producerDataSet` 注册、UNREGISTER_CLIENT(35) 清理），此前 broker 只记录 consumer 组 |
+| 208 | GET_CONSUME_STATS | `ConsumeStats`：brokerOffset / consumerOffset / pullOffset / lastTimestamp（单 topic 形式） |
+| 23 / 305 | GET_TOPIC_NAME_LIST / GET_SYSTEM_TOPIC_LIST_FROM_BROKER | 原来两者合并返回**全部 topic**，与 Java 不符；已拆开：23 返回全部，305 只返回系统 topic 集合 |
+| 43 | GET_ALL_CONSUMER_OFFSET | 复核发现**已由 `Store::all_offsets()` 实现**，不再重复添加 |
+
+响应体形状对齐 Java：`offsetTable` 使用 `MessageQueue.toString()` 形式的键 `MessageQueue [topic=…, brokerName=…, queueId=…]`，`topic@group -> queueId -> offset` 直接来自持久化 offset 表。
+
+```text
+cargo build                   -> 0 error / 0 warning
+cargo test                    -> 240 passed / 0 failed（238 + 1 controller + 1 broker）
+cargo clippy --all-targets    -> 75 warnings（比 76 基线少 1，顺手修掉老代码 let_and_return）
+新增 controller::tests::controller_config_get_and_update_are_live
+新增 broker::tests::admin_diagnostics_report_real_broker_state
+```
+
+**仍缺（写操作与更深的诊断）**：`UPDATE_BROKER_CONFIG(25)`（需把 `BrokerConfig` 从启动值改为共享可变配置，属配置模型重构）、`GET_CONSUMER_RUNNING_INFO(307)` 的 process-queue 明细、`RESET_CONSUMER_OFFSET_IN_BROKER(212)` / `CLONE_OFFSET` / `CONSUME_MESSAGE_DIRECTLY` / ACL CRUD / HA 状态 / epoch / RocksDB 进度，以及 AdminService 里仍为空表的 `get_consumer_running_info`、`scroll_id`、跨 proxy 转发。
+
 ### 7.4 待办
 
 | 顺序 | 项 | 状态 |
 |---|---|---|
-| 2 | 文件生命周期（abort / checkpoint / 水位 / 孤儿文件清理） | **已落地**；物理分段滚动 + 过期 commitlog 段删除并入第 5 项 |
-| 3 | broker Admin 命令集 + controller config 空桩 | 未开始 |
+| 2 | 文件生命周期（abort / checkpoint / 水位 / 孤儿文件清理） | **已落地**（§7.2）；物理分段滚动 + 过期 commitlog 段删除并入第 5 项 |
+| 3 | broker Admin 命令集 + controller config 空桩 | **高频只读诊断 + config 已落地**（§7.3）；写操作类 Admin 仍缺 |
 | 4 | 4.x remoting 协议 + RPCHook / zone | 未开始 |
 | 5 | HA / 多副本 / mmap 刷盘 + commitlog 分段 | 未开始 |

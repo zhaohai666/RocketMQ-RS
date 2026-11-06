@@ -10,7 +10,8 @@
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -1145,15 +1146,26 @@ pub trait BrokerHeartbeatManager: BrokerAlive + Send + Sync {
 #[derive(Default)]
 pub struct DefaultBrokerHeartbeatManager {
     heartbeats: Mutex<HashMap<(String, String, i64), BrokerLiveInfo>>,
-    timeout: Duration,
+    /// Milliseconds, atomic so `UPDATE_CONTROLLER_CONFIG` can change the
+    /// liveness window without rebuilding the manager (and its registered
+    /// heartbeat state).
+    timeout_ms: AtomicU64,
 }
 
 impl DefaultBrokerHeartbeatManager {
     pub fn new(timeout: Duration) -> Self {
         Self {
             heartbeats: Mutex::new(HashMap::new()),
-            timeout,
+            timeout_ms: AtomicU64::new(timeout.as_millis() as u64),
         }
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn set_timeout_ms(&self, millis: u64) {
+        self.timeout_ms.store(millis, Ordering::Relaxed);
     }
 }
 
@@ -1161,7 +1173,9 @@ impl BrokerAlive for DefaultBrokerHeartbeatManager {
     fn check(&self, _cluster: &str, broker_name: &str, broker_id: i64) -> bool {
         let map = self.heartbeats.lock().unwrap();
         map.iter().any(|((_, name, id), info)| {
-            name == broker_name && *id == broker_id && info.last_seen.elapsed() < self.timeout
+            name == broker_name
+                && *id == broker_id
+                && info.last_seen.elapsed() < Duration::from_millis(self.timeout_ms())
         })
     }
 }
@@ -1212,25 +1226,29 @@ pub struct Controller {
     manager: Arc<Mutex<ReplicasInfoManager>>,
     heartbeat: Arc<DefaultBrokerHeartbeatManager>,
     elect_policy: Arc<dyn ElectPolicy>,
-    config: ControllerConfig,
+    /// Shared with `ControllerRequestProcessor` so GET/UPDATE_CONTROLLER_CONFIG
+    /// observe and mutate the live configuration instead of a startup copy.
+    config: Arc<RwLock<ControllerConfig>>,
     /// Raft group handle; `None` in single-node mode (`peers` empty).
     raft: Option<Arc<RaftNode>>,
 }
 
 impl Controller {
     pub fn new(config: ControllerConfig) -> Arc<Self> {
+        let shared = Arc::new(RwLock::new(config));
+        let startup = shared.read().unwrap().clone();
         let heartbeat = Arc::new(DefaultBrokerHeartbeatManager::new(Duration::from_millis(
-            config.heartbeat_timeout_millis,
+            startup.heartbeat_timeout_millis,
         )));
         let elect_policy: Arc<dyn ElectPolicy> = Arc::new(DefaultElectPolicy::new(
             heartbeat.clone() as Arc<dyn BrokerAlive>,
             heartbeat.clone() as Arc<dyn BrokerLiveInfoGetter>,
         ));
-        let manager = Arc::new(Mutex::new(ReplicasInfoManager::new(config.clone())));
+        let manager = Arc::new(Mutex::new(ReplicasInfoManager::new(startup.clone())));
         // Multi-node mode: commit events through the replicated log. The applier runs on every
         // commit (leader and followers) and feeds committed events back into the shared state
         // machine, so the leader never applies an event before it is committed.
-        let raft = if config.peers.is_empty() {
+        let raft = if startup.peers.is_empty() {
             None
         } else {
             let applier_manager = manager.clone();
@@ -1242,8 +1260,8 @@ impl Controller {
                         .apply_event(event.into_event());
                 });
             Some(Arc::new(RaftNode::new(
-                config.node_id.clone(),
-                config.peers.clone(),
+                startup.node_id.clone(),
+                startup.peers.clone(),
                 Arc::new(RemotingTransport),
                 applier,
             )))
@@ -1252,7 +1270,7 @@ impl Controller {
             manager,
             heartbeat,
             elect_policy,
-            config,
+            config: shared,
             raft,
         })
     }
@@ -1437,12 +1455,142 @@ impl Controller {
     }
 
     pub fn metadata(&self) -> serde_json::Value {
+        let config = self.config.read().unwrap();
         serde_json::json!({
-            "enableElectUncleanMaster": self.config.enable_elect_unclean_master,
-            "notifyBrokerRoleChanged": self.config.notify_broker_role_changed,
-            "enableRaft": self.config.enable_raft,
+            "enableElectUncleanMaster": config.enable_elect_unclean_master,
+            "notifyBrokerRoleChanged": config.notify_broker_role_changed,
+            "enableRaft": config.enable_raft,
         })
     }
+
+    /// Live `ControllerConfig` for `GET_CONTROLLER_CONFIG`.
+    pub fn config_snapshot(&self) -> ControllerConfig {
+        self.config.read().unwrap().clone()
+    }
+
+    /// Java `ControllerRequestProcessor.updateControllerConfig`: apply the
+    /// properties from the request body to the running controller. Validation
+    /// happens on a candidate copy first, so a rejected key never leaves a
+    /// partially applied update behind. Three fields that require rebuilding
+    /// the Raft group are immutable at runtime, as are any keys listed in the
+    /// controller's `configBlackList`.
+    pub fn update_config(&self, body: &[u8]) -> std::result::Result<ControllerConfig, String> {
+        let properties = parse_config_properties(body)?;
+        let mut guard = self.config.write().unwrap();
+        let mut candidate = guard.clone();
+        for (key, value) in &properties {
+            if is_immutable_config(&guard, key) {
+                return Err(format!("config key [{key}] cannot be updated at runtime"));
+            }
+            apply_config_value(&mut candidate, key, value)?;
+        }
+        // Election decisions read ReplicasInfoManager's own copy, and the
+        // heartbeat manager caches the timeout, so both must be refreshed.
+        *guard = candidate.clone();
+        self.manager.lock().unwrap().config = candidate.clone();
+        self.heartbeat
+            .set_timeout_ms(candidate.heartbeat_timeout_millis);
+        Ok(candidate)
+    }
+}
+
+/// Keys whose change would require rebuilding the Raft group or reopening the
+/// listeners; Java keeps these in `ControllerConfig.configBlackList`.
+const IMMUTABLE_CONFIG_KEYS: &[&str] = &["enableRaft", "nodeId", "peers"];
+
+fn is_immutable_config(config: &ControllerConfig, key: &str) -> bool {
+    IMMUTABLE_CONFIG_KEYS.contains(&key)
+        || config
+            .config_black_list
+            .split(',')
+            .any(|entry| entry.trim() == key)
+}
+
+fn parse_bool(value: &str) -> std::result::Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(format!("[{value}] is not a boolean")),
+    }
+}
+
+fn apply_config_value(
+    config: &mut ControllerConfig,
+    key: &str,
+    value: &str,
+) -> std::result::Result<(), String> {
+    match key {
+        "enableElectUncleanMaster" => {
+            config.enable_elect_unclean_master = parse_bool(value)?;
+        }
+        "notifyBrokerRoleChanged" => {
+            config.notify_broker_role_changed = parse_bool(value)?;
+        }
+        "heartbeatTimeoutMillis" => {
+            let millis: u64 = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("[{value}] is not a positive integer"))?;
+            if !(1_000..=600_000).contains(&millis) {
+                return Err(format!(
+                    "heartbeatTimeoutMillis must be within [1000, 600000], got {millis}"
+                ));
+            }
+            config.heartbeat_timeout_millis = millis;
+        }
+        "controllerIdEpoch" => {
+            config.controller_id_epoch = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("[{value}] is not an integer"))?;
+        }
+        "configBlackList" => {
+            config.config_black_list = value.trim().to_owned();
+        }
+        _ => return Err(format!("unknown config key [{key}]")),
+    }
+    Ok(())
+}
+
+/// Java sends `java.util.Properties` text; JSON objects are also accepted so
+/// the admin CLI and the remoting API can share one decoder.
+fn parse_config_properties(body: &[u8]) -> std::result::Result<Vec<(String, String)>, String> {
+    if body.is_empty() {
+        return Err("update body is empty".to_owned());
+    }
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(body) {
+        let mut properties = Vec::with_capacity(map.len());
+        for (key, value) in map {
+            let text = match value {
+                serde_json::Value::String(text) => text,
+                other => other.to_string(),
+            };
+            properties.push((key, text));
+        }
+        if properties.is_empty() {
+            return Err("no configuration properties supplied".to_owned());
+        }
+        return Ok(properties);
+    }
+    let text = std::str::from_utf8(body).map_err(|error| error.to_string())?;
+    let mut properties = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("invalid property line [{line}]"))?;
+        if key.trim().is_empty() {
+            return Err(format!("invalid property line [{line}]"));
+        }
+        properties.push((key.trim().to_owned(), value.trim().to_owned()));
+    }
+    if properties.is_empty() {
+        return Err("no configuration properties supplied".to_owned());
+    }
+    Ok(properties)
 }
 
 /// Java `ControllerRequestProcessor`: dispatches controller requests to the [`Controller`].
@@ -1469,7 +1617,7 @@ impl Handler for ControllerRequestProcessor {
 
 async fn process(controller: Arc<Controller>, request: Command) -> Command {
     let code = request.code;
-    let response = match code {
+    match code {
         request_code::BROKER_HEARTBEAT => {
             let broker_id: Option<i64> = request
                 .ext_fields
@@ -1498,7 +1646,7 @@ async fn process(controller: Arc<Controller>, request: Command) -> Command {
                             .ext_fields
                             .get("heartbeatTimeoutMills")
                             .and_then(|v| v.parse().ok())
-                            .unwrap_or(controller.heartbeat().timeout.as_millis() as u64),
+                            .unwrap_or(controller.heartbeat().timeout_ms()),
                         request
                             .ext_fields
                             .get("epoch")
@@ -1734,32 +1882,44 @@ async fn process(controller: Arc<Controller>, request: Command) -> Command {
             }
             resp
         }
-        request_code::GET_CONTROLLER_CONFIG | request_code::UPDATE_CONTROLLER_CONFIG => {
-            Command::response(&request, response_code::SUCCESS)
+        request_code::GET_CONTROLLER_CONFIG => {
+            let body = serde_json::to_vec(&controller.config_snapshot()).unwrap_or_default();
+            Command::response(&request, response_code::SUCCESS).with_body(body)
         }
+        request_code::UPDATE_CONTROLLER_CONFIG => match controller.update_config(&request.body) {
+            Ok(config) => {
+                info!(?config, "controller config updated at runtime");
+                let body = serde_json::to_vec(&config).unwrap_or_default();
+                Command::response(&request, response_code::SUCCESS).with_body(body)
+            }
+            Err(remark) => {
+                let mut response =
+                    Command::response(&request, response_code::CONTROLLER_INVALID_REQUEST);
+                response.remark = Some(remark);
+                response
+            }
+        },
         _ => Command::response(&request, response_code::REQUEST_CODE_NOT_SUPPORTED),
-    };
-    response
+    }
 }
 
 /// Java `ControllerManager`: owns the controller, serves it, and periodically re-elects dead masters.
 pub struct ControllerManager {
     controller: Arc<Controller>,
-    config: ControllerConfig,
 }
 
 impl ControllerManager {
     pub fn new(config: ControllerConfig) -> Arc<Self> {
-        let controller = Controller::new(config.clone());
-        Arc::new(Self { controller, config })
+        let controller = Controller::new(config);
+        Arc::new(Self { controller })
     }
 
     pub fn controller(&self) -> &Arc<Controller> {
         &self.controller
     }
 
-    pub fn config(&self) -> &ControllerConfig {
-        &self.config
+    pub fn config(&self) -> ControllerConfig {
+        self.controller.config_snapshot()
     }
 
     /// Bind the controller listener and serve until `shutdown`.
@@ -1961,5 +2121,81 @@ mod tests {
         let (next, code) = controller.get_next_broker_id("c", "b");
         assert_eq!(next, 2);
         assert_eq!(code, response_code::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn controller_config_get_and_update_are_live() {
+        let controller = Controller::new(ControllerConfig {
+            config_black_list: "notifyBrokerRoleChanged".to_owned(),
+            ..ControllerConfig::default()
+        });
+
+        // GET returns the real configuration, not an empty SUCCESS stub.
+        let response = process(
+            controller.clone(),
+            Command::request(request_code::GET_CONTROLLER_CONFIG),
+        )
+        .await;
+        assert_eq!(response.code, response_code::SUCCESS);
+        let fetched: ControllerConfig = serde_json::from_slice(&response.body).unwrap();
+        assert!(!fetched.enable_elect_unclean_master);
+        assert_eq!(fetched.heartbeat_timeout_millis, 10_000);
+
+        // Java uses properties text; the update must reach election decisions,
+        // the heartbeat manager and the manager's own config copy.
+        let updated = process(
+            controller.clone(),
+            Command::request(request_code::UPDATE_CONTROLLER_CONFIG).with_body(
+                b"enableElectUncleanMaster=true\nheartbeatTimeoutMillis=2500".to_vec(),
+            ),
+        )
+        .await;
+        assert_eq!(updated.code, response_code::SUCCESS, "{:?}", updated.remark);
+        let config: ControllerConfig = serde_json::from_slice(&updated.body).unwrap();
+        assert!(config.enable_elect_unclean_master);
+        assert_eq!(config.heartbeat_timeout_millis, 2500);
+        assert!(controller
+            .manager
+            .lock()
+            .unwrap()
+            .config
+            .enable_elect_unclean_master);
+        assert_eq!(controller.heartbeat().timeout_ms(), 2500);
+
+        // JSON objects are accepted too.
+        let json = process(
+            controller.clone(),
+            Command::request(request_code::UPDATE_CONTROLLER_CONFIG)
+                .with_body(br#"{"controllerIdEpoch":7}"#.to_vec()),
+        )
+        .await;
+        assert_eq!(json.code, response_code::SUCCESS, "{:?}", json.remark);
+        assert_eq!(controller.config_snapshot().controller_id_epoch, 7);
+
+        // Blacklisted, immutable, unknown and invalid values are rejected with
+        // a typed error and never leave a partially applied update behind.
+        for body in [
+            "notifyBrokerRoleChanged=false",
+            "peers=127.0.0.1:9878",
+            "notAConfigKey=1",
+            "heartbeatTimeoutMillis=10\nenableElectUncleanMaster=false",
+        ] {
+            let response = process(
+                controller.clone(),
+                Command::request(request_code::UPDATE_CONTROLLER_CONFIG)
+                    .with_body(body.as_bytes().to_vec()),
+            )
+            .await;
+            assert_eq!(
+                response.code,
+                response_code::CONTROLLER_INVALID_REQUEST,
+                "body [{body}] should be rejected"
+            );
+        }
+        let config = controller.config_snapshot();
+        assert!(config.enable_elect_unclean_master, "partial update applied");
+        assert_eq!(config.heartbeat_timeout_millis, 2500);
+        assert!(config.peers.is_empty());
+        assert!(config.notify_broker_role_changed);
     }
 }
