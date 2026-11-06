@@ -25,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const REGISTER_INTERVAL: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(35);
-const SECURITY_NOTICE: &str = "TLS and authentication are not implemented. Do not expose these listeners directly to the public Internet.";
+const SECURITY_NOTICE: &str = "TLS (--tls-listen/--tls-cert/--tls-key) and ACL (--acl-enable/--acl-config) are available but off by default. This is a development server; enable them before exposing any listener to an untrusted network.";
 
 #[derive(Debug, Parser)]
 #[command(name = "rocketmq", version, about = "Rust RocketMQ development server and administration CLI", after_help = SECURITY_NOTICE)]
