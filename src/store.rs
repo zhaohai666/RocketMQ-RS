@@ -6,7 +6,7 @@ use crate::common::{
 use crate::filter::Subscription;
 use crate::schedule::{DelayOffsets, GroupConfig, TimerCheckpoint};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -27,6 +27,11 @@ const CHECKPOINT_FILE: &str = "storecheckpoint.json";
 /// refuses writes once `diskMaxUsedSpaceRatio` is exceeded; a directory quota
 /// gives the same protection without a platform-specific statvfs dependency.
 const DEFAULT_MAX_STORE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+/// Java `MessageStoreConfig.mappedFileSizeCommitLog`. A segment file is named
+/// by the global physical offset it starts at, so `Message.physical_offset`
+/// remains one logical byte position across the whole log even after the log
+/// is split into files.
+pub const DEFAULT_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024;
 /// Orphaned `.tmp` state files are only removed after this age, so a temp file
 /// belonging to a concurrent `replace_json` can never be swept away.
 const MIN_ORPHAN_AGE_MS: i64 = 60 * 60 * 1000;
@@ -94,7 +99,7 @@ struct Offsets {
 
 struct Inner {
     directory: PathBuf,
-    log: File,
+    log: CommitLog,
     queues: Queues,
     key_index: Keys,
     physical: BTreeMap<u64, u32>,
@@ -111,6 +116,9 @@ struct Inner {
     /// the disk watermark check never has to walk the directory on the hot path.
     directory_bytes: u64,
     checkpoint: StoreCheckpoint,
+    /// Millis of the last successful background flush; starts at open time so
+    /// the first async flush waits a full interval rather than firing at once.
+    last_flush_millis: i64,
     #[cfg(test)]
     fail_log_sync: bool,
     // Retaining the lock inode and handle prevents a second writer while idle.
@@ -131,9 +139,46 @@ pub struct StoreCheckpoint {
     pub logics_msg_timestamp: i64,
     pub index_msg_timestamp: i64,
     pub commitlog_len: u64,
+    /// Persisted so a restart reopens the same segment boundaries even when
+    /// the caller passes a different `StoreLimits::segment_size`.
+    pub commitlog_segment_size: u64,
     pub last_clean_timestamp: i64,
     pub clean_exit: bool,
     pub abnormal_recoveries: u64,
+}
+
+/// Java `MessageStoreConfig.flushDiskType`. `Sync` acknowledges an append only
+/// after its bytes are fsynced (`GroupCommitService`); `Async` acknowledges
+/// after the `write(2)` and lets a background task fsync at most once per
+/// interval (`FlushRealTimeService`), trading a bounded amount of durability
+/// for throughput. The default stays `Sync` so existing deployments keep their
+/// durability contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlushPolicy {
+    Sync,
+    Async { interval_ms: u64 },
+}
+
+impl FlushPolicy {
+    /// `0` means sync flush, matching Java's `flushIntervalCommitLog == 0` knob.
+    pub fn from_interval_ms(interval_ms: u64) -> Self {
+        if interval_ms == 0 {
+            Self::Sync
+        } else {
+            Self::Async { interval_ms }
+        }
+    }
+
+    pub fn is_async(self) -> bool {
+        matches!(self, Self::Async { .. })
+    }
+
+    pub fn interval_ms(self) -> u64 {
+        match self {
+            Self::Sync => 0,
+            Self::Async { interval_ms } => interval_ms,
+        }
+    }
 }
 
 /// Quotas for one store directory. `Store::open` uses conservative defaults;
@@ -141,12 +186,19 @@ pub struct StoreCheckpoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreLimits {
     pub max_store_bytes: u64,
+    /// Size of one commitlog segment. Ignored once a directory has a persisted
+    /// `commitlogSegmentSize`, so reopening a segmented store cannot silently
+    /// reinterpret its existing segment boundaries.
+    pub segment_size: u64,
+    pub flush_policy: FlushPolicy,
 }
 
 impl Default for StoreLimits {
     fn default() -> Self {
         Self {
             max_store_bytes: DEFAULT_MAX_STORE_BYTES,
+            segment_size: DEFAULT_SEGMENT_SIZE,
+            flush_policy: FlushPolicy::Sync,
         }
     }
 }
@@ -236,6 +288,318 @@ pub struct ReadResult {
     pub max_offset: u64,
 }
 
+// ---------------------------------------------------------------------------
+// CommitLog segments (Java `MappedFileQueue`)
+// ---------------------------------------------------------------------------
+
+/// Segment 0 keeps the historical `commitlog` name so pre-segmentation data
+/// directories, the recovery tests and operator tooling keep working. Later
+/// segments are `commitlog.<20-digit global start offset>`, like Java's
+/// `MappedFile` file-from-offset naming.
+fn segment_file_name(start: u64) -> String {
+    if start == 0 {
+        LOG_FILE.to_owned()
+    } else {
+        format!("{LOG_FILE}.{start:020}")
+    }
+}
+
+/// Only exact `commitlog.<20 digits>` names are segments, so housekeeping can
+/// never mistake a JSON state file or a `.tmp` for one.
+fn parse_segment_start(name: &str) -> Option<u64> {
+    let suffix = name.strip_prefix(LOG_FILE)?.strip_prefix('.')?;
+    if suffix.len() != 20 || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse::<u64>().ok().filter(|start| *start > 0)
+}
+
+/// Visible layout of a segmented commitlog, for operator diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentInfo {
+    pub segment_size: u64,
+    pub starts: Vec<u64>,
+}
+
+/// A byte-addressed commitlog split into fixed-size files. Global physical
+/// offsets stay contiguous, so a record may straddle a segment boundary; reads
+/// and writes stitch the files back together. Java instead pads the tail of a
+/// MappedFile so no message crosses a boundary — keeping offsets contiguous
+/// here is what lets every consume-queue index, key index, msgId and
+/// `END_TRANSACTION` lookup stay byte-for-byte unchanged.
+struct CommitLog {
+    directory: PathBuf,
+    segment_size: u64,
+    segments: BTreeMap<u64, File>,
+    len: u64,
+    cursor: u64,
+    /// Segment starts written since the last successful fsync. Java's
+    /// `MappedFileQueue.flush` only syncs the dirty mapped files; syncing every
+    /// segment on every append would make an fsync O(number of segments).
+    dirty: BTreeSet<u64>,
+    /// A newly created segment file needs its parent directory synced too.
+    directory_dirty: bool,
+}
+
+impl CommitLog {
+    fn open(directory: &Path, mut segment_size: u64) -> Result<Self> {
+        if segment_size == 0 {
+            return Err(invalid("commitlog segment size must be positive"));
+        }
+        let mut starts = BTreeSet::new();
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(start) = parse_segment_start(&name) {
+                reject_nonregular(&entry.path())?;
+                starts.insert(start);
+            }
+        }
+        let primary = directory.join(LOG_FILE);
+        reject_nonregular(&primary)?;
+        let primary_len = match fs::metadata(&primary) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(first) = starts.iter().next().copied() {
+            // No persisted segment size (older checkpoint): the smallest
+            // segment start is exactly one segment's worth of bytes, because
+            // this port never deletes a live segment out of the middle.
+            if first < segment_size {
+                segment_size = first;
+            }
+        } else if primary_len > segment_size {
+            // A pre-segmentation directory can be larger than the configured
+            // segment. Keep all of it in segment 0 and roll from its end.
+            segment_size = primary_len;
+        }
+        starts.insert(0);
+
+        let mut segments = BTreeMap::new();
+        let mut expected_start = 0u64;
+        for start in &starts {
+            let path = directory.join(segment_file_name(*start));
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            let file_len = file.metadata()?.len();
+            if *start != expected_start {
+                return Err(invalid(format!(
+                    "commitlog segment {} is not contiguous (expected start {expected_start})",
+                    start
+                )));
+            }
+            if file_len > segment_size {
+                return Err(invalid("commitlog segment exceeds its segment size"));
+            }
+            expected_start = expected_start
+                .checked_add(file_len)
+                .ok_or_else(|| invalid("commitlog length overflow"))?;
+            segments.insert(*start, file);
+        }
+        let len = expected_start;
+        Ok(Self {
+            directory: directory.to_path_buf(),
+            segment_size,
+            segments,
+            len,
+            cursor: len,
+            dirty: BTreeSet::new(),
+            directory_dirty: false,
+        })
+    }
+
+    fn segment(&mut self, start: u64) -> io::Result<&mut File> {
+        if !self.segments.contains_key(&start) {
+            let path = self.directory.join(segment_file_name(start));
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            self.segments.insert(start, file);
+            self.directory_dirty = true;
+        }
+        Ok(self
+            .segments
+            .get_mut(&start)
+            .expect("segment inserted above"))
+    }
+
+    fn read_at(&mut self, physical: u64, out: &mut [u8]) -> io::Result<()> {
+        let mut done = 0usize;
+        while done < out.len() {
+            let at = physical
+                .checked_add(done as u64)
+                .ok_or_else(|| io::Error::other("commitlog read offset overflow"))?;
+            if at >= self.len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "commitlog read past the committed length",
+                ));
+            }
+            let start = (at / self.segment_size) * self.segment_size;
+            let offset = at - start;
+            let take = ((self.segment_size - offset) as usize).min(out.len() - done);
+            let file = self.segment(start)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut out[done..done + take])?;
+            done += take;
+        }
+        Ok(())
+    }
+
+    fn write_at(&mut self, physical: u64, bytes: &[u8]) -> io::Result<()> {
+        let mut done = 0usize;
+        while done < bytes.len() {
+            let at = physical
+                .checked_add(done as u64)
+                .ok_or_else(|| io::Error::other("commitlog write offset overflow"))?;
+            let start = (at / self.segment_size) * self.segment_size;
+            let offset = at - start;
+            let take = ((self.segment_size - offset) as usize).min(bytes.len() - done);
+            self.dirty.insert(start);
+            let file = self.segment(start)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&bytes[done..done + take])?;
+            done += take;
+        }
+        self.len = self.len.max(physical + bytes.len() as u64);
+        Ok(())
+    }
+
+    fn truncate(&mut self, new_len: u64) -> io::Result<()> {
+        let doomed: Vec<u64> = self
+            .segments
+            .keys()
+            .copied()
+            .filter(|start| *start > 0 && *start >= new_len)
+            .collect();
+        for start in doomed {
+            self.segments.remove(&start);
+            self.dirty.remove(&start);
+            let path = self.directory.join(segment_file_name(start));
+            match fs::remove_file(&path) {
+                Ok(()) => self.directory_dirty = true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if new_len == 0 || !new_len.is_multiple_of(self.segment_size) {
+            let start = (new_len / self.segment_size) * self.segment_size;
+            let file = self.segment(start)?;
+            file.set_len(new_len - start)?;
+            file.sync_data()?;
+        }
+        self.len = new_len;
+        self.cursor = self.cursor.min(new_len);
+        Ok(())
+    }
+
+    /// Fsync only the segments this writer touched. On failure the unsynced
+    /// starts stay in `dirty`, so the next flush retries them instead of
+    /// silently acknowledging a write that may not be durable.
+    fn sync_data(&mut self) -> io::Result<()> {
+        let mut synced = Vec::with_capacity(self.dirty.len());
+        for start in self.dirty.iter().copied() {
+            if let Some(file) = self.segments.get(&start) {
+                file.sync_data()?;
+            }
+            synced.push(start);
+        }
+        for start in synced {
+            self.dirty.remove(&start);
+        }
+        if self.directory_dirty {
+            File::open(&self.directory)?.sync_all()?;
+            self.directory_dirty = false;
+        }
+        Ok(())
+    }
+
+    fn sync_all(&mut self) -> io::Result<()> {
+        for file in self.segments.values() {
+            file.sync_all()?;
+        }
+        self.dirty.clear();
+        if self.directory_dirty {
+            File::open(&self.directory)?.sync_all()?;
+            self.directory_dirty = false;
+        }
+        Ok(())
+    }
+
+    fn has_dirty(&self) -> bool {
+        !self.dirty.is_empty() || self.directory_dirty
+    }
+
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn info(&self) -> SegmentInfo {
+        SegmentInfo {
+            segment_size: self.segment_size,
+            starts: self.segments.keys().copied().collect(),
+        }
+    }
+
+    /// Replaces the segment-0 handle with a read-only one so the write-failure
+    /// fencing test still exercises a real `write` error.
+    #[cfg(test)]
+    fn force_read_only_for_test(&mut self) -> io::Result<()> {
+        let file = File::open(self.directory.join(segment_file_name(0)))?;
+        self.segments.insert(0, file);
+        Ok(())
+    }
+}
+
+impl Read for CommitLog {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.cursor >= self.len {
+            return Ok(0);
+        }
+        let count = (self.len - self.cursor).min(buf.len() as u64) as usize;
+        self.read_at(self.cursor, &mut buf[..count])?;
+        self.cursor += count as u64;
+        Ok(count)
+    }
+}
+
+impl Write for CommitLog {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_at(self.cursor, buf)?;
+        self.cursor += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // `Inner::sync_log` owns the durability decision (and the injected
+        // failure hook), so a `write_all` must not fsync behind its back.
+        Ok(())
+    }
+}
+
+impl Seek for CommitLog {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        match position {
+            SeekFrom::Start(offset) => {
+                self.cursor = offset;
+                Ok(offset)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "commitlog only supports SeekFrom::Start",
+            )),
+        }
+    }
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_limits(path, StoreLimits::default())
@@ -244,6 +608,12 @@ impl Store {
     pub fn open_with_limits(path: impl AsRef<Path>, limits: StoreLimits) -> Result<Self> {
         if limits.max_store_bytes == 0 {
             return Err(invalid("max_store_bytes must be positive"));
+        }
+        if limits.segment_size == 0 {
+            return Err(invalid("segment_size must be positive"));
+        }
+        if matches!(limits.flush_policy, FlushPolicy::Async { interval_ms: 0 }) {
+            return Err(invalid("async flush interval must be positive"));
         }
         let path = path.as_ref();
         if path.as_os_str().is_empty() {
@@ -301,15 +671,18 @@ impl Store {
         reject_nonregular(&log_path)?;
         let mut checkpoint: StoreCheckpoint =
             load_json(&directory.join(CHECKPOINT_FILE))?.unwrap_or_default();
+        // A directory created before segmentation has no persisted value; a
+        // segmented one must keep its original boundaries on every reopen.
+        let segment_size = if checkpoint.commitlog_segment_size > 0 {
+            checkpoint.commitlog_segment_size
+        } else {
+            limits.segment_size
+        };
         // Java `BrokerController.shutdown` removes `abort`. Its presence means
         // the last process was killed, so recovery must take the abnormal path.
         let abort_path = directory.join(ABORT_FILE);
         let abnormal = abort_path.try_exists()?;
-        let mut log = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(&log_path)?;
+        let mut log = CommitLog::open(&directory, segment_size)?;
         let (queues, physical, key_index, committed_len) = recover(&mut log, &mut topics)?;
         if abnormal {
             checkpoint.abnormal_recoveries = checkpoint.abnormal_recoveries.saturating_add(1);
@@ -326,6 +699,7 @@ impl Store {
         let now = now_millis();
         checkpoint.clean_exit = false;
         checkpoint.commitlog_len = committed_len;
+        checkpoint.commitlog_segment_size = log.segment_size;
         checkpoint.physic_msg_timestamp = now;
         checkpoint.logics_msg_timestamp = now;
         checkpoint.index_msg_timestamp = now;
@@ -359,6 +733,7 @@ impl Store {
                 limits,
                 directory_bytes,
                 checkpoint,
+                last_flush_millis: now,
                 #[cfg(test)]
                 fail_log_sync: false,
                 _lock: lock,
@@ -371,16 +746,23 @@ impl Store {
     /// point leaves the marker behind and the next open recovers abnormally.
     pub fn shutdown(&self) -> Result<()> {
         let mut inner = self.lock()?;
+        // An `Async` flush policy acknowledges writes before fsyncing them. A
+        // graceful shutdown must still make every acknowledged byte durable
+        // before it removes the abort marker; otherwise a later power loss
+        // could lose data that producers already saw as committed. In `Sync`
+        // mode this is a cheap no-op because every append flushed already.
+        if let Err(error) = inner.sync_log() {
+            return Err(error.into());
+        }
         let now = now_millis();
         inner.checkpoint.clean_exit = true;
         inner.checkpoint.commitlog_len = inner.committed_len;
         inner.checkpoint.physic_msg_timestamp = now;
         inner.checkpoint.logics_msg_timestamp = now;
         inner.checkpoint.index_msg_timestamp = now;
-        // Each append already calls sync_data on the commitlog, so a second
-        // fsync here is pure overhead. The checkpoint itself is advisory: if a
-        // power loss keeps `abort` alive, the next boot just revalidates the
-        // tail (a safe false positive), it does not lose data.
+        // The checkpoint itself is advisory: if a power loss keeps `abort`
+        // alive, the next boot just revalidates the tail (a safe false
+        // positive), it does not lose data.
         let bytes = encode_json(&inner.checkpoint)?;
         inner.replace_state(CHECKPOINT_FILE, &bytes, false)?;
         match fs::remove_file(inner.directory.join(ABORT_FILE)) {
@@ -593,11 +975,20 @@ impl Store {
         }
 
         let write_result = (|| -> Result<()> {
-            if inner.log.metadata()?.len() != inner.committed_len {
+            if inner.log.len() != inner.committed_len {
                 return Err(invalid("commitlog length changed outside this store"));
             }
+            // The old single `File` was opened with `append(true)`; a segmented
+            // log is position-addressed, so seek to the logical tail first.
+            let tail = inner.committed_len;
+            inner.log.seek(SeekFrom::Start(tail))?;
             inner.log.write_all(&encoded)?;
-            inner.sync_log()?;
+            match inner.limits.flush_policy {
+                FlushPolicy::Sync => inner.sync_log()?,
+                // `FlushRealTimeService` will fsync this dirty segment from
+                // `Store::flush_if_due`; a graceful shutdown also flushes.
+                FlushPolicy::Async { .. } => {}
+            }
             Ok(())
         })();
         if let Err(error) = write_result {
@@ -929,7 +1320,39 @@ impl Store {
             inner.fenced = true;
             return Err(error);
         }
+        inner.last_flush_millis = now_millis();
         Ok(())
+    }
+
+    /// The active durability policy, exposed so the runtime diagnostics and the
+    /// maintenance task can report / drive it without opening the store again.
+    pub fn flush_policy(&self) -> Result<FlushPolicy> {
+        Ok(self.lock()?.limits.flush_policy)
+    }
+
+    /// Java `FlushRealTimeService`: fsync the dirty commitlog segments at most
+    /// once per configured interval. A `Sync` store has nothing to do here
+    /// (each append already fsynced), and a due flush with no dirty bytes is a
+    /// no-op. Returns whether an fsync actually happened.
+    pub fn flush_if_due(&self) -> Result<bool> {
+        let mut inner = self.lock()?;
+        let interval_ms = match inner.limits.flush_policy {
+            FlushPolicy::Sync => return Ok(false),
+            FlushPolicy::Async { interval_ms } => i64::try_from(interval_ms).unwrap_or(i64::MAX),
+        };
+        if !inner.log.has_dirty() {
+            return Ok(false);
+        }
+        let now = now_millis();
+        if now.saturating_sub(inner.last_flush_millis) < interval_ms {
+            return Ok(false);
+        }
+        if let Err(error) = inner.sync_log() {
+            inner.fenced = true;
+            return Err(error.into());
+        }
+        inner.last_flush_millis = now;
+        Ok(true)
     }
 
     /// A fenced store must reopen because the durability of its unacknowledged tail is unknown.
@@ -937,6 +1360,12 @@ impl Store {
         let inner = self.lock()?;
         inner.ensure_writable()?;
         Ok(inner.committed_len)
+    }
+
+    /// `MappedFileQueue` layout: the segment size and every segment's global
+    /// start offset. Lets an operator see rolling in the runtime diagnostics.
+    pub fn segment_info(&self) -> Result<SegmentInfo> {
+        Ok(self.lock()?.log.info())
     }
 
     /// `SubscriptionGroupManager.getSubscriptionGroupTable`.
@@ -1078,7 +1507,7 @@ impl Store {
 }
 
 impl Inner {
-    fn sync_log(&self) -> io::Result<()> {
+    fn sync_log(&mut self) -> io::Result<()> {
         #[cfg(test)]
         if self.fail_log_sync {
             return Err(io::Error::other("injected commitlog sync failure"));
@@ -1344,10 +1773,10 @@ fn add_key_index(keys: &mut Keys, message: &Message) {
 }
 
 fn recover(
-    log: &mut File,
+    log: &mut CommitLog,
     topics: &mut BTreeMap<String, TopicConfig>,
 ) -> Result<(Queues, BTreeMap<u64, u32>, Keys, u64)> {
-    let file_len = log.metadata()?.len();
+    let file_len = log.len();
     let mut position = 0u64;
     let mut queues = Queues::new();
     let mut physical = BTreeMap::new();
@@ -1410,13 +1839,13 @@ fn recover(
     }
     if position != file_len {
         // Only a plausible unfinished EOF record is safe to discard, not corrupt complete records.
-        log.set_len(position)?;
+        log.truncate(position)?;
         log.sync_data()?;
     }
     Ok((queues, physical, key_index, position))
 }
 
-fn validate_partial_prefix(log: &mut File, physical: u64, remaining: u64) -> Result<()> {
+fn validate_partial_prefix(log: &mut CommitLog, physical: u64, remaining: u64) -> Result<()> {
     let length = remaining.min(36) as usize;
     let mut prefix = [0u8; 36];
     log.seek(SeekFrom::Start(physical))?;
@@ -1438,7 +1867,7 @@ fn validate_partial_prefix(log: &mut File, physical: u64, remaining: u64) -> Res
     Ok(())
 }
 
-fn read_record(log: &mut File, physical: u64, length: u32) -> Result<Message> {
+fn read_record(log: &mut CommitLog, physical: u64, length: u32) -> Result<Message> {
     validate_record_length(length as usize)?;
     log.seek(SeekFrom::Start(physical))?;
     let mut bytes = vec![0; length as usize];
@@ -2210,8 +2639,15 @@ mod tests {
     fn failed_log_write_fences_mutations_without_publishing_indexes() {
         let directory = TempDir::new().unwrap();
         let store = Store::open(directory.path()).unwrap();
-        // A read-only log handle forces a real write failure without releasing the directory lock.
-        store.inner.lock().unwrap().log = File::open(directory.path().join(LOG_FILE)).unwrap();
+        // A read-only segment handle forces a real write failure without releasing
+        // the directory lock.
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .log
+            .force_read_only_for_test()
+            .unwrap();
         assert!(store.append(message("topic", 0, b"x", "A")).is_err());
         assert_eq!(store.queue_max_offset("topic", 0), 0);
         assert!(store.topics().unwrap().is_empty());
@@ -2453,6 +2889,7 @@ mod tests {
             dir.path(),
             StoreLimits {
                 max_store_bytes: used + 4096,
+                ..StoreLimits::default()
             },
         )
         .unwrap();
@@ -2503,5 +2940,339 @@ mod tests {
         assert!(!stale.exists());
         assert!(fresh.exists(), "an in-flight temp file must be kept");
         assert!(store.checkpoint().unwrap().last_clean_timestamp > 0);
+    }
+
+    const SMALL_SEGMENT: u64 = 128;
+
+    fn segmented(dir: &TempDir) -> Store {
+        Store::open_with_limits(
+            dir.path(),
+            StoreLimits {
+                segment_size: SMALL_SEGMENT,
+                ..StoreLimits::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// The point of segmented storage: every index and msgId still addresses
+    /// one global byte position, even though the bytes live in several files.
+    #[test]
+    fn commitlog_rolls_into_segments_and_reads_across_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let store = segmented(&dir);
+        let mut physicals = Vec::new();
+        for index in 0..8 {
+            let body = format!("m{index}");
+            let saved = store
+                .append(message("segmented", 0, body.as_bytes(), ""))
+                .unwrap();
+            physicals.push((saved.physical_offset, body));
+        }
+        let info = store.segment_info().unwrap();
+        assert_eq!(info.segment_size, SMALL_SEGMENT);
+        assert!(info.starts.len() > 1, "commitlog never rolled over");
+        for (index, start) in info.starts.iter().enumerate() {
+            assert_eq!(*start, index as u64 * SMALL_SEGMENT);
+        }
+        // Every non-final segment is exactly full: no gaps in the global offset
+        // space, so `physical` stays a plain byte position.
+        for start in &info.starts[..info.starts.len() - 1] {
+            assert_eq!(
+                fs::metadata(dir.path().join(segment_file_name(*start)))
+                    .unwrap()
+                    .len(),
+                SMALL_SEGMENT
+            );
+        }
+        let total = store.physical_len().unwrap();
+        assert!(total > 2 * SMALL_SEGMENT, "no record crossed a boundary");
+        // A record whose bytes straddle two files must still decode.
+        for (physical, body) in &physicals {
+            let read = store.message_at(*physical).unwrap().unwrap();
+            assert_eq!(read.body, body.as_bytes());
+            assert_eq!(read.physical_offset, *physical);
+        }
+        let batch = store
+            .read("segmented", 0, 0, 8, MAX_READ_BYTES, None)
+            .unwrap();
+        assert_eq!(batch.messages.len(), 8);
+        for (index, message) in batch.messages.iter().enumerate() {
+            assert_eq!(message.queue_offset, index as u64);
+        }
+        // Housekeeping only sweeps `.tmp` files; segment files must survive it.
+        assert!(store.clean_expired_files().unwrap().removed.is_empty());
+        assert_eq!(store.segment_info().unwrap(), info);
+    }
+
+    /// A restart must reopen the *same* boundaries even when the caller passes
+    /// a different `StoreLimits` (the default 1 GiB), and appending continues
+    /// from the persisted logical tail.
+    #[test]
+    fn segmented_commitlog_survives_reopen_with_persisted_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let (info, total, last_physical) = {
+            let store = segmented(&dir);
+            for index in 0..8 {
+                store
+                    .append(message("segmented", 0, format!("m{index}").as_bytes(), ""))
+                    .unwrap();
+            }
+            let info = store.segment_info().unwrap();
+            let total = store.physical_len().unwrap();
+            let last = store
+                .read("segmented", 0, 7, 1, MAX_READ_BYTES, None)
+                .unwrap()
+                .messages[0]
+                .physical_offset;
+            store.flush().unwrap();
+            store.shutdown().unwrap();
+            (info, total, last)
+        };
+        assert!(info.starts.len() > 1);
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.segment_info().unwrap(), info);
+        assert_eq!(store.physical_len().unwrap(), total);
+        assert_eq!(
+            store.checkpoint().unwrap().commitlog_segment_size,
+            SMALL_SEGMENT
+        );
+        let all = store
+            .read("segmented", 0, 0, 8, MAX_READ_BYTES, None)
+            .unwrap();
+        assert_eq!(all.messages.len(), 8);
+        assert_eq!(all.messages[7].physical_offset, last_physical);
+
+        let continued = store
+            .append(message("segmented", 0, b"after-restart", ""))
+            .unwrap();
+        assert_eq!(continued.physical_offset, total);
+        assert_eq!(continued.queue_offset, 8);
+        assert_eq!(
+            store.message_at(total).unwrap().unwrap().body,
+            b"after-restart"
+        );
+    }
+
+    /// A torn record appended after a crash is truncated even when it lands in
+    /// a later segment; the intact segments and their boundaries stay put.
+    #[test]
+    fn segmented_commitlog_truncates_a_torn_tail_in_a_later_segment() {
+        let dir = TempDir::new().unwrap();
+        let (info, total) = {
+            let store = segmented(&dir);
+            for _ in 0..6 {
+                store
+                    .append(message("segmented", 0, b"0123456789", ""))
+                    .unwrap();
+            }
+            let total = store.physical_len().unwrap();
+            let info = store.segment_info().unwrap();
+            let last = *info.starts.last().unwrap();
+            let path = dir.path().join(segment_file_name(last));
+            // A valid magic prefix but fewer bytes than the length field
+            // promises: `recover` must discard just this tail.
+            let torn = message("segmented", 0, b"0123456789", "").encode().unwrap();
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&torn[..20]).unwrap();
+            file.sync_all().unwrap();
+            assert!(fs::metadata(&path).unwrap().len() <= SMALL_SEGMENT);
+            store.shutdown().unwrap();
+            (info, total)
+        };
+        assert!(info.starts.len() > 1);
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.physical_len().unwrap(), total);
+        assert_eq!(store.segment_info().unwrap().starts, info.starts);
+        assert_eq!(
+            store
+                .read("segmented", 0, 0, 10, MAX_READ_BYTES, None)
+                .unwrap()
+                .messages
+                .len(),
+            6
+        );
+    }
+
+    #[test]
+    fn segment_layout_is_persisted_in_the_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        {
+            let store = segmented(&dir);
+            store.append(message("segmented", 0, b"a", "")).unwrap();
+            store.flush_checkpoint().unwrap();
+        }
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join(CHECKPOINT_FILE)).unwrap()).unwrap();
+        assert_eq!(raw["commitlogSegmentSize"], SMALL_SEGMENT);
+        // An unknown segment name is never mistaken for a segment file.
+        assert_eq!(
+            parse_segment_start("commitlog.00000000000000000128"),
+            Some(128)
+        );
+        assert_eq!(parse_segment_start("commitlog.128"), None);
+        assert_eq!(parse_segment_start("topics.json"), None);
+    }
+
+    fn async_store(dir: &TempDir, interval_ms: u64) -> Store {
+        Store::open_with_limits(
+            dir.path(),
+            StoreLimits {
+                flush_policy: FlushPolicy::Async { interval_ms },
+                ..StoreLimits::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_zero_async_flush_interval_is_rejected_at_open() {
+        let dir = TempDir::new().unwrap();
+        let error = Store::open_with_limits(
+            dir.path(),
+            StoreLimits {
+                flush_policy: FlushPolicy::Async { interval_ms: 0 },
+                ..StoreLimits::default()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("async flush interval"));
+    }
+
+    #[test]
+    fn sync_flush_still_fsyncs_every_append() {
+        assert_eq!(FlushPolicy::from_interval_ms(0), FlushPolicy::Sync);
+        assert_eq!(
+            FlushPolicy::from_interval_ms(500),
+            FlushPolicy::Async { interval_ms: 500 }
+        );
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.flush_policy().unwrap(), FlushPolicy::Sync);
+        store.append(message("sync", 0, b"a", "")).unwrap();
+        // A SYNC_FLUSH append leaves nothing for the background service.
+        assert!(!store.inner.lock().unwrap().log.has_dirty());
+        assert!(!store.flush_if_due().unwrap());
+    }
+
+    /// `FlushRealTimeService` must not fsync before its interval, and a failed
+    /// fsync must fence the store just like a failed SYNC_FLUSH append would.
+    #[test]
+    fn async_flush_waits_for_its_interval_and_fences_on_failure() {
+        let dir = TempDir::new().unwrap();
+        let store = async_store(&dir, 60_000);
+        for index in 0..4 {
+            store
+                .append(message("async", 0, format!("m{index}").as_bytes(), ""))
+                .unwrap();
+        }
+        assert!(store.inner.lock().unwrap().log.has_dirty());
+        assert!(
+            !store.flush_if_due().unwrap(),
+            "flushed before the interval"
+        );
+        assert!(store.inner.lock().unwrap().log.has_dirty());
+
+        // Deterministic clock advance: no wall-clock sleep in the test.
+        store.inner.lock().unwrap().last_flush_millis = now_millis() - 60_001;
+        store.inner.lock().unwrap().fail_log_sync = true;
+        assert!(store.flush_if_due().is_err());
+        assert!(store.inner.lock().unwrap().log.has_dirty());
+        assert!(
+            store.append(message("async", 0, b"fenced", "")).is_err(),
+            "an uncertain fsync must fence future writes"
+        );
+
+        store.inner.lock().unwrap().fail_log_sync = false;
+        assert!(store.flush_if_due().unwrap());
+        assert!(!store.inner.lock().unwrap().log.has_dirty());
+        assert!(!store.flush_if_due().unwrap(), "nothing left to flush");
+    }
+
+    /// Acknowledged writes in ASYNC_FLUSH mode live only in the page cache
+    /// until a flush. A graceful shutdown must still fsync them before it
+    /// removes the abort marker, and a reopen must see every message.
+    #[test]
+    fn graceful_shutdown_flushes_an_async_commitlog() {
+        let dir = TempDir::new().unwrap();
+        {
+            let store = async_store(&dir, 60_000);
+            for index in 0..8 {
+                store
+                    .append(message("async", 0, format!("m{index}").as_bytes(), ""))
+                    .unwrap();
+            }
+            assert!(store.inner.lock().unwrap().log.has_dirty());
+            store.shutdown().unwrap();
+            assert!(!store.inner.lock().unwrap().log.has_dirty());
+            assert!(!dir.path().join(ABORT_FILE).exists());
+            let raw: serde_json::Value =
+                serde_json::from_slice(&fs::read(dir.path().join(CHECKPOINT_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(raw["cleanExit"], true);
+        }
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(reopened.queue_max_offset("async", 0), 8);
+        for index in 0..8 {
+            assert_eq!(
+                reopened
+                    .read("async", 0, index, 1, MAX_READ_BYTES, None)
+                    .unwrap()
+                    .messages[0]
+                    .body,
+                format!("m{index}").as_bytes()
+            );
+        }
+    }
+
+    /// With N segments, an append must not fsync all N files: only segments
+    /// touched since the last flush are dirty (Java `MappedFileQueue.flush`).
+    #[test]
+    fn only_segments_written_since_the_last_flush_are_dirty() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open_with_limits(
+            dir.path(),
+            StoreLimits {
+                segment_size: SMALL_SEGMENT,
+                flush_policy: FlushPolicy::Async {
+                    interval_ms: 60_000,
+                },
+                ..StoreLimits::default()
+            },
+        )
+        .unwrap();
+        for index in 0..8 {
+            store
+                .append(message("dirty", 0, format!("m{index}").as_bytes(), ""))
+                .unwrap();
+        }
+        // Clear the accumulated dirt with an explicit flush, then append one
+        // record: only the segment(s) that record lands in may be dirty.
+        store.flush().unwrap();
+        assert!(!store.inner.lock().unwrap().log.has_dirty());
+
+        store.append(message("dirty", 0, b"one-more", "")).unwrap();
+        let info = store.segment_info().unwrap();
+        assert!(info.starts.len() > 2, "commitlog never rolled over");
+        let dirty: Vec<u64> = store
+            .inner
+            .lock()
+            .unwrap()
+            .log
+            .dirty
+            .iter()
+            .copied()
+            .collect();
+        assert!(!dirty.is_empty());
+        assert!(
+            dirty.len() < info.starts.len(),
+            "an append dirtied every historical segment: {dirty:?}"
+        );
+        assert!(dirty.iter().all(|start| info.starts.contains(start)));
+        store.flush().unwrap();
+        assert!(!store.inner.lock().unwrap().log.has_dirty());
     }
 }

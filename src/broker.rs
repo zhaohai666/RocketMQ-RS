@@ -3459,11 +3459,17 @@ impl Broker {
                     .map(|entries| entries.len())
                     .sum();
                 let timer_slots = self.wheel.lock().unwrap().slots.len();
+                let segments = self.store.segment_info()?;
+                let flush = self.store.flush_policy()?;
                 json_response(request, json!({"table":{
                     "brokerVersionDesc":"RocketMQ-RS-0.1.0",
                     "brokerName":self.config.broker_name,
                     "bootTimestamp":self.started_at.to_string(),
                     "commitLogMaxOffset":self.store.physical_len()?.to_string(),
+                    "commitLogSegmentCount":segments.starts.len().to_string(),
+                    "commitLogSegmentSize":segments.segment_size.to_string(),
+                    "flushDiskType":if flush.is_async() { "ASYNC_FLUSH" } else { "SYNC_FLUSH" },
+                    "flushIntervalCommitLog":flush.interval_ms().to_string(),
                     "topicCount":self.store.topics()?.len().to_string(),
                     "clientCount":self.groups.lock().unwrap().len().to_string(),
                     "storeCleanExit":checkpoint.clean_exit.to_string(),
@@ -4503,6 +4509,16 @@ mod tests {
         let runtime = admin_value(&broker, 28, &[]).await;
         assert_eq!(runtime["table"]["clientCount"], "1");
         assert_eq!(runtime["table"]["storeCleanExit"], "false");
+        // The default 1 GiB commitlog is one segment until it rolls over.
+        assert_eq!(runtime["table"]["commitLogSegmentCount"], "1");
+        assert!(
+            runtime["table"]["commitLogSegmentSize"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                > 0
+        );
         assert!(
             runtime["table"]["storeDiskLimitBytes"]
                 .as_str()

@@ -14,7 +14,7 @@ use rocketmq_rs::namesrv::Namesrv;
 use rocketmq_rs::proxy::{ProxyConfig, ProxyContext};
 use rocketmq_rs::remoting;
 use rocketmq_rs::remoting::{Command, Handler, TlsConfig, invoke, serve, serve_tls};
-use rocketmq_rs::store::Store;
+use rocketmq_rs::store::{FlushPolicy, Store, StoreLimits};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinSet};
@@ -82,6 +82,16 @@ struct BrokerArgs {
     cluster_name: String,
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(i32).range(1..=1024))]
     default_queues: i32,
+    /// MessageStoreConfig.mappedFileSizeCommitLog: bytes per commitlog segment.
+    /// Ignored for an existing data directory, whose segment size is persisted
+    /// in its checkpoint so its boundaries cannot be reinterpreted.
+    #[arg(long, default_value_t = rocketmq_rs::store::DEFAULT_SEGMENT_SIZE, value_parser = clap::value_parser!(u64).range(1..))]
+    commitlog_segment_size: u64,
+    /// MessageStoreConfig.flushDiskType / flushIntervalCommitLog: 0 = SYNC_FLUSH
+    /// (fsync each append, the default); >0 = ASYNC_FLUSH with this interval in
+    /// milliseconds, fsynced by the background maintenance task.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64))]
+    flush_interval_ms: u64,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     auto_create_topic: bool,
     /// BrokerConfig.enablePropertyFilter
@@ -128,6 +138,12 @@ struct StandaloneArgs {
     data_dir: PathBuf,
     #[arg(long, default_value = "broker-a", value_parser = parse_name)]
     broker_name: String,
+    /// MessageStoreConfig.mappedFileSizeCommitLog (see `broker --commitlog-segment-size`).
+    #[arg(long, default_value_t = rocketmq_rs::store::DEFAULT_SEGMENT_SIZE, value_parser = clap::value_parser!(u64).range(1..))]
+    commitlog_segment_size: u64,
+    /// 0 = SYNC_FLUSH; >0 = ASYNC_FLUSH interval in milliseconds.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64))]
+    flush_interval_ms: u64,
     #[arg(long, default_value_t = false, action = ArgAction::Set)]
     enable_property_filter: bool,
     /// MessageStoreConfig.timerWheelEnable
@@ -555,7 +571,14 @@ async fn prepare_broker(args: BrokerArgs) -> Result<Services> {
         None => actual,
     };
     let broker = Arc::new(Broker::new(
-        Arc::new(Store::open(args.data_dir)?),
+        Arc::new(Store::open_with_limits(
+            args.data_dir,
+            StoreLimits {
+                segment_size: args.commitlog_segment_size,
+                flush_policy: FlushPolicy::from_interval_ms(args.flush_interval_ms),
+                ..StoreLimits::default()
+            },
+        )?),
         BrokerConfig {
             broker_name: args.broker_name,
             cluster_name: args.cluster_name,
@@ -627,7 +650,14 @@ async fn prepare_standalone(args: StandaloneArgs) -> Result<Services> {
         Duration::from_secs(120),
     )?);
     let broker = Arc::new(Broker::new(
-        Arc::new(Store::open(args.data_dir.join("broker"))?),
+        Arc::new(Store::open_with_limits(
+            args.data_dir.join("broker"),
+            StoreLimits {
+                segment_size: args.commitlog_segment_size,
+                flush_policy: FlushPolicy::from_interval_ms(args.flush_interval_ms),
+                ..StoreLimits::default()
+            },
+        )?),
         BrokerConfig {
             broker_name: args.broker_name,
             cluster_name: "DefaultCluster".into(),
@@ -895,6 +925,24 @@ async fn maintain_expiry(
                 }
                 if let Some(broker) = &broker {
                     broker.expire_clients();
+                }
+                // `FlushRealTimeService`: in ASYNC_FLUSH mode appends return
+                // after write(2), so a background task must still fsync the
+                // dirty commitlog segments. `flush_if_due` is a no-op for a
+                // SYNC_FLUSH store, and the blocking fsync stays off the async
+                // runtime thread.
+                if let Some(broker) = &broker {
+                    let store = broker.store().clone();
+                    if store.flush_policy().is_ok_and(|policy| policy.is_async()) {
+                        let flushed =
+                            tokio::task::spawn_blocking(move || store.flush_if_due()).await;
+                        match flushed {
+                            Ok(Ok(true)) => info!("async commitlog flush completed"),
+                            Ok(Ok(false)) => {}
+                            Ok(Err(error)) => warn!(%error, "async commitlog flush failed"),
+                            Err(error) => warn!(%error, "async commitlog flush task failed"),
+                        }
+                    }
                 }
                 ticks = ticks.wrapping_add(1);
                 if ticks == 10 {

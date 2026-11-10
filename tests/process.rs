@@ -77,7 +77,13 @@ async fn rpc(addr: &str, request: Command) -> Command {
 }
 
 async fn start(dir: &Path) -> (Process, String) {
-    let (child, lines) = spawn(dir, STANDALONE);
+    start_with(dir, &[]).await
+}
+
+async fn start_with(dir: &Path, extra: &[&str]) -> (Process, String) {
+    let mut args = STANDALONE.to_vec();
+    args.extend_from_slice(extra);
+    let (child, lines) = spawn(dir, &args);
     let deadline = Instant::now() + TIMEOUT;
     let mut log = String::new();
     loop {
@@ -346,4 +352,105 @@ async fn duplicate_store_open_fails_without_disrupting_owner() {
     let sent = rpc(&address, send(b"still-writable")).await;
     assert_eq!(sent.ext_fields["queueOffset"], "1");
     assert_eq!(pull(&address, 1).await.body, b"still-writable");
+}
+
+/// Real process, real crash: a segmented commitlog must roll over, advertise
+/// its layout through GET_BROKER_RUNTIME_INFO, persist the segment size, and
+/// survive SIGKILL + restart with every message readable. The restart passes
+/// *no* segment flag on purpose, so only the checkpoint can restore it.
+#[tokio::test]
+async fn segmented_commitlog_survives_sigkill_and_reopen() {
+    const SEGMENT_SIZE: u64 = 1024;
+    let dir = TempDir::new().unwrap();
+    let size = SEGMENT_SIZE.to_string();
+    let (mut broker, address) =
+        start_with(dir.path(), &["--commitlog-segment-size", size.as_str()]).await;
+
+    let count = 40usize;
+    for index in 0..count {
+        rpc(&address, send(format!("segmented-{index}").as_bytes())).await;
+    }
+    let broker_dir = dir.path().join("broker");
+    let segments: Vec<String> = std::fs::read_dir(&broker_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("commitlog."))
+        .collect();
+    assert!(
+        !segments.is_empty(),
+        "commitlog never rolled over with a 1 KiB segment"
+    );
+
+    let runtime: Value =
+        serde_json::from_slice(&rpc(&address, Command::request(28)).await.body).unwrap();
+    let table = &runtime["table"];
+    let segment_count: usize = table["commitLogSegmentCount"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(segment_count, segments.len() + 1);
+    assert_eq!(table["commitLogSegmentSize"], SEGMENT_SIZE.to_string());
+    assert_eq!(table["flushDiskType"], "SYNC_FLUSH");
+    assert_eq!(table["flushIntervalCommitLog"], "0");
+
+    let checkpoint: Value =
+        serde_json::from_slice(&std::fs::read(broker_dir.join("storecheckpoint.json")).unwrap())
+            .unwrap();
+    assert_eq!(checkpoint["commitlogSegmentSize"], SEGMENT_SIZE);
+
+    broker.0.kill().unwrap();
+    let status = broker.0.wait().unwrap();
+    assert!(!status.success());
+
+    // Deliberately omit the flag: the persisted segment size must win.
+    let (_restarted, address) = start(dir.path()).await;
+    for index in 0..count {
+        assert_eq!(
+            pull(&address, index as u64).await.body,
+            format!("segmented-{index}").as_bytes()
+        );
+    }
+    let runtime: Value =
+        serde_json::from_slice(&rpc(&address, Command::request(28)).await.body).unwrap();
+    assert_eq!(
+        runtime["table"]["commitLogSegmentSize"],
+        SEGMENT_SIZE.to_string()
+    );
+}
+
+/// `MessageStoreConfig.flushDiskType=ASYNC_FLUSH`: the CLI policy must reach
+/// the broker's runtime diagnostics, and acknowledged writes must still be
+/// readable after a real SIGKILL (the page cache survives process death; a
+/// graceful shutdown fsyncs them explicitly).
+#[tokio::test]
+async fn async_flush_policy_is_visible_and_survives_sigkill() {
+    let dir = TempDir::new().unwrap();
+    let (mut broker, address) = start_with(dir.path(), &["--flush-interval-ms", "200"]).await;
+
+    let runtime: Value =
+        serde_json::from_slice(&rpc(&address, Command::request(28)).await.body).unwrap();
+    assert_eq!(runtime["table"]["flushDiskType"], "ASYNC_FLUSH");
+    assert_eq!(runtime["table"]["flushIntervalCommitLog"], "200");
+
+    for index in 0..12 {
+        rpc(&address, send(format!("async-{index}").as_bytes())).await;
+    }
+    broker.0.kill().unwrap();
+    assert!(!broker.0.wait().unwrap().success());
+
+    // Keep the policy on restart; it is a runtime config, not a persisted
+    // property of the data directory, so the flag must be passed again.
+    let (_restarted, address) = start_with(dir.path(), &["--flush-interval-ms", "200"]).await;
+    for index in 0..12 {
+        assert_eq!(
+            pull(&address, index as u64).await.body,
+            format!("async-{index}").as_bytes()
+        );
+    }
+    let checkpoint: Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join("broker").join("storecheckpoint.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(checkpoint["abnormalRecoveries"], 1);
 }

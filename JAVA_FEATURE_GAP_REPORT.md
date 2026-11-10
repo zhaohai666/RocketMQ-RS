@@ -17,7 +17,7 @@
 | gRPC v2 MessagingService | **17/17 方法全部实现**（QueryRoute … SyncLiteSubscription） |
 | gRPC v2 AdminService | **16/16 方法全部实现**，但多数是语义空壳（见 P1） |
 | Java 5.2.2 客户端缺陷猎杀 | **15/15 PASS**（`JAVA_CLIENT_PARITY_REPORT.md`） |
-| 服务端基础设施 | **大面积缺失**：HA/多副本、mmap 刷盘、commitlog 分段与过期回收、Raft 日志持久化；**POP/计时器状态持久化（§7.1）、abort/checkpoint/磁盘水位/孤儿文件清理（§7.2）、Admin 诊断命令与 controller 配置（§7.3）已补齐** |
+| 服务端基础设施 | **从「大面积缺失」收敛为「架构级剩余」**：**commitlog 物理分段、SYNC/ASYNC_FLUSH 刷盘策略与后台 flush（§7.5）、POP/计时器状态持久化（§7.1）、abort/checkpoint/磁盘水位/孤儿文件清理（§7.2）、Admin 诊断命令与 controller 配置（§7.3）已补齐**；仍缺 HA/多副本、mmap/堆外写缓冲、过期 commitlog 段删除、Raft 日志与快照（评估见 §8） |
 | broker remoting 请求码 | 约 30 个 vs Java `AdminBrokerProcessor` 约 70 个 case |
 | namesrv 请求码 | 13 个 vs Java `DefaultRequestProcessor` 数十个 |
 
@@ -97,7 +97,7 @@
 2. ◐ **文件生命周期**（P0 #3）：abort/checkpoint/水位/孤儿文件清理已完成（§7.2）；物理分段与过期 commitlog 回收并入第 5 项。
 3. ◐ **broker Admin 命令集 + controller config 空桩**（P1 #13）：已完成高频只读诊断命令与 config 空桩（§7.3）；写操作类 Admin 仍缺。
 4. ◐ **4.x remoting 协议 + RPCHook**（P1 #9/#10）：转发分类/白名单、无 topic 命令路由、顺序消费锁 41/42 已落地（§7.4）；RPCHook、zone 就近路由、同端口多协议协商、多 broker fan-out 仍缺。
-5. **HA / 多副本与 mmap 刷盘**（P0 #1/#2）：架构级改造，需独立规划，不宜与前面几项混做。
+5. ◐ **HA / 多副本与 mmap 刷盘**（P0 #1/#2）：**commitlog 分段 + 刷盘策略 + 后台 flush 已落地（§7.5）**；HA 主从复制、mmap、过期段删除、Raft 日志属于架构级改造，方案与风险见 §8，不在这轮混做。
 
 ---
 
@@ -109,7 +109,7 @@ cargo build  -> 0 error / 0 warning
 cargo test   -> 225 passed / 0 failed
 ```
 
-> 审计阶段本身是只读的（除上述一行文案外无代码变更）。**后续「按顺序补齐能力」的代码改动与验证见 §7 各小节**；当前基线为 `cargo test -> 245 passed / 0 failed`、`cargo clippy --all-targets -> 75 warnings`。
+> 审计阶段本身是只读的（除上述一行文案外无代码变更）。**后续「按顺序补齐能力」的代码改动与验证见 §7 各小节**；当前基线为 `cargo test -> 256 passed / 0 failed`、`cargo clippy --all-targets -> 75 warnings`。
 
 ---
 
@@ -233,11 +233,106 @@ cargo clippy --all-targets    -> 75 warnings（基线持平，无新增）
 
 **仍未做（P1 #9/#10 剩余）**：`RPCHook.doBeforeRequest` 钩子链、`ZoneRouteRPCHook` 就近路由（需 broker 注册携带 `zoneName`）、`MultiProtocolRemotingServer` 同端口协议协商 / HTTP/2 代理 / HAProxy PROXY protocol、TLS 证书热加载；多 broker 集群下无 topic 命令的 fan-out/merge（Java 的 heartbeat/unregister 由 proxy 自己的 `ClientManagerActivity` 本地处理，本 port 只转给一个 broker，`one_broker_addr` 取到的就是该 broker 的视图）；§7.3 记录的写操作类 Admin 仍缺。
 
-### 7.5 待办
+### 7.5 ◐ 第 5 项：commitlog 物理分段 + 刷盘策略（P0 #2，HA/mmap 除外）
+
+**目标**：把「单 `std::fs::File` + 每次追加 fsync 全文件」改造成 Java `MappedFileQueue` 形态的分段日志，并补齐 `flushDiskType` 的 SYNC/ASYNC 两种语义与后台 flush。HA 主从复制、mmap 与过期段删除是另一层架构改造，方案与风险单列在 §8。
+
+**关键设计决策：透明分段，而不是照搬 Java 的段尾填充**
+
+`Message.physical_offset` 写进消息编码和 msgId，consume-queue 索引、`key_index`、`END_TRANSACTION` 定位全部按「一个全局连续字节位置」寻址。Java 用 `MappedFile` 在段尾填充 BLANK_MAGIC，保证一条消息不跨文件；本 port 改为**读写时跨段拼接**（`CommitLog::read_at` / `write_at` 循环按段边界切片），段文件名即该段的全局起始偏移（`commitlog.00000000001073741824`）。这样 6 处 `seek(physical)` 的读路径、全部索引、全部协议字段**零改动**，是唯一不破坏 250+ 既有测试的切入点。代价是一条记录可能横跨两段，恢复时按全局偏移顺序解析即可。
+
+| 改动 | 文件 | 说明 |
+|---|---|---|
+| 分段提交日志 | `src/store.rs` | 新增 `CommitLog { segments: BTreeMap<start, File>, segment_size, len, cursor, dirty, directory_dirty }`，实现 `Read`/`Write`/`Seek` 以复用既有 `recover` / `write_all`；`segment_size` 持久化到 `StoreCheckpoint.commitlogSegmentSize`，重启时**以 checkpoint 为准**忽略调用方传值，避免重新解释既有段边界 |
+| 段布局可观测 | `src/store.rs` / `src/broker.rs` | `Store::segment_info()`；`GET_BROKER_RUNTIME_INFO(28)` 新增 `commitLogSegmentCount` / `commitLogSegmentSize` / `flushDiskType` / `flushIntervalCommitLog` |
+| 段大小可配置 | `src/main.rs` | `broker` / `standalone` 新增 `--commitlog-segment-size`（默认 1 GiB，对齐 `mappedFileSizeCommitLog`）；仅对**新目录**生效 |
+| 刷盘策略 | `src/store.rs` | `FlushPolicy = Sync \| Async { interval_ms }`，默认 `Sync` 保持既有持久性契约；`Sync` 每次追加 fsync，`Async` 追加后只 `write(2)`，由 `Store::flush_if_due()` 按间隔 fsync。CLI `--flush-interval-ms`：0 = SYNC_FLUSH，>0 = ASYNC_FLUSH |
+| 后台 flush | `src/main.rs` | `maintain_expiry` 每秒 tick 在 `spawn_blocking` 中驱动 `flush_if_due()`（Java `FlushRealTimeService`）；阻塞 fsync 不占 async 运行时线程；`Sync` 存储跳过该任务 |
+| 精确 fsync | `src/store.rs` | 原 `CommitLog::sync_data()` 对**所有**段文件 fsync —— 分段后每次追加会退化成 O(段数)。改为只 fsync 上次成功 flush 之后写过的段（`dirty: BTreeSet<start>`），失败时保留未同步的 start 供下次重试；新建段文件时额外 `sync` 父目录以保证目录项持久 |
+| 优雅关闭 | `src/store.rs` | `Async` 模式下已确认的写可能只在 page cache；`shutdown()` 现在**先 fsync 再删 abort 标记**，否则断电会丢生产者已收到成功响应的数据 |
+
+```text
+cargo build                   -> 0 error / 0 warning
+cargo test                    -> 256 passed / 0 failed（250 基线 + 6 新增）
+cargo clippy --all-targets    -> 75 warnings（基线持平，无新增）
+cargo fmt -- --check          -> 仅剩旧提交的既有偏差，本轮新增代码零偏差
+新增 store::tests::commitlog_rolls_into_segments_and_reads_across_boundaries
+新增 store::tests::segmented_commitlog_survives_reopen_with_persisted_boundaries
+新增 store::tests::segmented_commitlog_truncates_a_torn_tail_in_a_later_segment
+新增 store::tests::segment_layout_is_persisted_in_the_checkpoint
+新增 store::tests::a_zero_async_flush_interval_is_rejected_at_open
+新增 store::tests::sync_flush_still_fsyncs_every_append
+新增 store::tests::async_flush_waits_for_its_interval_and_fences_on_failure
+新增 store::tests::graceful_shutdown_flushes_an_async_commitlog
+新增 store::tests::only_segments_written_since_the_last_flush_are_dirty
+新增 tests/process.rs::segmented_commitlog_survives_sigkill_and_reopen
+新增 tests/process.rs::async_flush_policy_is_visible_and_survives_sigkill
+     （真实进程 + SIGKILL：1 KiB 段滚动 40 条消息、重启时**不传**段大小标志仍按 checkpoint
+       恢复、策略经 CLI 到达运行时诊断、异常恢复计数 +1、全部消息可读）
+```
+
+**本项仍未做（详见 §8）**：过期 commitlog 段删除（`CleanCommitLogService`）、mmap / 堆外写缓冲 / 批量组提交、HA 主从复制与 failover、Raft 日志与快照。已落地的「分段」是这些能力的前置条件：段名即全局偏移，复制位点与过期回收都能按段边界对齐。
+
+### 7.6 待办
 
 | 顺序 | 项 | 状态 |
 |---|---|---|
-| 2 | 文件生命周期（abort / checkpoint / 水位 / 孤儿文件清理） | **已落地**（§7.2）；物理分段滚动 + 过期 commitlog 段删除并入第 5 项 |
+| 2 | 文件生命周期（abort / checkpoint / 水位 / 孤儿文件清理） | **已落地**（§7.2）；物理分段滚动已落地（§7.5）；过期 commitlog 段删除未做 |
 | 3 | broker Admin 命令集 + controller config 空桩 | **高频只读诊断 + config 已落地**（§7.3）；写操作类 Admin 仍缺 |
 | 4 | 4.x remoting 协议 + RPCHook / zone | **转发分类 / 无 topic 路由 / 41/42 已落地**（§7.4）；RPCHook、zone、多协议协商、fan-out 未开始 |
-| 5 | HA / 多副本 / mmap 刷盘 + commitlog 分段 | 未开始 |
+| 5 | commitlog 分段 + 刷盘策略 + 后台 flush | **已落地**（§7.5） |
+| 5' | HA / 多副本 / mmap / 过期段删除 / Raft 日志 | **未实现**；已完成架构评估与风险说明（§8），建议独立立项 |
+
+---
+
+## 8. HA 主从复制 / mmap 架构评估与风险说明
+
+> 本节是 §5 第 5 项明确要求的「方案与风险说明」。结论先行：**这四项不是功能开关，而是对「哪些状态是权威数据」重新定义**，在 §7.1–§7.5 完成之前做会把问题放大；现在前置条件已具备，可以按下面的阶段推进，但不建议在本轮补丁里混做。
+
+### 8.1 现状盘点（本轮复核）
+
+| 层 | 事实 | 位置 |
+|---|---|---|
+| broker 角色 | 写死 `brokerId=0` / `brokerRole=ASYNC_MASTER`，心跳 `haServerAddr=""`；`container.rs` 头注释自认 "does not perform HA log shipping" | `src/broker.rs` 注册与心跳分支、`src/main.rs` |
+| namesrv | 注册表不区分 master/slave，`route()` 返回全量 broker；无 `notifyMinBrokerIdChanged`、无 epoch | `src/namesrv.rs` |
+| store | 位置寻址的 `std::fs::File`（本轮已分段），consume-queue / key / offset / POP / Timer 状态全部是**内存结构 + JSON 快照**，无独立 consume-queue 文件 | `src/store.rs`、`src/broker.rs` |
+| controller / raft | 纯内存状态机，`raft.rs` 头注释自认 "term/vote/log are not persisted"；无 Raft 日志、无快照、无日志压缩 | `src/controller.rs`、`src/raft.rs` |
+| 恢复 | `abort` + `storecheckpoint.json` + commitlog 尾部校验；只保证**单节点本地**一致性 | `src/store.rs` |
+
+### 8.2 HA 主从复制：分阶段方案
+
+| 阶段 | 内容 | 依赖 / 可验证性 |
+|---|---|---|
+| A. 元数据与角色 | `BrokerConfig` 增加 `broker_id` / `broker_role` / `ha_server_addr` 并进注册；namesrv 保存角色与 epoch，路由默认只返回 master（slave 仅读扩展时可选入）；controller 选主结果写回角色 | 可独立落地、可单测；**此阶段不提供任何数据冗余**，必须在文档/运行时信息里明确标注，避免误认为已具备 HA |
+| B. 日志复制 | master 侧 HA 监听端口，slave 侧 `HAClient` 周期性上报自己的 `maxPhysicalOffset`；master 从该偏移流式发送 commitlog 字节。§7.5 的段文件按全局偏移命名，slave 可直接 `write_at(offset, bytes)` 落盘，无需重编码 | 需要把 `Store::append_records` 的「本地追加」与「复制追加」拆开：复制写入**不得**再分配 queue offset、不得再更新 topic/索引以外的元数据；需新增只读 slave 的写锁豁免 |
+| C. 提交确认 | `SYNC_MASTER` 需要 `GroupTransferService` 等待 slave ack 后才向生产者返回成功。注意与 §7.5 的 `FlushPolicy::Sync` **语义不同**：前者是跨节点副本确认，后者只是本地 fsync；两者独立配置 | 需引入「已提交水位」`confirmOffset`，`physical_len()` 与 `read()` 只对 <= confirmOffset 的数据可见 |
+| D. Failover | controller 基于 epoch 选主，`minBrokerId` 驱动角色切换，namesrv 主动刷新路由；切主时 slave 截断到与 new master 的共同位点 | 依赖 §8.4 的 Raft 持久化；否则 controller 重启丢共识状态，可能出现双主 |
+
+### 8.3 主要风险（按阻塞程度排序）
+
+1. **可复制状态集合远大于 commitlog**。consumer offset、订阅组配置、topic 配置、POP invisible/ack、Timer wheel、事务 half/op、ACL、delay offset 目前都是各 broker 自己的 JSON 快照。只复制 commitlog 字节，切主后消费者会从 0 或旧 offset 重新消费 → **这是比日志复制更大的阻塞项**。要么把这些状态也纳入复制流，要么外置到共享存储/controller。
+2. **`physical_offset` 全局语义是双刃剑**。段名/记录/msgId 都按全局字节偏移寻址，两个独立 broker 各自从 0 开始写会产生**相同 msgId**；只有严格「单主写、slave 纯追加且不产生自产消息」（retry/DLQ/timer 投递都必须由 master 生成）才安全。任何 slave 本地追加都会破坏一致性。
+3. **单写者假设**。`Store` 用目录文件锁 + `Mutex<Inner>` 保证唯一写者；slave 后台复制线程与本地读/恢复并存需要重新设计锁边界，且 `fenced` 语义要区分「本地写失败」与「复制位点落后」。
+4. **异步复制必然丢数据**。`ASYNC_MASTER` 在主宕机时会丢尚未复制到 slave 的尾部；当前 §7.5 的 SIGKILL 测试只验证单节点恢复，不能作为 HA 正确性的证据。需要专门的「kill -9 master 后比对 slave 位点」用例。
+5. **无自动 failover 的半成品更危险**。阶段 A 若只暴露角色字段而不做复制，运维会误以为已有副本。建议把阶段 A/B 的定位明确写成「只读 slave / 读扩展」，把自动切主留到阶段 D 之后。
+6. **controller 状态不可持久**。Raft term/vote/log 全内存，选主结果重启即丢，双主风险实存；`EpochFileCache` 与快照必须在 D 之前补齐。
+
+### 8.4 mmap / 组提交评估
+
+| 项 | Java | 本 port 现状 | 判断 |
+|---|---|---|---|
+| 文件映射 | `FileChannel.map` + `MappedByteBuffer`，`LibC.mlock` 锁页 | `std::fs::File` + `seek`/`read_exact`，本轮已分段 | 换 mmap 需引入 `memmap2`，且映射必须活过 `Mutex<Inner>` 的借用、`&[u8]` 生命周期要提到 `Arc` 级；文件被截断或磁盘满时访问映射会触发 **SIGBUS**（Rust 里难以安全兜底）；`msync`/`fsync` 跨平台语义不一致 |
+| 堆外缓冲 | `TransientStorePool` + `CommitRealTimeService` 批量 commit | 无 | 收益接近 mmap 而风险低得多 |
+| 组提交 | `GroupCommitService` 合并多个等待中的 fsync | §7.5 已实现 `Sync` 每追加 fsync + `Async` 定时 fsync | **建议下一步先做批量组提交**：把同一 tick 内多个 append 的 fsync 合并为一次，吞吐收益明确且不改持久性契约 |
+
+**结论**：本 port 缺的是吞吐优化，不是写入正确性；在 HA 复制位点、confirmOffset、状态复制集合定下来之前引入 mmap，会把「字节是否可见」与「副本是否已确认」两个问题耦在一起，得不偿失。
+
+### 8.5 过期 commitlog 段删除评估
+
+Java `CleanCommitLogService` 按 `fileReservedTime`（默认 72h）+ `deleteWhen` 删除整段文件，但必须先确定**最小仍被引用的物理偏移**：所有 `consumerOffset` 经 consume-queue 映射到 `Location.physical`、key index、事务 half/op 回放、timer/POP 游标共同决定。本 port 还缺三件事：
+
+- `base_offset` 概念：`recover()` 现在从物理 0 开始扫描，删除首段后必须从 `base` 开始；`read_at` 对 `< base` 应返回「已过期」而非 `UnexpectedEof`，`PULL_OFFSET_MOVED` 语义也要接上。
+- `base` 持久化：checkpoint 目前只记 `commitlogLen` / `commitlogSegmentSize`，不记起始偏移；可由最小段文件名推导，但删除与 checkpoint 写入必须原子有序。
+- 段边界与记录跨界：§7.5 允许记录跨段，删除起点必须保证不切在记录中间，且复制位点（§8.2 阶段 B 的 `slaveMaxOffset`）不能落在已删段内。
+
+**结论**：与 HA 复制位点一起设计，单独实现会与后续复制逻辑冲突，故本轮明确不做。当前靠 `StoreLimits::max_store_bytes`（默认 32 GiB）硬水位兜底，旧空间仍不可回收 —— 这是**已记录的已知限制**，不是遗漏。
